@@ -3,6 +3,14 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="NBA Live Scoreboard Theme Editor" Width="1380" Height="860"
         MinWidth="1050" MinHeight="680" Background="#171A20" Foreground="#F3F4F6">
+    <Window.Resources>
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="#F3F4F6"/>
+        </Style>
+        <Style TargetType="GroupBox">
+            <Setter Property="Foreground" Value="#F3F4F6"/>
+        </Style>
+    </Window.Resources>
     <Grid>
         <Grid.RowDefinitions><RowDefinition Height="54"/><RowDefinition Height="*"/><RowDefinition Height="28"/></Grid.RowDefinitions>
         <Border Grid.Row="0" Background="#222630" Padding="10,8">
@@ -13,7 +21,9 @@
                 <TextBlock Text="Away" VerticalAlignment="Center" Margin="0,0,5,0"/>
                 <ComboBox x:Name="AwayTeamCombo" Width="190" SelectionChanged="PreviewChanged" DisplayMemberPath="DisplayName" Margin="0,0,12,0"/>
                 <TextBlock Text="Home" VerticalAlignment="Center" Margin="0,0,5,0"/>
-                <ComboBox x:Name="HomeTeamCombo" Width="190" SelectionChanged="PreviewChanged" DisplayMemberPath="DisplayName"/>
+                <ComboBox x:Name="HomeTeamCombo" Width="190" SelectionChanged="PreviewChanged" DisplayMemberPath="DisplayName" Margin="0,0,18,0"/>
+                <TextBlock Text="Preview" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <ComboBox x:Name="PreviewAspectCombo" Width="88" SelectionChanged="PreviewChanged"/>
             </StackPanel>
         </Border>
 
@@ -21,10 +31,15 @@
             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="390"/></Grid.ColumnDefinitions>
             <Grid Grid.Column="0" Margin="14">
                 <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="150"/></Grid.RowDefinitions>
-                <Border Background="#0D0F13" BorderBrush="#343946" BorderThickness="1" Padding="20">
+                <Border Background="#0D0F13" BorderBrush="#343946" BorderThickness="1" Padding="12">
                     <Viewbox Stretch="Uniform">
-                        <Canvas x:Name="PreviewCanvas" Width="620" Height="68" Background="#0F1218"
-                                MouseMove="Canvas_MouseMove" MouseLeftButtonUp="Canvas_MouseLeftButtonUp"/>
+                        <Canvas x:Name="PreviewStage" Width="1366" Height="768" Background="#090B10">
+                            <Image x:Name="PreviewBackground" Width="1366" Height="768"
+                                   Source="Assets/broadcast-court.png" Stretch="UniformToFill"/>
+                            <Canvas x:Name="PreviewCanvas" Width="620" Height="68" Background="#E80F1218"
+                                    MouseLeftButtonDown="PreviewCanvas_MouseLeftButtonDown"
+                                    MouseMove="Canvas_MouseMove" MouseLeftButtonUp="Canvas_MouseLeftButtonUp"/>
+                        </Canvas>
                     </Viewbox>
                 </Border>
                 <GroupBox Grid.Row="1" Header="Preview Data" Margin="0,12,0,0" Padding="8">
@@ -43,10 +58,26 @@
             </Grid>
 
             <TabControl Grid.Column="1" Margin="0,14,14,14" Background="#222630">
+                <TabItem Header="Layout">
+                    <StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
+                        <TextBlock Text="Reference width"/><TextBox x:Name="ReferenceWidthBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Reference height"/><TextBox x:Name="ReferenceHeightBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Scale mode"/><ComboBox x:Name="LayoutScaleModeCombo" Margin="0,3,0,8"/>
+                        <TextBlock Text="Scoreboard X offset"/><TextBox x:Name="ScoreboardOffsetXBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Scoreboard Y offset"/><TextBox x:Name="ScoreboardOffsetYBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Scoreboard width"/><TextBox x:Name="ScoreboardWidthBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Scoreboard height"/><TextBox x:Name="ScoreboardHeightBox" Margin="0,3,0,8"/>
+                        <Button Content="Apply Layout" Click="ApplyLayout_Click" Margin="0,8,0,0" Padding="8"/>
+                        <TextBlock Margin="0,14,0,0" Foreground="#AAB2C0" TextWrapping="Wrap"
+                                   Text="Drag an uncovered part of the scoreboard background to reposition the entire scoreboard."/>
+                    </StackPanel>
+                </TabItem>
                 <TabItem Header="Element">
-                    <StackPanel Margin="12">
+                    <StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
                         <TextBlock Text="Selected element" FontWeight="Bold"/>
-                        <TextBlock x:Name="SelectedElementLabel" Text="Click an element on the canvas" Margin="0,4,0,12"/>
+                        <ComboBox x:Name="ElementSelector" Margin="0,4,0,5"
+                                  SelectionChanged="ElementSelector_SelectionChanged"/>
+                        <TextBlock x:Name="SelectedElementLabel" Text="Select or click an element" Margin="0,0,0,12" Foreground="#AAB2C0"/>
                         <UniformGrid Columns="2">
                             <TextBlock Text="X"/><TextBox x:Name="ElementXBox"/>
                             <TextBlock Text="Y"/><TextBox x:Name="ElementYBox"/>
@@ -58,8 +89,19 @@
                     </StackPanel>
                 </TabItem>
                 <TabItem Header="Behavior">
-                    <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
                         <TextBlock Text="Scoreboard visibility"/><ComboBox x:Name="VisibilityCombo" Margin="0,3,0,8"/>
+                        <TextBlock Text="Background color (decimal RGB)"/><TextBox x:Name="BackgroundColorBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Background alpha (0-255)"/><TextBox x:Name="BackgroundAlphaBox" Margin="0,3,0,8"/>
+                        <CheckBox x:Name="ShowBackgroundImageCheck" Content="Display scoreboard background image" Margin="0,4"/>
+                        <TextBlock Text="Background image (relative to theme folder)"/>
+                        <DockPanel Margin="0,3,0,8">
+                            <Button DockPanel.Dock="Right" Content="Browse..." Click="BrowseBackgroundImage_Click" Margin="6,0,0,0" Padding="8,2"/>
+                            <TextBox x:Name="BackgroundImageBox"/>
+                        </DockPanel>
+                        <TextBlock Text="Background image alpha (0-255)"/><TextBox x:Name="BackgroundImageAlphaBox" Margin="0,3,0,8"/>
+                        <CheckBox x:Name="ShowAccentCheck" Content="Display secondary-color accent strips" Margin="0,4"/>
+                        <TextBlock Text="Accent-strip height"/><TextBox x:Name="AccentHeightBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Show after score (milliseconds)"/><TextBox x:Name="AfterScoreBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Always show below game seconds"/><TextBox x:Name="LateGameBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Shot-clock visibility"/><ComboBox x:Name="ShotVisibilityCombo" Margin="0,3,0,8"/>
@@ -81,7 +123,7 @@
                     </StackPanel></ScrollViewer>
                 </TabItem>
                 <TabItem Header="Font">
-                    <StackPanel Margin="12">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
                         <TextBlock Text="Font file"/><TextBox x:Name="FontFileBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
                         <TextBlock Text="Internal font family name"/><TextBox x:Name="FontFaceBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
                         <TextBlock Text="Font weight"/><TextBox x:Name="FontWeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
@@ -89,9 +131,18 @@
                         <TextBlock Text="Score height"/><TextBox x:Name="ScoreHeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
                         <TextBlock Text="Clock height"/><TextBox x:Name="ClockHeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
                         <TextBlock Text="Shot-clock height"/><TextBox x:Name="ShotHeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
+                        <TextBlock Text="Team-name height"/><TextBox x:Name="TeamNameHeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
+                        <TextBlock Text="Period height"/><TextBox x:Name="PeriodHeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
+                        <TextBlock Text="Foul text/number height"/><TextBox x:Name="FoulHeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
+                        <TextBlock Text="Timeout text/number height"/><TextBox x:Name="TimeoutHeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
+                        <TextBlock Text="BONUS height"/><TextBox x:Name="BonusHeightBox" Margin="0,3,0,8" TextChanged="FontTextChanged"/>
                         <Button Content="Apply Font" Click="ApplyFont_Click" Margin="0,8,0,0" Padding="8"/>
-                    </StackPanel>
+                    </StackPanel></ScrollViewer>
                 </TabItem>
+                <TabItem Header="Intro" IsEnabled="False"><TextBlock Text="Coming later" Margin="12"/></TabItem>
+                <TabItem Header="Stats" IsEnabled="False"><TextBlock Text="Coming later" Margin="12"/></TabItem>
+                <TabItem Header="Violation" IsEnabled="False"><TextBlock Text="Coming later" Margin="12"/></TabItem>
+                <TabItem Header="Playcall" IsEnabled="False"><TextBlock Text="Coming later" Margin="12"/></TabItem>
             </TabControl>
         </Grid>
         <TextBlock Grid.Row="2" x:Name="StatusText" Text="Open popups\TEST\scoreboard.json to begin" Padding="10,4" Background="#222630" Foreground="#B8C0CF"/>

@@ -4,6 +4,14 @@ Open `popups\TEST\scoreboard.json`, select preview teams, and drag the known
 scoreboard elements directly on the canvas. Exact bounds, behavior rules, font
 settings, simulated game data, and asset-backed team previews are supported.
 
+The Font tab independently controls score, game clock, shot clock, team name,
+period, numeric/text foul, numeric/text timeout, and BONUS heights. Dot, bar,
+and image indicator sizes use their draggable element bounds instead.
+
+The Preview selector shows the scoreboard over a bundled generic broadcast
+background at 4:3, 16:9, or 16:10. The stage uses the same centered placement,
+reference resolution, offsets, and uniform/fixed scale rules as the game.
+
 ## Build
 
 Open `ScoreboardThemeEditor.csproj` in Visual Studio 2022 with the .NET 8 SDK,

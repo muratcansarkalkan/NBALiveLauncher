@@ -7,6 +7,11 @@
   "scoreHeight": 34,
   "clockHeight": 28,
   "shotClockHeight": 17,
+  "teamNameHeight": 15,
+  "periodHeight": 18,
+  "foulHeight": 15,
+  "timeoutHeight": 15,
+  "bonusHeight": 13,
   "scoreColor": 16777215,
   "clockColor": 16777215,
   "shotClockColor": 16764480

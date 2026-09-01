@@ -8,6 +8,11 @@ struct Style {
     float scoreHeight;
     float clockHeight;
     float shotClockHeight;
+    float teamNameHeight;
+    float periodHeight;
+    float foulHeight;
+    float timeoutHeight;
+    float bonusHeight;
     float characterSpacing;
     D3DCOLOR scoreColor;
     D3DCOLOR clockColor;

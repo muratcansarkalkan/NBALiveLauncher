@@ -11,6 +11,13 @@ public sealed class ScoreboardTheme
     public double OffsetY { get; set; } = 18;
     public double ScoreboardWidth { get; set; } = 620;
     public double ScoreboardHeight { get; set; } = 68;
+    public int BackgroundColor { get; set; } = 987672;
+    public int BackgroundAlpha { get; set; } = 232;
+    public bool ShowBackgroundImage { get; set; }
+    public string BackgroundImage { get; set; } = "images/background.png";
+    public int BackgroundImageAlpha { get; set; } = 255;
+    public bool ShowAccent { get; set; } = true;
+    public double AccentHeight { get; set; } = 6;
     public string VisibilityMode { get; set; } = "always";
     public int ShowAfterScoreMilliseconds { get; set; } = 5000;
     public int AlwaysShowBelowSeconds { get; set; } = 120;
@@ -83,6 +90,11 @@ public sealed class PopupFontTheme
     public int ScoreHeight { get; set; } = 34;
     public int ClockHeight { get; set; } = 28;
     public int ShotClockHeight { get; set; } = 17;
+    public int TeamNameHeight { get; set; } = 15;
+    public int PeriodHeight { get; set; } = 18;
+    public int FoulHeight { get; set; } = 15;
+    public int TimeoutHeight { get; set; } = 15;
+    public int BonusHeight { get; set; } = 13;
     public int ScoreColor { get; set; } = 16777215;
     public int ClockColor { get; set; } = 16777215;
     public int ShotClockColor { get; set; } = 16764480;

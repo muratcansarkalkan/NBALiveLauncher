@@ -8,4 +8,7 @@
     <AssemblyName>NBALiveScoreboardEditor</AssemblyName>
     <RootNamespace>NBALiveScoreboardEditor</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="Assets\broadcast-court.png" />
+  </ItemGroup>
 </Project>

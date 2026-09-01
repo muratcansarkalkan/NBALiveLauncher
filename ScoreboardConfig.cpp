@@ -24,6 +24,13 @@ void SetDefaults(Config* c)
     c->offsetY = 18.0f;
     c->width = 620.0f;
     c->height = 68.0f;
+    c->backgroundColor = D3DCOLOR_XRGB(15, 18, 24);
+    c->backgroundAlpha = 232;
+    c->showBackgroundImage = false;
+    std::strcpy(c->backgroundImage, "images/background.png");
+    c->backgroundImageAlpha = 255;
+    c->showAccent = true;
+    c->accentHeight = 6.0f;
     c->visibilityMode = VisibilityMode::Always;
     c->showAfterScoreMilliseconds = 5000;
     c->alwaysShowBelowSeconds = 120;
@@ -203,6 +210,18 @@ void Parse(const std::string& json, Config* c)
     c->offsetY = Number(json, "offsetY", c->offsetY);
     c->width = Number(json, "scoreboardWidth", c->width);
     c->height = Number(json, "scoreboardHeight", c->height);
+    c->backgroundColor = Color(json,
+        "backgroundColor", c->backgroundColor);
+    c->backgroundAlpha = Integer(json,
+        "backgroundAlpha", c->backgroundAlpha);
+    c->showBackgroundImage = Boolean(json,
+        "showBackgroundImage", c->showBackgroundImage);
+    String(json, "backgroundImage", c->backgroundImage,
+        sizeof(c->backgroundImage), "images/background.png");
+    c->backgroundImageAlpha = Integer(json,
+        "backgroundImageAlpha", c->backgroundImageAlpha);
+    c->showAccent = Boolean(json, "showAccent", c->showAccent);
+    c->accentHeight = Number(json, "accentHeight", c->accentHeight);
 
     std::string visibility = StringValue(json, "visibilityMode", "always");
     c->visibilityMode = visibility == "afterScore" ? VisibilityMode::AfterScore :

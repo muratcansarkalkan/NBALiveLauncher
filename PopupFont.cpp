@@ -45,7 +45,9 @@ char g_theme[64] = {};
 char g_privateFontPath[MAX_PATH] = {};
 
 Style g_style = {
-    34.0f, 28.0f, 17.0f, 1.0f,
+    34.0f, 28.0f, 17.0f,
+    15.0f, 18.0f, 15.0f, 15.0f, 13.0f,
+    1.0f,
     D3DCOLOR_XRGB(255, 255, 255),
     D3DCOLOR_XRGB(255, 255, 255),
     D3DCOLOR_XRGB(255, 210, 64)
@@ -173,6 +175,16 @@ bool BuildAtlas(IDirect3DDevice9* device, const char* themeName)
         configuration, "clockHeight", 28));
     g_style.shotClockHeight = static_cast<float>(ReadJsonInteger(
         configuration, "shotClockHeight", 17));
+    g_style.teamNameHeight = static_cast<float>(ReadJsonInteger(
+        configuration, "teamNameHeight", 15));
+    g_style.periodHeight = static_cast<float>(ReadJsonInteger(
+        configuration, "periodHeight", 18));
+    g_style.foulHeight = static_cast<float>(ReadJsonInteger(
+        configuration, "foulHeight", 15));
+    g_style.timeoutHeight = static_cast<float>(ReadJsonInteger(
+        configuration, "timeoutHeight", 15));
+    g_style.bonusHeight = static_cast<float>(ReadJsonInteger(
+        configuration, "bonusHeight", 13));
     g_style.scoreColor = ReadJsonColor(configuration, "scoreColor",
         D3DCOLOR_XRGB(255, 255, 255));
     g_style.clockColor = ReadJsonColor(configuration, "clockColor",

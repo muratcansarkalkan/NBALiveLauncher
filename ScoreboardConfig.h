@@ -23,6 +23,13 @@ struct Config {
     float offsetY;
     float width;
     float height;
+    D3DCOLOR backgroundColor;
+    int backgroundAlpha;
+    bool showBackgroundImage;
+    char backgroundImage[MAX_PATH];
+    int backgroundImageAlpha;
+    bool showAccent;
+    float accentHeight;
 
     VisibilityMode visibilityMode;
     unsigned int showAfterScoreMilliseconds;

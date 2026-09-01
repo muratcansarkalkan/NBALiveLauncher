@@ -101,6 +101,30 @@ void DrawTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture,
         sizeof(TextureVertex));
 }
 
+void DrawTextureStretched(IDirect3DDevice9* device,
+                          IDirect3DTexture9* texture,
+                          float left, float top, float right, float bottom,
+                          D3DCOLOR color)
+{
+    if (!texture) return;
+    const TextureVertex vertices[4] = {
+        { left,  top,    0.0f, 1.0f, color, 0.0f, 0.0f },
+        { right, top,    0.0f, 1.0f, color, 1.0f, 0.0f },
+        { left,  bottom, 0.0f, 1.0f, color, 0.0f, 1.0f },
+        { right, bottom, 0.0f, 1.0f, color, 1.0f, 1.0f }
+    };
+    device->SetTexture(0, texture);
+    device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices,
+        sizeof(TextureVertex));
+}
+
 void DrawSevenSegmentDigit(IDirect3DDevice9* device, int digit,
                            float x, float y, float width, float height,
                            float thickness, D3DCOLOR color)
@@ -272,7 +296,8 @@ void DrawIndicator(IDirect3DDevice9* device,
                    scoreboardconfig::IndicatorMode mode,
                    const scoreboardconfig::Rect& rectangle,
                    int value, int maximum, const char* label,
-                   IDirect3DTexture9* image, D3DCOLOR color)
+                   IDirect3DTexture9* image, D3DCOLOR color,
+                   float textHeight)
 {
     if (mode == scoreboardconfig::IndicatorMode::None || value < 0) return;
     if (value > maximum && maximum > 0) value = maximum;
@@ -284,7 +309,7 @@ void DrawIndicator(IDirect3DDevice9* device,
         else
             std::snprintf(text, sizeof(text), "%d", value);
         DrawBoundText(device, text, rectangle,
-            rectangle.height, color, 0);
+            textHeight, color, 0);
         return;
     }
     if (maximum <= 0) return;
@@ -349,6 +374,15 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
     device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
     device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
     device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+    // NBA Live may leave sampler 0 configured for point filtering. That is
+    // especially visible when a reference-resolution scoreboard is reduced
+    // to 640x480: logos become grainy and the GDI glyph atlas stair-steps.
+    // The state block restores the game's original sampler state afterward.
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
     const scoreboardconfig::Config& config = scoreboardconfig::Get();
     float scale = 1.0f;
@@ -373,23 +407,40 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
         ToScreen(config.awayPanel, left, top, scale);
     const scoreboardconfig::Rect homePanel =
         ToScreen(config.homePanel, left, top, scale);
-    DrawFilledRect(device, left, top, right, bottom,
-        D3DCOLOR_ARGB(232, 15, 18, 24));
+    int backgroundAlpha = config.backgroundAlpha;
+    if (backgroundAlpha < 0) backgroundAlpha = 0;
+    if (backgroundAlpha > 255) backgroundAlpha = 255;
+    const D3DCOLOR backgroundColor =
+        (static_cast<D3DCOLOR>(backgroundAlpha) << 24) |
+        (config.backgroundColor & 0x00FFFFFFu);
+    DrawFilledRect(device, left, top, right, bottom, backgroundColor);
+    if (config.showBackgroundImage && config.backgroundImage[0]) {
+        IDirect3DTexture9* backgroundImage =
+            popup::GetThemeTexture(device, config.backgroundImage);
+        int imageAlpha = config.backgroundImageAlpha;
+        if (imageAlpha < 0) imageAlpha = 0;
+        if (imageAlpha > 255) imageAlpha = 255;
+        DrawTextureStretched(device, backgroundImage,
+            left, top, right, bottom,
+            D3DCOLOR_ARGB(imageAlpha, 255, 255, 255));
+    }
     DrawFilledRect(device, awayPanel.x, awayPanel.y,
         awayPanel.x + awayPanel.width, awayPanel.y + awayPanel.height,
         frame.awayColor);
     DrawFilledRect(device, homePanel.x, homePanel.y,
         homePanel.x + homePanel.width, homePanel.y + homePanel.height,
         frame.homeColor);
-    const float accentHeight = 6.0f * scale;
-    DrawFilledRect(device, awayPanel.x,
-        awayPanel.y + awayPanel.height - accentHeight,
-        awayPanel.x + awayPanel.width,
-        awayPanel.y + awayPanel.height, frame.awaySecondaryColor);
-    DrawFilledRect(device, homePanel.x,
-        homePanel.y + homePanel.height - accentHeight,
-        homePanel.x + homePanel.width,
-        homePanel.y + homePanel.height, frame.homeSecondaryColor);
+    if (config.showAccent && config.accentHeight > 0.0f) {
+        const float accentHeight = config.accentHeight * scale;
+        DrawFilledRect(device, awayPanel.x,
+            awayPanel.y + awayPanel.height - accentHeight,
+            awayPanel.x + awayPanel.width,
+            awayPanel.y + awayPanel.height, frame.awaySecondaryColor);
+        DrawFilledRect(device, homePanel.x,
+            homePanel.y + homePanel.height - accentHeight,
+            homePanel.x + homePanel.width,
+            homePanel.y + homePanel.height, frame.homeSecondaryColor);
+    }
 
     scoreboardconfig::Rect awayLogo =
         ToScreen(config.awayLogo, left, top, scale);
@@ -459,14 +510,14 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
             period, sizeof(period));
         DrawBoundText(device, period,
             ToScreen(config.period, left, top, scale),
-            style.shotClockHeight * scale, style.clockColor, 0);
+            style.periodHeight * scale, style.clockColor, 0);
         if (config.showTeamNames) {
             DrawBoundText(device, frame.awayTeamName,
                 ToScreen(config.awayName, left, top, scale),
-                config.awayName.height * scale, style.scoreColor, 0);
+                style.teamNameHeight * scale, style.scoreColor, 0);
             DrawBoundText(device, frame.homeTeamName,
                 ToScreen(config.homeName, left, top, scale),
-                config.homeName.height * scale, style.scoreColor, 0);
+                style.teamNameHeight * scale, style.scoreColor, 0);
         }
 
         int awayTimeouts = frame.awayTimeouts;
@@ -484,19 +535,21 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
         DrawIndicator(device, config.foulMode,
             ToScreen(config.awayFouls, left, top, scale),
             frame.awayFouls, config.maximumTeamFouls,
-            "F", foulImage, style.scoreColor);
+            "F", foulImage, style.scoreColor, style.foulHeight * scale);
         DrawIndicator(device, config.foulMode,
             ToScreen(config.homeFouls, left, top, scale),
             frame.homeFouls, config.maximumTeamFouls,
-            "F", foulImage, style.scoreColor);
+            "F", foulImage, style.scoreColor, style.foulHeight * scale);
         DrawIndicator(device, config.timeoutMode,
             ToScreen(config.awayTimeouts, left, top, scale),
             awayTimeouts, config.maximumTimeouts,
-            "TO", timeoutImage, style.scoreColor);
+            "TO", timeoutImage, style.scoreColor,
+            style.timeoutHeight * scale);
         DrawIndicator(device, config.timeoutMode,
             ToScreen(config.homeTimeouts, left, top, scale),
             homeTimeouts, config.maximumTimeouts,
-            "TO", timeoutImage, style.scoreColor);
+            "TO", timeoutImage, style.scoreColor,
+            style.timeoutHeight * scale);
 
         if (config.showBonus && frame.homeFouls >= config.bonusThreshold) {
             const char* bonus = config.doubleBonusThreshold > 0 &&
@@ -504,7 +557,7 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
                 config.doubleBonusText : config.bonusText;
             DrawBoundText(device, bonus,
                 ToScreen(config.awayBonus, left, top, scale),
-                config.awayBonus.height * scale, style.scoreColor, 0);
+                style.bonusHeight * scale, style.scoreColor, 0);
         }
         if (config.showBonus && frame.awayFouls >= config.bonusThreshold) {
             const char* bonus = config.doubleBonusThreshold > 0 &&
@@ -512,7 +565,7 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
                 config.doubleBonusText : config.bonusText;
             DrawBoundText(device, bonus,
                 ToScreen(config.homeBonus, left, top, scale),
-                config.homeBonus.height * scale, style.scoreColor, 0);
+                style.bonusHeight * scale, style.scoreColor, 0);
         }
     }
     else {

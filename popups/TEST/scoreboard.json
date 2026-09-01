@@ -6,23 +6,23 @@
   "offsetY": 18,
   "scoreboardWidth": 620,
   "scoreboardHeight": 68,
-
+  "backgroundColor": 987672,
+  "backgroundAlpha": 232,
+  "showAccent": true,
+  "accentHeight": 6,
   "visibilityMode": "always",
   "showAfterScoreMilliseconds": 5000,
   "alwaysShowBelowSeconds": 120,
-
   "shotClockVisibility": "always",
   "shotClockThreshold": 10,
   "urgentShotClockThreshold": 10,
   "shotClockNormalColor": 16764480,
   "shotClockUrgentColor": 16724016,
-
   "showTeamNames": false,
   "showAwayLogo": true,
   "showHomeLogo": true,
   "teamNameFormat": "abbreviation",
   "periodFormat": "ordinal",
-
   "foulMode": "none",
   "timeoutMode": "none",
   "maximumTeamFouls": 5,
@@ -30,13 +30,11 @@
   "timeoutCountMode": "remaining",
   "foulImage": "images/foul.png",
   "timeoutImage": "images/timeout.png",
-
   "showBonus": false,
   "bonusThreshold": 5,
   "doubleBonusThreshold": 0,
   "bonusText": "BONUS",
   "doubleBonusText": "BONUS+",
-
   "awayPanelX": 0, "awayPanelY": 0, "awayPanelWidth": 186, "awayPanelHeight": 68,
   "homePanelX": 434, "homePanelY": 0, "homePanelWidth": 186, "homePanelHeight": 68,
   "awayLogoX": 12, "awayLogoY": 5, "awayLogoWidth": 162, "awayLogoHeight": 48,

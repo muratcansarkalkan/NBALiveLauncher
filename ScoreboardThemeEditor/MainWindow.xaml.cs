@@ -18,16 +18,32 @@ public partial class MainWindow : Window
         PropertyNameCaseInsensitive = true,
         WriteIndented = true
     };
+    private static readonly string[] EditableElements =
+    [
+        "awayPanel", "homePanel",
+        "awayLogo", "homeLogo",
+        "awayName", "homeName",
+        "awayScore", "homeScore",
+        "gameClock", "shotClock", "period",
+        "awayFouls", "homeFouls",
+        "awayTimeouts", "homeTimeouts",
+        "awayBonus", "homeBonus"
+    ];
 
     private ScoreboardTheme _theme = new();
     private PopupFontTheme _font = new();
     private readonly List<TeamDefinition> _teams = [];
     private string? _themeDirectory;
     private FrameworkElement? _selected;
+    private string? _selectedPrefix;
     private bool _dragging;
+    private bool _draggingScoreboard;
     private Point _dragStart;
+    private Point _scoreboardDragStart;
     private double _elementStartX;
     private double _elementStartY;
+    private double _scoreboardStartOffsetX;
+    private double _scoreboardStartOffsetY;
     private bool _loadingControls;
 
     public MainWindow()
@@ -40,6 +56,11 @@ public partial class MainWindow : Window
         FoulModeCombo.ItemsSource = TimeoutModeCombo.ItemsSource =
             new[] { "none", "number", "text", "dots", "bars", "images" };
         ScaleModeCombo.ItemsSource = new[] { "uniform", "fixed", "positionOnly" };
+        LayoutScaleModeCombo.ItemsSource = new[] { "uniform", "fixed", "positionOnly" };
+        PreviewAspectCombo.ItemsSource = new[] { "4:3", "16:9", "16:10" };
+        PreviewAspectCombo.SelectedItem = "16:9";
+        ElementSelector.ItemsSource = EditableElements;
+        ElementSelector.SelectedItem = "awayPanel";
         LoadControls();
         RebuildPreview();
     }
@@ -108,6 +129,7 @@ public partial class MainWindow : Window
         }
         try
         {
+            ApplyLayoutFromControls();
             ApplyBehaviorFromControls();
             ApplyFontFromControls();
             RebuildPreview();
@@ -133,6 +155,13 @@ public partial class MainWindow : Window
     {
         _loadingControls = true;
         VisibilityCombo.SelectedItem = _theme.VisibilityMode;
+        BackgroundColorBox.Text = _theme.BackgroundColor.ToString();
+        BackgroundAlphaBox.Text = _theme.BackgroundAlpha.ToString();
+        ShowBackgroundImageCheck.IsChecked = _theme.ShowBackgroundImage;
+        BackgroundImageBox.Text = _theme.BackgroundImage;
+        BackgroundImageAlphaBox.Text = _theme.BackgroundImageAlpha.ToString();
+        ShowAccentCheck.IsChecked = _theme.ShowAccent;
+        AccentHeightBox.Text = _theme.AccentHeight.ToString();
         AfterScoreBox.Text = _theme.ShowAfterScoreMilliseconds.ToString();
         LateGameBox.Text = _theme.AlwaysShowBelowSeconds.ToString();
         ShotVisibilityCombo.SelectedItem = _theme.ShotClockVisibility;
@@ -150,6 +179,13 @@ public partial class MainWindow : Window
         ShowBonusCheck.IsChecked = _theme.ShowBonus;
         BonusThresholdBox.Text = _theme.BonusThreshold.ToString();
         ScaleModeCombo.SelectedItem = _theme.ScaleMode;
+        ReferenceWidthBox.Text = _theme.ReferenceWidth.ToString();
+        ReferenceHeightBox.Text = _theme.ReferenceHeight.ToString();
+        LayoutScaleModeCombo.SelectedItem = _theme.ScaleMode;
+        ScoreboardOffsetXBox.Text = _theme.OffsetX.ToString("0.##");
+        ScoreboardOffsetYBox.Text = _theme.OffsetY.ToString("0.##");
+        ScoreboardWidthBox.Text = _theme.ScoreboardWidth.ToString("0.##");
+        ScoreboardHeightBox.Text = _theme.ScoreboardHeight.ToString("0.##");
         FontFileBox.Text = _font.FontFile;
         FontFaceBox.Text = _font.FontFace;
         FontWeightBox.Text = _font.FontWeight.ToString();
@@ -157,6 +193,11 @@ public partial class MainWindow : Window
         ScoreHeightBox.Text = _font.ScoreHeight.ToString();
         ClockHeightBox.Text = _font.ClockHeight.ToString();
         ShotHeightBox.Text = _font.ShotClockHeight.ToString();
+        TeamNameHeightBox.Text = _font.TeamNameHeight.ToString();
+        PeriodHeightBox.Text = _font.PeriodHeight.ToString();
+        FoulHeightBox.Text = _font.FoulHeight.ToString();
+        TimeoutHeightBox.Text = _font.TimeoutHeight.ToString();
+        BonusHeightBox.Text = _font.BonusHeight.ToString();
         _loadingControls = false;
     }
 
@@ -166,9 +207,40 @@ public partial class MainWindow : Window
         RebuildPreview();
     }
 
+    private void ApplyLayout_Click(object sender, RoutedEventArgs e)
+    {
+        ApplyLayoutFromControls();
+        RebuildPreview();
+    }
+
+    private void ApplyLayoutFromControls()
+    {
+        _theme.ReferenceWidth = Math.Max(1,
+            Int(ReferenceWidthBox, _theme.ReferenceWidth));
+        _theme.ReferenceHeight = Math.Max(1,
+            Int(ReferenceHeightBox, _theme.ReferenceHeight));
+        _theme.ScaleMode = LayoutScaleModeCombo.SelectedItem as string ??
+            _theme.ScaleMode;
+        ScaleModeCombo.SelectedItem = _theme.ScaleMode;
+        _theme.OffsetX = Double(ScoreboardOffsetXBox, _theme.OffsetX);
+        _theme.OffsetY = Double(ScoreboardOffsetYBox, _theme.OffsetY);
+        _theme.ScoreboardWidth = Math.Max(1,
+            Double(ScoreboardWidthBox, _theme.ScoreboardWidth));
+        _theme.ScoreboardHeight = Math.Max(1,
+            Double(ScoreboardHeightBox, _theme.ScoreboardHeight));
+    }
+
     private void ApplyBehaviorFromControls()
     {
         _theme.VisibilityMode = VisibilityCombo.SelectedItem as string ?? "always";
+        _theme.BackgroundColor = Int(BackgroundColorBox, 987672);
+        _theme.BackgroundAlpha = Math.Clamp(Int(BackgroundAlphaBox, 232), 0, 255);
+        _theme.ShowBackgroundImage = ShowBackgroundImageCheck.IsChecked == true;
+        _theme.BackgroundImage = BackgroundImageBox.Text.Trim();
+        _theme.BackgroundImageAlpha = Math.Clamp(
+            Int(BackgroundImageAlphaBox, 255), 0, 255);
+        _theme.ShowAccent = ShowAccentCheck.IsChecked == true;
+        _theme.AccentHeight = Math.Max(0, Double(AccentHeightBox, 6));
         _theme.ShowAfterScoreMilliseconds = Int(AfterScoreBox, 5000);
         _theme.AlwaysShowBelowSeconds = Int(LateGameBox, 120);
         _theme.ShotClockVisibility = ShotVisibilityCombo.SelectedItem as string ?? "always";
@@ -212,32 +284,49 @@ public partial class MainWindow : Window
         _font.ScoreHeight = Int(ScoreHeightBox, 34);
         _font.ClockHeight = Int(ClockHeightBox, 28);
         _font.ShotClockHeight = Int(ShotHeightBox, 17);
+        _font.TeamNameHeight = Int(TeamNameHeightBox, 15);
+        _font.PeriodHeight = Int(PeriodHeightBox, 18);
+        _font.FoulHeight = Int(FoulHeightBox, 15);
+        _font.TimeoutHeight = Int(TimeoutHeightBox, 15);
+        _font.BonusHeight = Int(BonusHeightBox, 13);
     }
 
     private void ShowAppliedFontStatus()
     {
         StatusText.Text =
             $"Font preview: score {_font.ScoreHeight}, " +
-            $"clock {_font.ClockHeight}, shot {_font.ShotClockHeight}";
+            $"clock {_font.ClockHeight}, shot {_font.ShotClockHeight}, " +
+            $"team {_font.TeamNameHeight}, period {_font.PeriodHeight}, " +
+            $"foul {_font.FoulHeight}, timeout {_font.TimeoutHeight}, " +
+            $"bonus {_font.BonusHeight}";
     }
 
     private void RebuildPreview()
     {
+        UpdatePreviewStage();
         PreviewCanvas.Width = Math.Max(1, _theme.ScoreboardWidth);
         PreviewCanvas.Height = Math.Max(1, _theme.ScoreboardHeight);
+        PreviewCanvas.Background = PackedBrush(
+            _theme.BackgroundColor, _theme.BackgroundAlpha);
         PreviewCanvas.Children.Clear();
+        AddBackgroundImage();
         TeamDefinition away = AwayTeamCombo.SelectedItem as TeamDefinition ??
             _teams.FirstOrDefault() ?? new() { Abbreviation = "AWY", TeamName = "Away", CityName = "Away", PrimaryColor = 3030876, SecondaryColor = 14013909 };
         TeamDefinition home = HomeTeamCombo.SelectedItem as TeamDefinition ??
             _teams.Skip(1).FirstOrDefault() ?? new() { Abbreviation = "HME", TeamName = "Home", CityName = "Home", PrimaryColor = 9969197, SecondaryColor = 16777215 };
         AddRectangle("awayPanel", PackedBrush(away.PrimaryColor));
         AddRectangle("homePanel", PackedBrush(home.PrimaryColor));
+        if (_theme.ShowAccent && _theme.AccentHeight > 0)
+        {
+            AddAccent(away, true);
+            AddAccent(home, false);
+        }
         if (_theme.ShowAwayLogo) AddImage("awayLogo", away);
         if (_theme.ShowHomeLogo) AddImage("homeLogo", home);
         if (_theme.ShowTeamNames)
         {
-            AddText("awayName", FormatTeam(away), _theme.AwayNameHeight);
-            AddText("homeName", FormatTeam(home), _theme.HomeNameHeight);
+            AddText("awayName", FormatTeam(away), _font.TeamNameHeight);
+            AddText("homeName", FormatTeam(home), _font.TeamNameHeight);
         }
         AddText("awayScore", AwayScoreBox.Text, _font.ScoreHeight);
         AddText("homeScore", HomeScoreBox.Text, _font.ScoreHeight);
@@ -249,15 +338,52 @@ public partial class MainWindow : Window
                 PackedBrush(shot <= _theme.UrgentShotClockThreshold
                     ? _theme.ShotClockUrgentColor : _theme.ShotClockNormalColor));
         }
-        AddText("period", FormatPeriod(), _theme.PeriodHeight);
-        AddIndicator("awayFouls", _theme.FoulMode, Int(AwayFoulsBox, 0), "F");
-        AddIndicator("homeFouls", _theme.FoulMode, Int(HomeFoulsBox, 0), "F");
-        AddIndicator("awayTimeouts", _theme.TimeoutMode, Int(AwayTimeoutsBox, 0), "TO");
-        AddIndicator("homeTimeouts", _theme.TimeoutMode, Int(HomeTimeoutsBox, 0), "TO");
+        AddText("period", FormatPeriod(), _font.PeriodHeight);
+        AddIndicator("awayFouls", _theme.FoulMode,
+            Int(AwayFoulsBox, 0), "F", _font.FoulHeight);
+        AddIndicator("homeFouls", _theme.FoulMode,
+            Int(HomeFoulsBox, 0), "F", _font.FoulHeight);
+        AddIndicator("awayTimeouts", _theme.TimeoutMode,
+            Int(AwayTimeoutsBox, 0), "TO", _font.TimeoutHeight);
+        AddIndicator("homeTimeouts", _theme.TimeoutMode,
+            Int(HomeTimeoutsBox, 0), "TO", _font.TimeoutHeight);
         if (_theme.ShowBonus && Int(HomeFoulsBox, 0) >= _theme.BonusThreshold)
-            AddText("awayBonus", _theme.BonusText, _theme.AwayBonusHeight);
+            AddText("awayBonus", _theme.BonusText, _font.BonusHeight);
         if (_theme.ShowBonus && Int(AwayFoulsBox, 0) >= _theme.BonusThreshold)
-            AddText("homeBonus", _theme.BonusText, _theme.HomeBonusHeight);
+            AddText("homeBonus", _theme.BonusText, _font.BonusHeight);
+        RestoreElementSelection();
+    }
+
+    private void UpdatePreviewStage()
+    {
+        const double stageWidth = 1366.0;
+        string aspect = PreviewAspectCombo.SelectedItem as string ?? "16:9";
+        double stageHeight = aspect switch
+        {
+            "4:3" => Math.Round(stageWidth * 3.0 / 4.0),
+            "16:10" => Math.Round(stageWidth * 10.0 / 16.0),
+            _ => Math.Round(stageWidth * 9.0 / 16.0)
+        };
+
+        PreviewStage.Width = stageWidth;
+        PreviewStage.Height = stageHeight;
+        PreviewBackground.Width = stageWidth;
+        PreviewBackground.Height = stageHeight;
+
+        double scale = 1.0;
+        if (_theme.ScaleMode == "uniform")
+        {
+            double referenceWidth = Math.Max(1, _theme.ReferenceWidth);
+            double referenceHeight = Math.Max(1, _theme.ReferenceHeight);
+            scale = Math.Min(stageWidth / referenceWidth,
+                stageHeight / referenceHeight);
+        }
+        PreviewCanvas.RenderTransform = new ScaleTransform(scale, scale);
+        double scaledWidth = _theme.ScoreboardWidth * scale;
+        double offsetScale = _theme.ScaleMode == "uniform" ? scale : 1.0;
+        Canvas.SetLeft(PreviewCanvas,
+            (stageWidth - scaledWidth) * 0.5 + _theme.OffsetX * offsetScale);
+        Canvas.SetTop(PreviewCanvas, _theme.OffsetY * offsetScale);
     }
 
     private void AddRectangle(string prefix, Brush brush)
@@ -265,6 +391,25 @@ public partial class MainWindow : Window
         Border border = CreateBorder(prefix);
         border.Background = brush;
         AddToCanvas(border, prefix);
+    }
+
+    private void AddAccent(TeamDefinition team, bool away)
+    {
+        double panelX = away ? _theme.AwayPanelX : _theme.HomePanelX;
+        double panelY = away ? _theme.AwayPanelY : _theme.HomePanelY;
+        double panelWidth = away ? _theme.AwayPanelWidth : _theme.HomePanelWidth;
+        double panelHeight = away ? _theme.AwayPanelHeight : _theme.HomePanelHeight;
+        Border accent = new()
+        {
+            Width = Math.Max(1, panelWidth),
+            Height = Math.Max(1, _theme.AccentHeight),
+            Background = PackedBrush(team.SecondaryColor),
+            IsHitTestVisible = false
+        };
+        Canvas.SetLeft(accent, panelX);
+        Canvas.SetTop(accent,
+            panelY + panelHeight - _theme.AccentHeight);
+        PreviewCanvas.Children.Add(accent);
     }
 
     private void AddImage(string prefix, TeamDefinition team)
@@ -293,7 +438,64 @@ public partial class MainWindow : Window
         AddToCanvas(border, prefix);
     }
 
-    private void AddIndicator(string prefix, string mode, int value, string label)
+    private void AddBackgroundImage()
+    {
+        if (!_theme.ShowBackgroundImage || _themeDirectory is null ||
+            string.IsNullOrWhiteSpace(_theme.BackgroundImage))
+            return;
+
+        string path = Path.GetFullPath(Path.Combine(_themeDirectory,
+            _theme.BackgroundImage.Replace('/', Path.DirectorySeparatorChar)));
+        if (!File.Exists(path)) return;
+
+        try
+        {
+            BitmapImage bitmap = new();
+            bitmap.BeginInit();
+            bitmap.CacheOption = BitmapCacheOption.OnLoad;
+            bitmap.UriSource = new Uri(path, UriKind.Absolute);
+            bitmap.EndInit();
+            bitmap.Freeze();
+
+            Image image = new()
+            {
+                Source = bitmap,
+                Width = Math.Max(1, _theme.ScoreboardWidth),
+                Height = Math.Max(1, _theme.ScoreboardHeight),
+                Stretch = Stretch.Fill,
+                Opacity = _theme.BackgroundImageAlpha / 255.0,
+                IsHitTestVisible = false
+            };
+            Canvas.SetLeft(image, 0);
+            Canvas.SetTop(image, 0);
+            Panel.SetZIndex(image, int.MinValue);
+            PreviewCanvas.Children.Add(image);
+        }
+        catch { }
+    }
+
+    private void BrowseBackgroundImage_Click(object sender, RoutedEventArgs e)
+    {
+        OpenFileDialog dialog = new()
+        {
+            Title = "Select scoreboard background image",
+            Filter = "Image files|*.png;*.jpg;*.jpeg;*.bmp;*.tga|All files|*.*"
+        };
+        if (_themeDirectory is not null)
+            dialog.InitialDirectory = _themeDirectory;
+        if (dialog.ShowDialog(this) != true) return;
+
+        BackgroundImageBox.Text = _themeDirectory is null
+            ? dialog.FileName
+            : Path.GetRelativePath(_themeDirectory, dialog.FileName)
+                .Replace(Path.DirectorySeparatorChar, '/');
+        ShowBackgroundImageCheck.IsChecked = true;
+        ApplyBehaviorFromControls();
+        RebuildPreview();
+    }
+
+    private void AddIndicator(string prefix, string mode, int value,
+        string label, double textHeight)
     {
         if (mode == "none") return;
         string text = mode switch
@@ -304,27 +506,39 @@ public partial class MainWindow : Window
             "images" => new string('◆', Math.Max(0, value)),
             _ => value.ToString()
         };
-        AddText(prefix, text, Get(prefix, "Height"));
+        bool textMode = mode is "number" or "text";
+        AddText(prefix, text,
+            textMode ? textHeight : Get(prefix, "Height"));
+    }
+
+    private FontFamily GetPreviewFontFamily()
+    {
+        try
+        {
+            if (_themeDirectory is not null &&
+                !string.IsNullOrWhiteSpace(_font.FontFile))
+            {
+                string fontPath = Path.GetFullPath(Path.Combine(_themeDirectory,
+                    _font.FontFile.Replace('/', Path.DirectorySeparatorChar)));
+                if (File.Exists(fontPath))
+                {
+                    string directory = Path.GetDirectoryName(fontPath)! +
+                        Path.DirectorySeparatorChar;
+                    return new FontFamily(new Uri(directory, UriKind.Absolute),
+                        $"./#{_font.FontFace.Trim()}");
+                }
+            }
+        }
+        catch { }
+        try { return new FontFamily(_font.FontFace); }
+        catch { return new FontFamily("Arial"); }
     }
 
     private TextBlock PreviewText(string text, double height, Brush brush)
     {
-        FontFamily family;
+        FontFamily family = GetPreviewFontFamily();
         FontWeight weight = FontWeight.FromOpenTypeWeight(
             Math.Clamp(_font.FontWeight, 1, 999));
-        try
-        {
-            string? fontPath = _themeDirectory is null ? null :
-                Path.Combine(_themeDirectory,
-                    _font.FontFile.Replace('/', Path.DirectorySeparatorChar));
-            family = fontPath is not null && File.Exists(fontPath)
-                ? new FontFamily(
-                    new Uri(Path.GetDirectoryName(fontPath)! +
-                        Path.DirectorySeparatorChar),
-                    $"./#{_font.FontFace}")
-                : new FontFamily(_font.FontFace);
-        }
-        catch { family = new FontFamily("Arial"); }
 
         // PopupFont.cpp renders a GDI atlas relative to tmHeight + four
         // padding pixels. WPF FontSize is an em size, so using `height`
@@ -385,7 +599,9 @@ public partial class MainWindow : Window
 
     private void Element_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        SelectElement((FrameworkElement)sender);
+        FrameworkElement element = (FrameworkElement)sender;
+        if (element.Tag is not string prefix) return;
+        SelectElement(element, prefix);
         _dragging = true;
         _dragStart = e.GetPosition(PreviewCanvas);
         _elementStartX = Canvas.GetLeft(_selected!);
@@ -394,37 +610,106 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
+    private void PreviewCanvas_MouseLeftButtonDown(
+        object sender, MouseButtonEventArgs e)
+    {
+        if (!ReferenceEquals(e.OriginalSource, PreviewCanvas)) return;
+
+        _draggingScoreboard = true;
+        _scoreboardDragStart = e.GetPosition(PreviewStage);
+        _scoreboardStartOffsetX = _theme.OffsetX;
+        _scoreboardStartOffsetY = _theme.OffsetY;
+        PreviewCanvas.CaptureMouse();
+        e.Handled = true;
+    }
+
     private void Canvas_MouseMove(object sender, MouseEventArgs e)
     {
-        if (!_dragging || _selected is null || e.LeftButton != MouseButtonState.Pressed) return;
-        Point current = e.GetPosition(PreviewCanvas);
-        double x = Math.Round(_elementStartX + current.X - _dragStart.X, 1);
-        double y = Math.Round(_elementStartY + current.Y - _dragStart.Y, 1);
+        if (_draggingScoreboard && e.LeftButton == MouseButtonState.Pressed)
+        {
+            Point current = e.GetPosition(PreviewStage);
+            double scale = 1.0;
+            if (_theme.ScaleMode == "uniform")
+                scale = Math.Min(
+                    PreviewStage.Width / Math.Max(1, _theme.ReferenceWidth),
+                    PreviewStage.Height / Math.Max(1, _theme.ReferenceHeight));
+            double offsetScale = _theme.ScaleMode == "uniform"
+                ? Math.Max(scale, 0.0001) : 1.0;
+            _theme.OffsetX = _scoreboardStartOffsetX +
+                (current.X - _scoreboardDragStart.X) / offsetScale;
+            _theme.OffsetY = _scoreboardStartOffsetY +
+                (current.Y - _scoreboardDragStart.Y) / offsetScale;
+            ScoreboardOffsetXBox.Text = _theme.OffsetX.ToString("0.##");
+            ScoreboardOffsetYBox.Text = _theme.OffsetY.ToString("0.##");
+            UpdatePreviewStage();
+            return;
+        }
+
+        if (!_dragging || _selected is null || _selectedPrefix is null ||
+            e.LeftButton != MouseButtonState.Pressed) return;
+
+        Point elementPosition = e.GetPosition(PreviewCanvas);
+        double x = Math.Round(
+            _elementStartX + elementPosition.X - _dragStart.X, 1);
+        double y = Math.Round(
+            _elementStartY + elementPosition.Y - _dragStart.Y, 1);
         Canvas.SetLeft(_selected, x);
         Canvas.SetTop(_selected, y);
-        Set((string)_selected.Tag, "X", x);
-        Set((string)_selected.Tag, "Y", y);
+        Set(_selectedPrefix, "X", x);
+        Set(_selectedPrefix, "Y", y);
         ShowElementValues();
     }
 
     private void Canvas_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
+        if (_draggingScoreboard)
+        {
+            _draggingScoreboard = false;
+            PreviewCanvas.ReleaseMouseCapture();
+            return;
+        }
         _dragging = false;
         PreviewCanvas.ReleaseMouseCapture();
     }
 
-    private void SelectElement(FrameworkElement element)
+    private void ElementSelector_SelectionChanged(
+        object sender, SelectionChangedEventArgs e)
+    {
+        if (ElementSelector.SelectedItem is not string prefix) return;
+        SelectElement(FindElement(prefix), prefix, false);
+    }
+
+    private FrameworkElement? FindElement(string prefix) =>
+        PreviewCanvas.Children.OfType<FrameworkElement>()
+            .FirstOrDefault(element => element.Tag as string == prefix);
+
+    private void SelectElement(FrameworkElement? element, string prefix,
+        bool updateSelector = true)
     {
         if (_selected is Border old) old.BorderBrush = Brushes.Transparent;
         _selected = element;
+        _selectedPrefix = prefix;
         if (_selected is Border selected) selected.BorderBrush = Brushes.Lime;
+        if (updateSelector && ElementSelector.SelectedItem as string != prefix)
+            ElementSelector.SelectedItem = prefix;
+        ShowElementValues();
+    }
+
+    private void RestoreElementSelection()
+    {
+        if (_selectedPrefix is null) return;
+        _selected = FindElement(_selectedPrefix);
+        if (_selected is Border selected)
+            selected.BorderBrush = Brushes.Lime;
         ShowElementValues();
     }
 
     private void ShowElementValues()
     {
-        if (_selected?.Tag is not string prefix) return;
-        SelectedElementLabel.Text = prefix;
+        if (_selectedPrefix is not string prefix) return;
+        SelectedElementLabel.Text = _selected is null
+            ? $"{prefix} (currently hidden)"
+            : prefix;
         ElementXBox.Text = Get(prefix, "X").ToString("0.##");
         ElementYBox.Text = Get(prefix, "Y").ToString("0.##");
         ElementWidthBox.Text = Get(prefix, "Width").ToString("0.##");
@@ -433,7 +718,7 @@ public partial class MainWindow : Window
 
     private void ApplyElement_Click(object sender, RoutedEventArgs e)
     {
-        if (_selected?.Tag is not string prefix) return;
+        if (_selectedPrefix is not string prefix) return;
         Set(prefix, "X", Double(ElementXBox, Get(prefix, "X")));
         Set(prefix, "Y", Double(ElementYBox, Get(prefix, "Y")));
         Set(prefix, "Width", Double(ElementWidthBox, Get(prefix, "Width")));
@@ -478,10 +763,11 @@ public partial class MainWindow : Window
         return Int(ShotBox, 24) <= _theme.ShotClockThreshold;
     }
 
-    private static SolidColorBrush PackedBrush(int packed) => new(
-        Color.FromRgb((byte)((packed >> 16) & 255),
-                      (byte)((packed >> 8) & 255),
-                      (byte)(packed & 255)));
+    private static SolidColorBrush PackedBrush(int packed, int alpha = 255) => new(
+        Color.FromArgb((byte)Math.Clamp(alpha, 0, 255),
+                       (byte)((packed >> 16) & 255),
+                       (byte)((packed >> 8) & 255),
+                       (byte)(packed & 255)));
 
     private void PreviewChanged(object sender, SelectionChangedEventArgs e)
     {
