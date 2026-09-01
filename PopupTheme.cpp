@@ -16,12 +16,19 @@ struct LogoTexture {
     IDirect3DTexture9* texture;
 };
 
+struct AssetTexture {
+    char path[MAX_PATH];
+    IDirect3DTexture9* texture;
+};
+
 std::vector<TeamVisual> g_teams;
 std::vector<LogoTexture> g_logos;
+std::vector<AssetTexture> g_assets;
 IDirect3DDevice9* g_textureDevice = nullptr;
 bool g_loadAttempted = false;
 char g_loadedTheme[64] = {};
 char g_lastError[512] = {};
+char g_themeDirectory[MAX_PATH] = {};
 
 void SetLastError(const char* format, ...)
 {
@@ -65,6 +72,9 @@ void ReleaseTextures()
             g_logos[i].texture->Release();
     }
     g_logos.clear();
+    for (size_t i = 0; i < g_assets.size(); ++i)
+        if (g_assets[i].texture) g_assets[i].texture->Release();
+    g_assets.clear();
     g_textureDevice = nullptr;
 }
 
@@ -270,6 +280,7 @@ bool Load(const char* themeName)
     }
     const std::string themeDirectory =
         gameDirectory + "\\popups\\" + themeName;
+    std::strncpy(g_themeDirectory, themeDirectory.c_str(), MAX_PATH - 1);
     const std::string jsonPath = themeDirectory + "\\teams.json";
     std::string json;
     if (!ReadFile(jsonPath.c_str(), &json)) {
@@ -351,6 +362,45 @@ IDirect3DTexture9* GetLogoTexture(
     return cached.texture;
 }
 
+IDirect3DTexture9* GetThemeTexture(
+    IDirect3DDevice9* device, const char* relativePath)
+{
+    if (!device || !relativePath || !*relativePath) return nullptr;
+    if (device != g_textureDevice) {
+        ReleaseTextures();
+        g_textureDevice = device;
+    }
+    char fullPath[MAX_PATH] = {};
+    std::snprintf(fullPath, sizeof(fullPath), "%s\\%s",
+        g_themeDirectory, relativePath);
+    for (char* p = fullPath; *p; ++p)
+        if (*p == '/') *p = '\\';
+    for (size_t i = 0; i < g_assets.size(); ++i)
+        if (_stricmp(g_assets[i].path, fullPath) == 0)
+            return g_assets[i].texture;
+
+    AssetTexture asset = {};
+    std::strncpy(asset.path, fullPath, MAX_PATH - 1);
+    if (GetFileAttributesA(fullPath) == INVALID_FILE_ATTRIBUTES) {
+        SetLastError("Theme image does not exist: %s", fullPath);
+        g_assets.push_back(asset);
+        return nullptr;
+    }
+    const D3DXCreateTextureFromFileExAFn loadTexture = GetTextureLoader();
+    if (!loadTexture) return nullptr;
+    HRESULT result = loadTexture(device, fullPath,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 1, 0, D3DFMT_UNKNOWN,
+        D3DPOOL_MANAGED, 0x00000003u, 0x00000003u,
+        0, nullptr, nullptr, &asset.texture);
+    if (FAILED(result)) {
+        asset.texture = nullptr;
+        SetLastError("D3DX failed to load %s (HRESULT=%08X).",
+            fullPath, static_cast<unsigned int>(result));
+    }
+    g_assets.push_back(asset);
+    return asset.texture;
+}
+
 const char* GetLastError()
 {
     return g_lastError;
@@ -363,6 +413,7 @@ void Shutdown()
     g_loadAttempted = false;
     g_loadedTheme[0] = '\0';
     g_lastError[0] = '\0';
+    g_themeDirectory[0] = '\0';
 }
 
 } // namespace popup

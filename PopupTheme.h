@@ -24,6 +24,8 @@ const TeamVisual* FindTeam(int databaseTeamID);
 // Loaded lazily from TeamVisual::logoPath and cached per D3D device.
 IDirect3DTexture9* GetLogoTexture(
     IDirect3DDevice9* device, int databaseTeamID);
+IDirect3DTexture9* GetThemeTexture(
+    IDirect3DDevice9* device, const char* relativePath);
 
 // Human-readable reason for the most recent theme/logo loading failure.
 const char* GetLastError();

@@ -1,8 +1,11 @@
 #include "ScoreboardRenderer.h"
 #include "PopupFont.h"
+#include "PopupTheme.h"
+#include "ScoreboardConfig.h"
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 
 namespace scoreboard {
 namespace {
@@ -24,6 +27,28 @@ void DrawFilledRect(IDirect3DDevice9* device, float left, float top,
     device->SetTexture(0, nullptr);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
     device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices,
+        sizeof(ScreenVertex));
+}
+
+void DrawFilledCircle(IDirect3DDevice9* device, float centerX,
+                      float centerY, float radius, D3DCOLOR color)
+{
+    constexpr int SEGMENTS = 20;
+    constexpr float TWO_PI = 6.28318530717958647692f;
+    ScreenVertex vertices[SEGMENTS + 2] = {};
+    vertices[0] = { centerX, centerY, 0.0f, 1.0f, color };
+    for (int i = 0; i <= SEGMENTS; ++i) {
+        const float angle = TWO_PI * static_cast<float>(i) /
+            static_cast<float>(SEGMENTS);
+        vertices[i + 1] = {
+            centerX + std::cos(angle) * radius,
+            centerY + std::sin(angle) * radius,
+            0.0f, 1.0f, color
+        };
+    }
+    device->SetTexture(0, nullptr);
+    device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, SEGMENTS, vertices,
         sizeof(ScreenVertex));
 }
 
@@ -182,6 +207,119 @@ void DrawGameClock(IDirect3DDevice9* device, unsigned int rawClock,
     DrawClockText(device, text, centerX, y, color);
 }
 
+scoreboardconfig::Rect ToScreen(const scoreboardconfig::Rect& source,
+                                float originX, float originY, float scale)
+{
+    scoreboardconfig::Rect result = {
+        originX + source.x * scale,
+        originY + source.y * scale,
+        source.width * scale,
+        source.height * scale
+    };
+    return result;
+}
+
+void FormatPeriod(int zeroBasedQuarter,
+                  scoreboardconfig::PeriodFormat format,
+                  char* output, size_t capacity)
+{
+    if (zeroBasedQuarter >= 4) {
+        const int overtime = zeroBasedQuarter - 3;
+        if (overtime == 1) std::snprintf(output, capacity, "OT");
+        else std::snprintf(output, capacity, "%dOT", overtime);
+        return;
+    }
+    const int quarter = zeroBasedQuarter + 1;
+    const char* ordinal = quarter == 1 ? "1st" : quarter == 2 ?
+        "2nd" : quarter == 3 ? "3rd" : "4th";
+    switch (format) {
+    case scoreboardconfig::PeriodFormat::Number:
+        std::snprintf(output, capacity, "%d", quarter); break;
+    case scoreboardconfig::PeriodFormat::OrdinalQuarter:
+        std::snprintf(output, capacity, "%s Qtr", ordinal); break;
+    case scoreboardconfig::PeriodFormat::ShortQuarter:
+        std::snprintf(output, capacity, "Q%d", quarter); break;
+    case scoreboardconfig::PeriodFormat::LongQuarter:
+        std::snprintf(output, capacity, "%s Quarter", ordinal); break;
+    default:
+        std::snprintf(output, capacity, "%s", ordinal); break;
+    }
+}
+
+void DrawBoundText(IDirect3DDevice9* device, const char* text,
+                   const scoreboardconfig::Rect& rectangle,
+                   float height, D3DCOLOR color, int alignment)
+{
+    // The rectangle is an alignment box, not a font-size ceiling. Keeping
+    // the requested height allows the editor's score/clock/shot-clock font
+    // controls to grow text beyond the original default element bounds.
+    const float actualHeight = height > 0.0f ? height : rectangle.height;
+    const float y = rectangle.y +
+        (rectangle.height - actualHeight) * 0.5f;
+    if (alignment < 0)
+        popupfont::DrawLeft(device, text, rectangle.x, y,
+            actualHeight, color);
+    else if (alignment > 0)
+        popupfont::DrawRight(device, text,
+            rectangle.x + rectangle.width, y, actualHeight, color);
+    else
+        popupfont::DrawCentered(device, text,
+            rectangle.x + rectangle.width * 0.5f,
+            y, actualHeight, color);
+}
+
+void DrawIndicator(IDirect3DDevice9* device,
+                   scoreboardconfig::IndicatorMode mode,
+                   const scoreboardconfig::Rect& rectangle,
+                   int value, int maximum, const char* label,
+                   IDirect3DTexture9* image, D3DCOLOR color)
+{
+    if (mode == scoreboardconfig::IndicatorMode::None || value < 0) return;
+    if (value > maximum && maximum > 0) value = maximum;
+    if (mode == scoreboardconfig::IndicatorMode::Number ||
+        mode == scoreboardconfig::IndicatorMode::Text) {
+        char text[32];
+        if (mode == scoreboardconfig::IndicatorMode::Text)
+            std::snprintf(text, sizeof(text), "%s %d", label, value);
+        else
+            std::snprintf(text, sizeof(text), "%d", value);
+        DrawBoundText(device, text, rectangle,
+            rectangle.height, color, 0);
+        return;
+    }
+    if (maximum <= 0) return;
+    const float spacing = 2.0f;
+    const float itemWidth =
+        (rectangle.width - spacing * (maximum - 1)) / maximum;
+    for (int i = 0; i < maximum; ++i) {
+        const float left = rectangle.x + i * (itemWidth + spacing);
+        const float dot = itemWidth < rectangle.height ?
+            itemWidth : rectangle.height;
+        if (i >= value) {
+            if (mode == scoreboardconfig::IndicatorMode::Dots)
+                DrawFilledCircle(device, left + dot * 0.5f,
+                    rectangle.y + rectangle.height * 0.5f,
+                    dot * 0.5f, D3DCOLOR_ARGB(85, 255, 255, 255));
+            else
+                DrawFilledRect(device, left, rectangle.y,
+                    left + itemWidth, rectangle.y + rectangle.height,
+                    D3DCOLOR_ARGB(85, 255, 255, 255));
+            continue;
+        }
+        if (mode == scoreboardconfig::IndicatorMode::Images && image)
+            DrawTexture(device, image, left, rectangle.y,
+                left + itemWidth, rectangle.y + rectangle.height);
+        else if (mode == scoreboardconfig::IndicatorMode::Dots) {
+            DrawFilledCircle(device, left + dot * 0.5f,
+                rectangle.y + rectangle.height * 0.5f,
+                dot * 0.5f, color);
+        }
+        else
+            DrawFilledRect(device, left, rectangle.y,
+                left + itemWidth, rectangle.y + rectangle.height, color);
+    }
+}
+
 } // namespace
 
 void Render(IDirect3DDevice9* device, const Frame& frame)
@@ -212,30 +350,59 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
     device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
     device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
 
-    const float width = viewport.Width >= 900 ? 620.0f : 520.0f;
-    const float height = 68.0f;
-    const float left = (static_cast<float>(viewport.Width) - width) * 0.5f;
-    const float top = 18.0f;
+    const scoreboardconfig::Config& config = scoreboardconfig::Get();
+    float scale = 1.0f;
+    if (config.scaleMode == scoreboardconfig::ScaleMode::Uniform) {
+        const float scaleX = static_cast<float>(viewport.Width) /
+            config.referenceWidth;
+        const float scaleY = static_cast<float>(viewport.Height) /
+            config.referenceHeight;
+        scale = scaleX < scaleY ? scaleX : scaleY;
+    }
+    const float width = config.width * scale;
+    const float height = config.height * scale;
+    const float left = (static_cast<float>(viewport.Width) - width) * 0.5f +
+        config.offsetX * (config.scaleMode ==
+            scoreboardconfig::ScaleMode::Uniform ? scale : 1.0f);
+    const float top = config.offsetY * (config.scaleMode ==
+        scoreboardconfig::ScaleMode::Uniform ? scale : 1.0f);
     const float right = left + width;
     const float bottom = top + height;
-    const float teamWidth = width * 0.30f;
-    const float scoreWidth = width * 0.10f;
-    const float centerLeft = left + teamWidth + scoreWidth;
-    const float centerRight = right - teamWidth - scoreWidth;
 
+    const scoreboardconfig::Rect awayPanel =
+        ToScreen(config.awayPanel, left, top, scale);
+    const scoreboardconfig::Rect homePanel =
+        ToScreen(config.homePanel, left, top, scale);
     DrawFilledRect(device, left, top, right, bottom,
         D3DCOLOR_ARGB(232, 15, 18, 24));
-    DrawFilledRect(device, left, top, left + teamWidth, bottom,
+    DrawFilledRect(device, awayPanel.x, awayPanel.y,
+        awayPanel.x + awayPanel.width, awayPanel.y + awayPanel.height,
         frame.awayColor);
-    DrawFilledRect(device, right - teamWidth, top, right, bottom,
+    DrawFilledRect(device, homePanel.x, homePanel.y,
+        homePanel.x + homePanel.width, homePanel.y + homePanel.height,
         frame.homeColor);
-    const float accentHeight = 6.0f;
-    DrawFilledRect(device, left, bottom - accentHeight,
-        left + teamWidth, bottom, frame.awaySecondaryColor);
-    DrawFilledRect(device, right - teamWidth, bottom - accentHeight,
-        right, bottom, frame.homeSecondaryColor);
-    DrawFilledRect(device, centerLeft, top, centerRight, bottom,
-        D3DCOLOR_ARGB(255, 24, 28, 36));
+    const float accentHeight = 6.0f * scale;
+    DrawFilledRect(device, awayPanel.x,
+        awayPanel.y + awayPanel.height - accentHeight,
+        awayPanel.x + awayPanel.width,
+        awayPanel.y + awayPanel.height, frame.awaySecondaryColor);
+    DrawFilledRect(device, homePanel.x,
+        homePanel.y + homePanel.height - accentHeight,
+        homePanel.x + homePanel.width,
+        homePanel.y + homePanel.height, frame.homeSecondaryColor);
+
+    scoreboardconfig::Rect awayLogo =
+        ToScreen(config.awayLogo, left, top, scale);
+    if (config.showAwayLogo)
+        DrawTexture(device, frame.awayLogo,
+            awayLogo.x, awayLogo.y,
+            awayLogo.x + awayLogo.width,
+            awayLogo.y + awayLogo.height);
+    scoreboardconfig::Rect homeLogo =
+        ToScreen(config.homeLogo, left, top, scale);
+    if (config.showHomeLogo)
+        DrawTexture(device, frame.homeLogo, homeLogo.x, homeLogo.y,
+            homeLogo.x + homeLogo.width, homeLogo.y + homeLogo.height);
 
     const unsigned int shotSeconds =
         (frame.shotClockRaw + frame.clockUnitsPerSecond - 1u) /
@@ -262,43 +429,107 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
                 totalSeconds % 60u);
         }
         std::sprintf(shotClock, "%u", shotSeconds);
-        popupfont::DrawRight(device, awayScore,
-            centerLeft - 12.0f, top + 14.0f,
-            style.scoreHeight, style.scoreColor);
-        popupfont::DrawRight(device, homeScore,
-            right - teamWidth - 12.0f, top + 14.0f,
-            style.scoreHeight, style.scoreColor);
-        popupfont::DrawCentered(device, clock,
-            (centerLeft + centerRight) * 0.5f, top + 7.0f,
-            style.clockHeight, style.clockColor);
-        if (frame.shotClockValid)
-            popupfont::DrawRight(device, shotClock,
-                centerRight - 8.0f, top + 41.0f,
-                style.shotClockHeight, style.shotClockColor);
+        DrawBoundText(device, awayScore,
+            ToScreen(config.awayScore, left, top, scale),
+            style.scoreHeight * scale, style.scoreColor, 1);
+        DrawBoundText(device, homeScore,
+            ToScreen(config.homeScore, left, top, scale),
+            style.scoreHeight * scale, style.scoreColor, 1);
+        DrawBoundText(device, clock,
+            ToScreen(config.gameClock, left, top, scale),
+            style.clockHeight * scale, style.clockColor, 0);
+
+        bool showShotClock = frame.shotClockValid &&
+            config.shotClockVisibility !=
+                scoreboardconfig::ShotClockVisibility::Never;
+        if (showShotClock && config.shotClockVisibility ==
+                scoreboardconfig::ShotClockVisibility::UnderThreshold)
+            showShotClock = shotSeconds <= config.shotClockThreshold;
+        if (showShotClock) {
+            D3DCOLOR shotColor = shotSeconds <=
+                config.urgentShotClockThreshold ?
+                config.shotClockUrgentColor : config.shotClockNormalColor;
+            DrawBoundText(device, shotClock,
+                ToScreen(config.shotClock, left, top, scale),
+                style.shotClockHeight * scale, shotColor, 1);
+        }
+
+        char period[32];
+        FormatPeriod(frame.quarter, config.periodFormat,
+            period, sizeof(period));
+        DrawBoundText(device, period,
+            ToScreen(config.period, left, top, scale),
+            style.shotClockHeight * scale, style.clockColor, 0);
+        if (config.showTeamNames) {
+            DrawBoundText(device, frame.awayTeamName,
+                ToScreen(config.awayName, left, top, scale),
+                config.awayName.height * scale, style.scoreColor, 0);
+            DrawBoundText(device, frame.homeTeamName,
+                ToScreen(config.homeName, left, top, scale),
+                config.homeName.height * scale, style.scoreColor, 0);
+        }
+
+        int awayTimeouts = frame.awayTimeouts;
+        int homeTimeouts = frame.homeTimeouts;
+        if (!config.timeoutCountRemaining) {
+            awayTimeouts = config.maximumTimeouts - awayTimeouts;
+            homeTimeouts = config.maximumTimeouts - homeTimeouts;
+        }
+        IDirect3DTexture9* foulImage =
+            config.foulMode == scoreboardconfig::IndicatorMode::Images ?
+            popup::GetThemeTexture(device, config.foulImage) : nullptr;
+        IDirect3DTexture9* timeoutImage =
+            config.timeoutMode == scoreboardconfig::IndicatorMode::Images ?
+            popup::GetThemeTexture(device, config.timeoutImage) : nullptr;
+        DrawIndicator(device, config.foulMode,
+            ToScreen(config.awayFouls, left, top, scale),
+            frame.awayFouls, config.maximumTeamFouls,
+            "F", foulImage, style.scoreColor);
+        DrawIndicator(device, config.foulMode,
+            ToScreen(config.homeFouls, left, top, scale),
+            frame.homeFouls, config.maximumTeamFouls,
+            "F", foulImage, style.scoreColor);
+        DrawIndicator(device, config.timeoutMode,
+            ToScreen(config.awayTimeouts, left, top, scale),
+            awayTimeouts, config.maximumTimeouts,
+            "TO", timeoutImage, style.scoreColor);
+        DrawIndicator(device, config.timeoutMode,
+            ToScreen(config.homeTimeouts, left, top, scale),
+            homeTimeouts, config.maximumTimeouts,
+            "TO", timeoutImage, style.scoreColor);
+
+        if (config.showBonus && frame.homeFouls >= config.bonusThreshold) {
+            const char* bonus = config.doubleBonusThreshold > 0 &&
+                frame.homeFouls >= config.doubleBonusThreshold ?
+                config.doubleBonusText : config.bonusText;
+            DrawBoundText(device, bonus,
+                ToScreen(config.awayBonus, left, top, scale),
+                config.awayBonus.height * scale, style.scoreColor, 0);
+        }
+        if (config.showBonus && frame.awayFouls >= config.bonusThreshold) {
+            const char* bonus = config.doubleBonusThreshold > 0 &&
+                frame.awayFouls >= config.doubleBonusThreshold ?
+                config.doubleBonusText : config.bonusText;
+            DrawBoundText(device, bonus,
+                ToScreen(config.homeBonus, left, top, scale),
+                config.homeBonus.height * scale, style.scoreColor, 0);
+        }
     }
     else {
         DrawInteger(device, static_cast<unsigned int>(frame.awayScore),
-            centerLeft - 12.0f, top + 17.0f,
+            left + 236.0f * scale, top + 17.0f * scale,
             16.0f, 34.0f, 5.0f, white);
         DrawInteger(device, static_cast<unsigned int>(frame.homeScore),
-            right - teamWidth - 12.0f, top + 17.0f,
+            left + 422.0f * scale, top + 17.0f * scale,
             16.0f, 34.0f, 5.0f, white);
         DrawGameClock(device, frame.gameClockRaw,
             frame.clockUnitsPerSecond,
-            (centerLeft + centerRight) * 0.5f, top + 10.0f, white);
+            left + 310.0f * scale, top + 10.0f * scale, white);
         if (frame.shotClockValid)
-            DrawInteger(device, shotSeconds, centerRight - 8.0f,
+            DrawInteger(device, shotSeconds, left + 364.0f * scale,
                 top + 43.0f, 8.0f, 17.0f, 2.0f,
                 D3DCOLOR_XRGB(255, 210, 64));
     }
-
-    // Team logos are aspect-fitted and preserve PNG transparency.
-    DrawTexture(device, frame.awayLogo,
-        left + 12.0f, top + 7.0f,
-        left + teamWidth - 12.0f, bottom - accentHeight - 5.0f);
-    DrawTexture(device, frame.homeLogo,
-        right - teamWidth + 12.0f, top + 7.0f,
-        right - 12.0f, bottom - accentHeight - 5.0f);
 
     if (stateBlock) {
         stateBlock->Apply();

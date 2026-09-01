@@ -14,6 +14,7 @@
 #include "ScoreboardRenderer.h"
 #include "PopupTheme.h"
 #include "PopupFont.h"
+#include "ScoreboardConfig.h"
 
 #pragma comment(lib, "d3d9.lib")
 
@@ -47,6 +48,7 @@ bool g_scoreboardVisible = false;
 bool g_scoreboardSuppressed = false;
 bool g_gameplayStarted = false;
 bool g_seenIntroOverlayHide = false;
+int g_pendingFoulResetQuarter = INT_MIN;
 constexpr int MAX_OVERLAY_TYPE = 12;
 unsigned int g_lastOverlayHash[MAX_OVERLAY_TYPE + 1] = {};
 bool g_seenOverlayType[MAX_OVERLAY_TYPE + 1] = {};
@@ -133,6 +135,26 @@ volatile LONG g_d3d9ProbeScheduled = 0;
 bool g_reloadKeyWasDown = false;
 int g_loggedAwayLogoTeam = INT_MIN;
 int g_loggedHomeLogoTeam = INT_MIN;
+int g_visibilityPreviousAwayScore = INT_MIN;
+int g_visibilityPreviousHomeScore = INT_MIN;
+DWORD g_visibilityLastTick = 0;
+unsigned int g_scoreboardShowRemaining = 0;
+ULONGLONG g_reloadFileStamp = 0;
+DWORD g_reloadFileLastCheck = 0;
+
+ULONGLONG GetPopupReloadFileStamp()
+{
+    char path[MAX_PATH] = {};
+    DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return 0;
+    char* slash = std::strrchr(path, '\\');
+    if (!slash) return 0;
+    std::strcpy(slash + 1, "popups\\TEST\\.reload");
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &data)) return 0;
+    return (static_cast<ULONGLONG>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+        data.ftLastWriteTime.dwLowDateTime;
+}
 
 void CopyText(char* destination, size_t capacity, const char* source)
 {
@@ -465,6 +487,22 @@ void PollState()
         return;
     }
 
+    // Team fouls reset between periods. The game's foul getters can retain
+    // the previous period's values for a very short time after the quarter
+    // number changes, which would otherwise flash BONUS on the first frame.
+    if (g_lastState.quarter != INT_MIN &&
+        state.quarter != g_lastState.quarter) {
+        g_pendingFoulResetQuarter = state.quarter;
+    }
+    if (g_pendingFoulResetQuarter == state.quarter) {
+        const bool gameHasResetFouls =
+            state.homeFouls == 0 && state.awayFouls == 0;
+        state.homeFouls = 0;
+        state.awayFouls = 0;
+        if (gameHasResetFouls)
+            g_pendingFoulResetQuarter = INT_MIN;
+    }
+
     if (StateChanged(state, g_lastState)) {
         const unsigned int units = state.clockUnitsPerSecond;
         const unsigned int gameSeconds =
@@ -520,6 +558,7 @@ int __cdecl HookSendEvent(
         if (pauseEvent) {
             g_scoreboardSuppressed = true;
             g_scoreboardVisible = false;
+            g_visibilityLastTick = 0;
         }
         else if (std::strcmp(name, "ScoreHideEvent") == 0 ||
                  std::strcmp(name, "HideOverlaysEvent") == 0) {
@@ -534,6 +573,7 @@ int __cdecl HookSendEvent(
                  std::strcmp(name, "ShowOverlaysEvent") == 0) {
             g_scoreboardSuppressed = false;
             g_scoreboardVisible = g_gameplayStarted;
+            g_visibilityLastTick = 0;
         }
     }
 
@@ -617,6 +657,14 @@ bool RefreshRealtimeScoreboardState()
             g_lastState.awayTeamID = -1;
             g_lastState.homeTeamDBID = -1;
             g_lastState.awayTeamDBID = -1;
+            g_lastState.quarter = INT_MIN;
+            g_lastState.homeFouls = 0;
+            g_lastState.awayFouls = 0;
+            g_pendingFoulResetQuarter = INT_MIN;
+            g_visibilityPreviousAwayScore = INT_MIN;
+            g_visibilityPreviousHomeScore = INT_MIN;
+            g_visibilityLastTick = 0;
+            g_scoreboardShowRemaining = 0;
             return false;
         }
 
@@ -649,7 +697,17 @@ bool RefreshRealtimeScoreboardState()
                 g_lastState.clockUnitsPerSecond = 60;
         }
         g_lastState.gameRaw = getGameClock(info);
-        g_lastState.quarter = GetQuarter(gdAI);
+        const int previousQuarter = g_lastState.quarter;
+        const int currentQuarter = GetQuarter(gdAI);
+        g_lastState.quarter = currentQuarter;
+        if (previousQuarter != INT_MIN &&
+            currentQuarter != previousQuarter) {
+            // Clear the presentation cache immediately. PollState will
+            // replace these with the new quarter's authoritative values.
+            g_lastState.homeFouls = 0;
+            g_lastState.awayFouls = 0;
+            g_pendingFoulResetQuarter = currentQuarter;
+        }
         g_lastState.shotValid = isShotClockValid(info) ? 1 : 0;
         if (g_lastState.shotValid)
             g_lastState.shotRaw = getShotClock(info);
@@ -677,6 +735,63 @@ bool RefreshRealtimeScoreboardState()
     }
 }
 
+bool ThemeVisibilityAllowsScoreboard(const ExtendedState& state)
+{
+    const scoreboardconfig::Config& config = scoreboardconfig::Get();
+    const DWORD now = GetTickCount();
+    if (g_visibilityLastTick) {
+        const DWORD elapsed = now - g_visibilityLastTick;
+        g_scoreboardShowRemaining = elapsed >= g_scoreboardShowRemaining ?
+            0 : g_scoreboardShowRemaining - elapsed;
+    }
+    g_visibilityLastTick = now;
+
+    if (g_visibilityPreviousAwayScore != INT_MIN &&
+        (state.awayScore > g_visibilityPreviousAwayScore ||
+         state.homeScore > g_visibilityPreviousHomeScore)) {
+        g_scoreboardShowRemaining = config.showAfterScoreMilliseconds;
+    }
+    g_visibilityPreviousAwayScore = state.awayScore;
+    g_visibilityPreviousHomeScore = state.homeScore;
+
+    const unsigned int gameSeconds = state.clockUnitsPerSecond ?
+        state.gameRaw / state.clockUnitsPerSecond : UINT_MAX;
+    const bool lateGame =
+        gameSeconds <= config.alwaysShowBelowSeconds;
+    switch (config.visibilityMode) {
+    case scoreboardconfig::VisibilityMode::AfterScore:
+        return g_scoreboardShowRemaining > 0;
+    case scoreboardconfig::VisibilityMode::LateGameOnly:
+        return lateGame;
+    case scoreboardconfig::VisibilityMode::AfterScoreAndLateGame:
+        return lateGame || g_scoreboardShowRemaining > 0;
+    default:
+        return true;
+    }
+}
+
+const char* SelectTeamName(const popup::TeamVisual* team,
+                           scoreboardconfig::TeamNameFormat format,
+                           char* fullName, size_t capacity,
+                           const char* fallback)
+{
+    if (!team) return fallback;
+    switch (format) {
+    case scoreboardconfig::TeamNameFormat::City:
+        return team->cityName;
+    case scoreboardconfig::TeamNameFormat::Nickname:
+        return team->teamName;
+    case scoreboardconfig::TeamNameFormat::FullName:
+        std::snprintf(fullName, capacity, "%s %s",
+            team->cityName, team->teamName);
+        return fullName;
+    case scoreboardconfig::TeamNameFormat::ShortCode:
+        return team->shortCode;
+    default:
+        return team->abbreviation;
+    }
+}
+
 void RenderNativeScoreboard(IDirect3DDevice9* device)
 {
     if (!device || !RefreshRealtimeScoreboardState() ||
@@ -688,6 +803,11 @@ void RenderNativeScoreboard(IDirect3DDevice9* device)
     // TEST is the first external popup package. Team data is keyed by the
     // zero-based database ID, not by the runtime IDTeam value.
     popup::Load("TEST");
+    scoreboardconfig::Load("TEST");
+    if (!ThemeVisibilityAllowsScoreboard(g_lastState))
+        return;
+    const scoreboardconfig::Config& scoreboardSettings =
+        scoreboardconfig::Get();
     const popup::TeamVisual* awayTeam =
         popup::FindTeam(g_lastState.awayTeamDBID);
     const popup::TeamVisual* homeTeam =
@@ -700,6 +820,11 @@ void RenderNativeScoreboard(IDirect3DDevice9* device)
     frame.shotClockRaw = g_lastState.shotRaw;
     frame.awayScore = g_lastState.awayScore;
     frame.homeScore = g_lastState.homeScore;
+    frame.quarter = g_lastState.quarter;
+    frame.awayFouls = g_lastState.awayFouls;
+    frame.homeFouls = g_lastState.homeFouls;
+    frame.awayTimeouts = g_lastState.awayTimeouts;
+    frame.homeTimeouts = g_lastState.homeTimeouts;
     frame.awayDatabaseTeamID = g_lastState.awayTeamDBID;
     frame.homeDatabaseTeamID = g_lastState.homeTeamDBID;
     frame.awayColor = awayTeam ? awayTeam->primaryColor :
@@ -730,24 +855,45 @@ void RenderNativeScoreboard(IDirect3DDevice9* device)
             homeTeam ? homeTeam->logoPath : "<no team entry>",
             frame.homeLogo ? "<none>" : popup::GetLastError());
     }
+    char awayFullName[128] = {};
+    char homeFullName[128] = {};
+    frame.awayTeamName = SelectTeamName(awayTeam,
+        scoreboardSettings.teamNameFormat,
+        awayFullName, sizeof(awayFullName), g_broadcast.awayName);
+    frame.homeTeamName = SelectTeamName(homeTeam,
+        scoreboardSettings.teamNameFormat,
+        homeFullName, sizeof(homeFullName), g_broadcast.homeName);
     scoreboard::Render(device, frame);
 }
 
 void CheckPopupHotReload(IDirect3DDevice9* device)
 {
     const bool keyDown = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
-    if (keyDown && !g_reloadKeyWasDown) {
+    bool reloadRequested = keyDown && !g_reloadKeyWasDown;
+    const DWORD now = GetTickCount();
+    if (now - g_reloadFileLastCheck >= 500) {
+        g_reloadFileLastCheck = now;
+        const ULONGLONG stamp = GetPopupReloadFileStamp();
+        if (g_reloadFileStamp && stamp && stamp != g_reloadFileStamp)
+            reloadRequested = true;
+        g_reloadFileStamp = stamp;
+    }
+    if (reloadRequested) {
         // This runs on the Present/render thread, so cached D3D resources are
         // never released concurrently with scoreboard drawing.
         const bool themeLoaded = popup::Reload("TEST");
         const bool fontLoaded = popupfont::Reload(device, "TEST");
+        const bool scoreboardLoaded = scoreboardconfig::Reload("TEST");
         g_loggedAwayLogoTeam = INT_MIN;
         g_loggedHomeLogoTeam = INT_MIN;
         AppendDiagnostic(
-            "Popup hot reload: teams=%s font=%s error=%s\n",
+            "Popup hot reload: teams=%s font=%s scoreboard=%s error=%s\n",
             themeLoaded ? "OK" : "FAILED",
             fontLoaded ? "OK" : "FAILED",
-            themeLoaded ? "<none>" : popup::GetLastError());
+            scoreboardLoaded ? "OK" : "FAILED",
+            themeLoaded && scoreboardLoaded ? "<none>" :
+                (!themeLoaded ? popup::GetLastError() :
+                    scoreboardconfig::GetLastError()));
     }
     g_reloadKeyWasDown = keyDown;
 }

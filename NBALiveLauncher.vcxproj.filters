@@ -51,6 +51,9 @@
     <ClCompile Include="PopupFont.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ScoreboardConfig.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Resolutions.h">
@@ -80,10 +83,18 @@
     <ClInclude Include="PopupFont.h">
       <Filter>Source Files</Filter>
     </ClInclude>
+    <ClInclude Include="ScoreboardConfig.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="NBALiveResolution.rc">
       <Filter>Resource Files</Filter>
     </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="ScoreboardThemeSystem_README.md">
+      <Filter>Source Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

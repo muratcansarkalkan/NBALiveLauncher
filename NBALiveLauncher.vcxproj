@@ -113,6 +113,7 @@ xcopy /y "$(TargetDir)$(TargetName).pdb" "C:\Games\NBA LIVE 08\plugins" </Comman
     <ClCompile Include="EnableWindowed.cpp" />
     <ClCompile Include="PopupFont.cpp" />
     <ClCompile Include="PopupTheme.cpp" />
+    <ClCompile Include="ScoreboardConfig.cpp" />
     <ClCompile Include="ScoreboardRenderer.cpp" />
     <ClCompile Include="ShotClock.cpp" />
     <ClCompile Include="ShotClockGames.cpp" />
@@ -124,12 +125,16 @@ xcopy /y "$(TargetDir)$(TargetName).pdb" "C:\Games\NBA LIVE 08\plugins" </Comman
     <ClInclude Include="PopupTheme.h" />
     <ClInclude Include="Resolutions.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="ScoreboardConfig.h" />
     <ClInclude Include="ScoreboardRenderer.h" />
     <ClInclude Include="ShotClock.h" />
     <ClInclude Include="ShotClockGames.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="NBALiveResolution.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="ScoreboardThemeSystem_README.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

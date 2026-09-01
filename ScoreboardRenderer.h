@@ -11,6 +11,11 @@ struct Frame {
     unsigned int shotClockRaw;
     int awayScore;
     int homeScore;
+    int quarter;
+    int awayFouls;
+    int homeFouls;
+    int awayTimeouts;
+    int homeTimeouts;
     int awayDatabaseTeamID;
     int homeDatabaseTeamID;
     D3DCOLOR awayColor;
@@ -19,6 +24,8 @@ struct Frame {
     D3DCOLOR homeSecondaryColor;
     IDirect3DTexture9* awayLogo;
     IDirect3DTexture9* homeLogo;
+    const char* awayTeamName;
+    const char* homeTeamName;
 };
 
 void Render(IDirect3DDevice9* device, const Frame& frame);

@@ -1,0 +1,13 @@
+{
+  "fontFile": "fonts/scoreboard.ttf",
+  "fontFace": "Arial",
+  "fontSourceHeight": 48,
+  "fontWeight": 600,
+  "characterSpacing": 1,
+  "scoreHeight": 34,
+  "clockHeight": 28,
+  "shotClockHeight": 17,
+  "scoreColor": 16777215,
+  "clockColor": 16777215,
+  "shotClockColor": 16764480
+}
