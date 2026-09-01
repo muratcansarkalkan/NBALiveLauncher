@@ -1,4 +1,5 @@
 #include "ScoreboardRenderer.h"
+#include "PopupFont.h"
 
 #include <cstdio>
 #include <cstring>
@@ -240,17 +241,56 @@ void Render(IDirect3DDevice9* device, const Frame& frame)
         (frame.shotClockRaw + frame.clockUnitsPerSecond - 1u) /
         frame.clockUnitsPerSecond;
     const D3DCOLOR white = D3DCOLOR_XRGB(255, 255, 255);
-    DrawInteger(device, static_cast<unsigned int>(frame.awayScore),
-        centerLeft - 12.0f, top + 17.0f, 16.0f, 34.0f, 5.0f, white);
-    DrawInteger(device, static_cast<unsigned int>(frame.homeScore),
-        right - teamWidth - 12.0f, top + 17.0f,
-        16.0f, 34.0f, 5.0f, white);
-    DrawGameClock(device, frame.gameClockRaw, frame.clockUnitsPerSecond,
-        (centerLeft + centerRight) * 0.5f, top + 10.0f, white);
-    if (frame.shotClockValid)
-        DrawInteger(device, shotSeconds, centerRight - 8.0f,
-            top + 43.0f, 8.0f, 17.0f, 2.0f,
-            D3DCOLOR_XRGB(255, 210, 64));
+    if (popupfont::Begin(device, "TEST")) {
+        const popupfont::Style& style = popupfont::GetStyle();
+        char awayScore[16];
+        char homeScore[16];
+        char clock[16];
+        char shotClock[16];
+        std::sprintf(awayScore, "%d", frame.awayScore);
+        std::sprintf(homeScore, "%d", frame.homeScore);
+        const unsigned int totalTenths =
+            (frame.gameClockRaw * 10u + frame.clockUnitsPerSecond - 1u) /
+            frame.clockUnitsPerSecond;
+        if (totalTenths < 600u)
+            std::sprintf(clock, "%u.%u", totalTenths / 10u,
+                totalTenths % 10u);
+        else {
+            const unsigned int totalSeconds =
+                frame.gameClockRaw / frame.clockUnitsPerSecond;
+            std::sprintf(clock, "%u:%02u", totalSeconds / 60u,
+                totalSeconds % 60u);
+        }
+        std::sprintf(shotClock, "%u", shotSeconds);
+        popupfont::DrawRight(device, awayScore,
+            centerLeft - 12.0f, top + 14.0f,
+            style.scoreHeight, style.scoreColor);
+        popupfont::DrawRight(device, homeScore,
+            right - teamWidth - 12.0f, top + 14.0f,
+            style.scoreHeight, style.scoreColor);
+        popupfont::DrawCentered(device, clock,
+            (centerLeft + centerRight) * 0.5f, top + 7.0f,
+            style.clockHeight, style.clockColor);
+        if (frame.shotClockValid)
+            popupfont::DrawRight(device, shotClock,
+                centerRight - 8.0f, top + 41.0f,
+                style.shotClockHeight, style.shotClockColor);
+    }
+    else {
+        DrawInteger(device, static_cast<unsigned int>(frame.awayScore),
+            centerLeft - 12.0f, top + 17.0f,
+            16.0f, 34.0f, 5.0f, white);
+        DrawInteger(device, static_cast<unsigned int>(frame.homeScore),
+            right - teamWidth - 12.0f, top + 17.0f,
+            16.0f, 34.0f, 5.0f, white);
+        DrawGameClock(device, frame.gameClockRaw,
+            frame.clockUnitsPerSecond,
+            (centerLeft + centerRight) * 0.5f, top + 10.0f, white);
+        if (frame.shotClockValid)
+            DrawInteger(device, shotSeconds, centerRight - 8.0f,
+                top + 43.0f, 8.0f, 17.0f, 2.0f,
+                D3DCOLOR_XRGB(255, 210, 64));
+    }
 
     // Team logos are aspect-fitted and preserve PNG transparency.
     DrawTexture(device, frame.awayLogo,

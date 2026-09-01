@@ -48,6 +48,9 @@
     <ClCompile Include="PopupTheme.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PopupFont.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Resolutions.h">
@@ -72,6 +75,9 @@
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="PopupTheme.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PopupFont.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

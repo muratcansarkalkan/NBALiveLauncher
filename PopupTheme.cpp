@@ -1,6 +1,7 @@
 #include "PopupTheme.h"
 
 #include <Windows.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,16 @@ std::vector<LogoTexture> g_logos;
 IDirect3DDevice9* g_textureDevice = nullptr;
 bool g_loadAttempted = false;
 char g_loadedTheme[64] = {};
+char g_lastError[512] = {};
+
+void SetLastError(const char* format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(g_lastError, sizeof(g_lastError), format, arguments);
+    va_end(arguments);
+    g_lastError[sizeof(g_lastError) - 1] = '\0';
+}
 
 typedef HRESULT (WINAPI *D3DXCreateTextureFromFileExAFn)(
     IDirect3DDevice9*, const char*, UINT, UINT, UINT, DWORD,
@@ -240,7 +251,10 @@ bool ParseTeams(const std::string& json, const std::string& themeDirectory)
 
 bool Load(const char* themeName)
 {
-    if (!themeName || !*themeName) return false;
+    if (!themeName || !*themeName) {
+        SetLastError("Theme name is empty.");
+        return false;
+    }
     if (g_loadAttempted && std::strcmp(g_loadedTheme, themeName) == 0)
         return !g_teams.empty();
 
@@ -250,13 +264,33 @@ bool Load(const char* themeName)
     std::strncpy(g_loadedTheme, themeName, sizeof(g_loadedTheme) - 1);
 
     const std::string gameDirectory = GetGameDirectory();
-    if (gameDirectory.empty()) return false;
+    if (gameDirectory.empty()) {
+        SetLastError("Could not resolve the game directory.");
+        return false;
+    }
     const std::string themeDirectory =
         gameDirectory + "\\popups\\" + themeName;
     const std::string jsonPath = themeDirectory + "\\teams.json";
     std::string json;
-    return ReadFile(jsonPath.c_str(), &json) &&
-           ParseTeams(json, themeDirectory);
+    if (!ReadFile(jsonPath.c_str(), &json)) {
+        SetLastError("Could not read %s", jsonPath.c_str());
+        return false;
+    }
+    if (!ParseTeams(json, themeDirectory)) {
+        SetLastError("No valid team records in %s", jsonPath.c_str());
+        return false;
+    }
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool Reload(const char* themeName)
+{
+    ReleaseTextures();
+    g_teams.clear();
+    g_loadAttempted = false;
+    g_loadedTheme[0] = '\0';
+    return Load(themeName);
 }
 
 const TeamVisual* FindTeam(int databaseTeamID)
@@ -280,9 +314,26 @@ IDirect3DTexture9* GetLogoTexture(
             return g_logos[i].texture;
 
     const TeamVisual* team = FindTeam(databaseTeamID);
-    if (!team || !team->logoPath[0]) return nullptr;
+    if (!team) {
+        SetLastError("No teams.json entry for databaseTeamID=%d.",
+            databaseTeamID);
+        return nullptr;
+    }
+    if (!team->logoPath[0]) {
+        SetLastError("Team %d has no logo path.", databaseTeamID);
+        return nullptr;
+    }
+    if (GetFileAttributesA(team->logoPath) == INVALID_FILE_ATTRIBUTES) {
+        SetLastError("Logo file does not exist: %s", team->logoPath);
+        LogoTexture missing = { databaseTeamID, nullptr };
+        g_logos.push_back(missing);
+        return nullptr;
+    }
     const D3DXCreateTextureFromFileExAFn loadTexture = GetTextureLoader();
-    if (!loadTexture) return nullptr;
+    if (!loadTexture) {
+        SetLastError("No usable d3dx9_24.dll through d3dx9_43.dll found.");
+        return nullptr;
+    }
 
     IDirect3DTexture9* texture = nullptr;
     const HRESULT result = loadTexture(
@@ -292,7 +343,17 @@ IDirect3DTexture9* GetLogoTexture(
     LogoTexture cached = { databaseTeamID,
         SUCCEEDED(result) ? texture : nullptr };
     g_logos.push_back(cached);
+    if (FAILED(result))
+        SetLastError("D3DX failed to load %s (HRESULT=%08X).",
+            team->logoPath, static_cast<unsigned int>(result));
+    else
+        g_lastError[0] = '\0';
     return cached.texture;
+}
+
+const char* GetLastError()
+{
+    return g_lastError;
 }
 
 void Shutdown()
@@ -301,6 +362,7 @@ void Shutdown()
     g_teams.clear();
     g_loadAttempted = false;
     g_loadedTheme[0] = '\0';
+    g_lastError[0] = '\0';
 }
 
 } // namespace popup

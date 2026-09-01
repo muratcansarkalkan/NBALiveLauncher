@@ -18,11 +18,15 @@ struct TeamVisual {
 // Loads <game directory>\popups\<themeName>\teams.json.
 // It is safe to call repeatedly; the file is read only once per theme.
 bool Load(const char* themeName);
+bool Reload(const char* themeName);
 const TeamVisual* FindTeam(int databaseTeamID);
 
 // Loaded lazily from TeamVisual::logoPath and cached per D3D device.
 IDirect3DTexture9* GetLogoTexture(
     IDirect3DDevice9* device, int databaseTeamID);
+
+// Human-readable reason for the most recent theme/logo loading failure.
+const char* GetLastError();
 
 void Shutdown();
 

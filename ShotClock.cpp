@@ -13,6 +13,7 @@
 #include <d3d9.h>
 #include "ScoreboardRenderer.h"
 #include "PopupTheme.h"
+#include "PopupFont.h"
 
 #pragma comment(lib, "d3d9.lib")
 
@@ -129,6 +130,9 @@ void** g_hookedDeviceVtable = nullptr;
 bool g_presentReached = false;
 HMODULE g_systemD3D9Module = nullptr;
 volatile LONG g_d3d9ProbeScheduled = 0;
+bool g_reloadKeyWasDown = false;
+int g_loggedAwayLogoTeam = INT_MIN;
+int g_loggedHomeLogoTeam = INT_MIN;
 
 void CopyText(char* destination, size_t capacity, const char* source)
 {
@@ -504,8 +508,16 @@ int __cdecl HookSendEvent(
     // Pause/menu overlay events are not guaranteed to target
     // _level0.gMainScreen. Treat them as global presentation state.
     if (name) {
-        if (std::strstr(name, "Pause") != nullptr &&
-            std::strstr(name, "Resume") == nullptr) {
+        // "UnPauseEvent" contains the word "Pause", so resume events must
+        // be recognized before the generic pause substring check. Otherwise
+        // 07/08 stay suppressed until the next ScoreClockUpdateEvent.
+        const bool resumeEvent =
+            std::strstr(name, "Resume") != nullptr ||
+            std::strstr(name, "UnPause") != nullptr;
+        const bool pauseEvent =
+            std::strstr(name, "Pause") != nullptr && !resumeEvent;
+
+        if (pauseEvent) {
             g_scoreboardSuppressed = true;
             g_scoreboardVisible = false;
         }
@@ -517,7 +529,7 @@ int __cdecl HookSendEvent(
             g_scoreboardSuppressed = true;
             g_scoreboardVisible = false;
         }
-        else if (std::strstr(name, "Resume") != nullptr ||
+        else if (resumeEvent ||
                  std::strcmp(name, "ScoreShowEvent") == 0 ||
                  std::strcmp(name, "ShowOverlaysEvent") == 0) {
             g_scoreboardSuppressed = false;
@@ -700,9 +712,44 @@ void RenderNativeScoreboard(IDirect3DDevice9* device)
         D3DCOLOR_XRGB(220, 220, 220);
     frame.awayLogo = popup::GetLogoTexture(
         device, g_lastState.awayTeamDBID);
+    if (g_loggedAwayLogoTeam != g_lastState.awayTeamDBID) {
+        g_loggedAwayLogoTeam = g_lastState.awayTeamDBID;
+        AppendDiagnostic(
+            "Away logo databaseTeamID=%d texture=%p path=%s error=%s\n",
+            g_lastState.awayTeamDBID, frame.awayLogo,
+            awayTeam ? awayTeam->logoPath : "<no team entry>",
+            frame.awayLogo ? "<none>" : popup::GetLastError());
+    }
     frame.homeLogo = popup::GetLogoTexture(
         device, g_lastState.homeTeamDBID);
+    if (g_loggedHomeLogoTeam != g_lastState.homeTeamDBID) {
+        g_loggedHomeLogoTeam = g_lastState.homeTeamDBID;
+        AppendDiagnostic(
+            "Home logo databaseTeamID=%d texture=%p path=%s error=%s\n",
+            g_lastState.homeTeamDBID, frame.homeLogo,
+            homeTeam ? homeTeam->logoPath : "<no team entry>",
+            frame.homeLogo ? "<none>" : popup::GetLastError());
+    }
     scoreboard::Render(device, frame);
+}
+
+void CheckPopupHotReload(IDirect3DDevice9* device)
+{
+    const bool keyDown = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+    if (keyDown && !g_reloadKeyWasDown) {
+        // This runs on the Present/render thread, so cached D3D resources are
+        // never released concurrently with scoreboard drawing.
+        const bool themeLoaded = popup::Reload("TEST");
+        const bool fontLoaded = popupfont::Reload(device, "TEST");
+        g_loggedAwayLogoTeam = INT_MIN;
+        g_loggedHomeLogoTeam = INT_MIN;
+        AppendDiagnostic(
+            "Popup hot reload: teams=%s font=%s error=%s\n",
+            themeLoaded ? "OK" : "FAILED",
+            fontLoaded ? "OK" : "FAILED",
+            themeLoaded ? "<none>" : popup::GetLastError());
+    }
+    g_reloadKeyWasDown = keyDown;
 }
 
 HRESULT WINAPI HookPresent(IDirect3DDevice9* device, const RECT* sourceRect,
@@ -717,6 +764,7 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* device, const RECT* sourceRect,
             "Native scoreboard reached Present device=%p viewport=%ux%u.\n",
             device, viewport.Width, viewport.Height);
     }
+    CheckPopupHotReload(device);
     if (SUCCEEDED(device->BeginScene())) {
         RenderNativeScoreboard(device);
         device->EndScene();

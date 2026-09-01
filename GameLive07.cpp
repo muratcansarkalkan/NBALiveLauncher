@@ -152,6 +152,27 @@ namespace live07 {
         return CallMethodAndReturn<DWORD, 0x439024>(address, &v3, v6);
     }
 
+    __declspec(naked) void Live07MovieFilter()
+    {
+        __asm
+        {
+            // Original instruction
+            mov ecx, [esp + 8]
+
+            // EAX = movie ID returned by sub_501110.
+            cmp eax, 1
+            je skipMovie
+
+            // Original movie playback.
+            push eax
+            mov edx, 0x0055C430
+            call edx
+
+            skipMovie :
+            ret
+        }
+    }
+
     int METHOD BroadcastMouseInput(int* _this)
     {
         int result; // eax
@@ -256,9 +277,9 @@ void Install_LIVE07() {
     patch::SetFloat(0x63F982 + 4, loadYEnd);
     // enable/disable intro
     if (INTRO != 1) {
+        patch::RedirectJump(0x005650AB, Live07MovieFilter);
         patch::SetPointer(0x560A23 + 1, "DUMMY");
-        patch::SetPointer(0x560C96 + 1, "DUMMY");
-        patch::SetPointer(0x560C96 + 1, "DUMMY");
+        //patch::SetPointer(0x560C96 + 1, "DUMMY");
     }
     // CreateZone
     patch::SetUInt(0xC65D68, czXPos);
