@@ -45,6 +45,9 @@
     <ClCompile Include="ScoreboardRenderer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PopupTheme.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Resolutions.h">
@@ -66,6 +69,9 @@
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="ShotClock.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PopupTheme.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

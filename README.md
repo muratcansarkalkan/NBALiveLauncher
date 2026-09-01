@@ -53,15 +53,9 @@ require a separate configuration entry.
 
 ## Supported Games
 
-  Game            Resolution / Widescreen   Windowed Mode   Native Scoreboard
-  --------------- ------------------------- --------------- -------------------
-  NBA Live 2005   Yes                       Yes             Yes
-  NBA Live 06     Yes                       Yes             Yes
-  NBA Live 07     Yes                       Yes             Yes
-  NBA Live 08     Yes                       Yes             Yes
-
 The plugin targets the specific supported game executables used by the
-original projects. A compatible **NO-CD fixed executable** is required.
+original projects. The only games that are supported are NBA Live 2005-08.
+A compatible **NO-CD fixed executable** is required.
 The original CD releases are also problematic on modern versions of
 Windows.
 
@@ -161,42 +155,24 @@ NBA Live 2005, 06, and 07 expose 10 resolution entries. NBA Live 08
 exposes 16 entries. The launcher replaces the original entries with the
 following resolutions.
 
-  --------------------------------------------------------------------------
-  Original Entry NBA Live 2005  NBA Live 06    NBA Live 07    NBA Live 08
-  -------------- -------------- -------------- -------------- --------------
-  640x480x16     640x480x32     640x480x32     640x480x32     640x480x32
-
-  640x480x32     800x600x32     800x600x32     `RES_X` x      `RES_X` x
-                                               `RES_Y` x32    `RES_Y` x32
-
-  800x600x16     1024x768x32    1024x768x32    1024x768x32    1024x768x32
-
-  800x600x32     1280x720x32    1280x720x32    1280x720x32    1280x720x32
-
-  1024x768x16    1280x1024x32   1280x1024x32   1280x1024x32   1280x1024x32
-
-  1024x768x32    1366x768x32    1366x768x32    1366x768x32    1366x768x32
-
-  1280x720x16    \-             \-             \-             1440x900x32
-
-  1280x720x32    \-             \-             \-             1600x900x32
-
-  1280x1024x16   1440x900x32    1440x900x32    1440x900x32    1600x1200x32
-
-  1280x1024x32   1600x900x32    1600x900x32    1600x900x32    1680x1050x32
-
-  1440x900x16    \-             \-             \-             1920x1080x32
-
-  1440x900x32    \-             \-             \-             2560x1440x32
-
-  1600x1200x16   1920x1080x32   1920x1080x32   1920x1080x32   3440x1440x32
-
-  1600x1200x32   2560x1440x32   2560x1440x32   2560x1440x32   3840x1080x32
-
-  1680x1050x16   \-             \-             \-             3840x1200x32
-
-  1680x1050x32   \-             \-             \-             3840x1600x32
-  --------------------------------------------------------------------------
+| Resolution    | 2005         | 2006         | 2007         | 2008         |
+|---------------|--------------|--------------|--------------|--------------|
+| 640x480x16    | 640x480x32   | 640x480x32   | 640x480x32   | 640x480x32   |
+| 640x480x32    | 800x600x32   | 800x600x32   | RES_XxRES_Yx32*   | RES_XxRES_Yx32*   |
+| 800x600x16    | 1024x768x32  | 1024x768x32  | 1024x768x32  | 1024x768x32  |
+| 800x600x32    | 1280x720x32  | 1280x720x32  | 1280x720x32  | 1280x720x32  |
+| 1024x768x16   | 1280x1024x32 | 1280x1024x32 | 1280x1024x32 | 1280x1024x32 |
+| 1024x768x32   | 1366x768x32  | 1366x768x32  | 1366x768x32  | 1366x768x32  |
+| 1280x720x16   | -            | -            | -            | 1440x900x32  |
+| 1280x720x32   | -            | -            | -            | 1600x900x32  |
+| 1280x1024x16  | 1440x900x32  | 1440x900x32  | 1440x900x32  | 1600x1200x32 |
+| 1280x1024x32  | 1600x900x32  | 1600x900x32  | 1600x900x32  | 1680x1050x32 |
+| 1440x900x16   | -            | -            | -            | 1920x1080x32 |
+| 1440x900x32   | -            | -            | -            | 2560x1440x32 |
+| 1600x1200x16  | 1920x1080x32 | 1920x1080x32 | 1920x1080x32 | 3440x1440x32 |
+| 1600x1200x32  | 2560x1440x32 | 2560x1440x32 | 2560x1440x32 | 3840x1080x32 |
+| 1680x1050x16  | -            | -            | -            | 3840x1200x32 |
+| 1680x1050x32  | -            | -            | -            | 3840x1600x32 |
 
 For example, to select **1920x1080** in NBA Live 06, select the original
 **1600x1200x16** entry in Detail Settings.
@@ -353,9 +329,6 @@ Check that:
 
 ## Credits
 
--   **Murat Can Şarkalkan** --- launcher integration,
-    resolution/widescreen work, windowed mode, and scoreboard
-    development
 -   **Dmitri** --- coding assistance and FIFAM ASI Loader development
 -   **wiscard_rush** --- UI components
 -   **JuicyShaqMeat** --- UI components

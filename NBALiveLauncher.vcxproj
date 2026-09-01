@@ -111,6 +111,7 @@ xcopy /y "$(TargetDir)$(TargetName).pdb" "C:\Games\NBA LIVE 08\plugins" </Comman
     <ClCompile Include="GameLive2005.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="EnableWindowed.cpp" />
+    <ClCompile Include="PopupTheme.cpp" />
     <ClCompile Include="ScoreboardRenderer.cpp" />
     <ClCompile Include="ShotClock.cpp" />
     <ClCompile Include="ShotClockGames.cpp" />
@@ -118,6 +119,7 @@ xcopy /y "$(TargetDir)$(TargetName).pdb" "C:\Games\NBA LIVE 08\plugins" </Comman
   <ItemGroup>
     <ClInclude Include="AdjustWSUI.h" />
     <ClInclude Include="Games.h" />
+    <ClInclude Include="PopupTheme.h" />
     <ClInclude Include="Resolutions.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="ScoreboardRenderer.h" />

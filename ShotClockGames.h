@@ -30,4 +30,3 @@ extern const GameAddresses NBA_LIVE_2005;
 extern const GameAddresses NBA_LIVE_2006;
 extern const GameAddresses NBA_LIVE_2007;
 extern const GameAddresses NBA_LIVE_2008;
-#pragma once
