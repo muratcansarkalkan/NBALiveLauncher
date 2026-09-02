@@ -624,6 +624,34 @@ int __cdecl HookSendEvent(
             }
         }
     }
+    // Keep ScoreShowEvent available to the custom scoreboard lifecycle code
+    // above, but do not forward it to the original Flash/APT main-screen
+    // receiver in games whose native show-state wrappers are neutralized.
+    if (g_game &&
+        (g_game->version == GameVersion::Live2005 ||
+        g_game->version == GameVersion::Live2006 ||
+        g_game->version == GameVersion::Live2007 ||
+        g_game->version == GameVersion::Live2008) &&
+        mainScreen && name && std::strcmp(name, "ScoreShowEvent") == 0) {
+        return 0;
+    }
+
+    // Live 08's pause flow restores the existing Flash main screen through
+    // ShowOverlayManager itself, before its later ScoreShowEvent reaches this
+    // hook. Preserve the pause/overlay manager, then hide only the native
+    // scoreboard. Call the original directly for the synthetic hide so our
+    // custom scoreboard lifecycle is not suppressed.
+    if (g_game &&
+        (g_game->version == GameVersion::Live2007 ||
+            g_game->version == GameVersion::Live2008) &&
+        name && std::strcmp(name, "ShowOverlayManager") == 0) {
+        const int result = g_originalSendEvent(
+            event, path, name, p0, p1, p2, p3, p4);
+        g_originalSendEvent(event, "_level0.gMainScreen", "ScoreHideEvent",
+            nullptr, nullptr, nullptr, nullptr, nullptr);
+        return result;
+    }
+
     return g_originalSendEvent(event, path, name, p0, p1, p2, p3, p4);
 }
 
@@ -1305,6 +1333,53 @@ void Initialize(const GameAddresses& game)
 {
     g_game = &game;
     g_originalSendEvent = reinterpret_cast<SendEventFn>(game.sendEvent);
+
+    if (game.version == GameVersion::Live2005) {
+        patch::SetUChar(0x0054023F + 3, 0); // Generic show
+        patch::SetUChar(0x0055AA7F + 3, 0); // JumpBallToss
+        patch::SetUChar(0x0055AADF + 3, 0); // QuarterStart
+        patch::SetUChar(0x0055AB0F + 3, 0); // UnPauseGame
+    }
+
+    // NBA Live 06 FEOverlayScore::Show sets its controller-visible flag at
+    // [this+0x24] before sending ScoreShowEvent. Keep that flag cleared so a
+    // later ShowOverlaysEvent (notably pause/resume) cannot resurrect the
+    // native scoreboard. The immediate byte of C6 41 24 01 is at +3.
+    if (game.version == GameVersion::Live2006)
+        patch::SetUChar(0x0053AB8F + 3, 0);
+
+    // Live 06 also has three overlay-manager ScoreShowEvent wrappers. Each
+    // sets its own [this+0x24] visible byte before SendEvent reaches our hook.
+    // The pause path uses the third wrapper (call logged at 0x0055B1CE), so
+    // merely consuming ScoreShowEvent is too late: ShowOverlayManager sees the
+    // byte and restores the native board. Keep all three wrapper flags clear.
+    if (game.version == GameVersion::Live2006) {
+        patch::SetUChar(0x0055B12F + 3, 0);
+        patch::SetUChar(0x0055B18F + 3, 0);
+        patch::SetUChar(0x0055B1BF + 3, 0);
+    }
+
+    if (game.version == GameVersion::Live2007) {
+        patch::SetUChar(0x0054DC8F + 3, 0);
+        patch::SetUChar(0x0054E1CF + 3, 0);
+        patch::SetUChar(0x0054E232 + 3, 0);
+        patch::SetUChar(0x0054E27F + 3, 0);
+        patch::SetUChar(0x0055B73F + 3, 0);
+        patch::SetUChar(0x0055B84D + 3, 0);
+    }
+
+    // NBA Live 08 uses +0x30 for the native scoreboard controller-visible
+    // byte. Neutralize every known ScoreShowEvent wrapper, including the two
+    // overlay-manager paths used while restoring overlays after pause.
+    if (game.version == GameVersion::Live2008) {
+        patch::SetUChar(0x005547BF + 3, 0);
+        patch::SetUChar(0x00554D3F + 3, 0);
+        patch::SetUChar(0x00554DA2 + 3, 0);
+        patch::SetUChar(0x00554DEF + 3, 0);
+        patch::SetUChar(0x0056C57F + 3, 0);
+        patch::SetUChar(0x0056C6AD + 3, 0);
+    }
+
     InitializeCriticalSection(&g_logLock);
     g_logReady = true;
 
