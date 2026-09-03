@@ -15,9 +15,18 @@
         <Grid.RowDefinitions><RowDefinition Height="54"/><RowDefinition Height="*"/><RowDefinition Height="28"/></Grid.RowDefinitions>
         <Border Grid.Row="0" Background="#222630" Padding="10,8">
             <StackPanel Orientation="Horizontal">
-                <Button Content="Open Theme" Click="OpenTheme_Click" Padding="14,5" Margin="0,0,8,0"/>
+                <Button Content="Open" Click="OpenTheme_Click" Padding="14,5" Margin="0,0,8,0"/>
                 <Button Content="Save" Click="Save_Click" Padding="14,5" Margin="0,0,8,0"/>
+                <Button Content="Save As..." Click="SaveAs_Click" Padding="14,5" Margin="0,0,8,0"/>
                 <Button Content="Save + Reload in Game" Click="SaveReload_Click" Padding="14,5" Margin="0,0,18,0"/>
+                <TextBlock Text="Screen" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <ComboBox x:Name="ScreenCombo" Width="105" SelectedIndex="0" Margin="0,0,18,0">
+                    <ComboBoxItem Content="Scoreboard" IsEnabled="True"/>
+                    <ComboBoxItem Content="Stats" IsEnabled="False"/>
+                    <ComboBoxItem Content="Intro" IsEnabled="False"/>
+                    <ComboBoxItem Content="Violation" IsEnabled="False"/>
+                    <ComboBoxItem Content="Playcall" IsEnabled="False"/>
+                </ComboBox>
                 <TextBlock Text="Away" VerticalAlignment="Center" Margin="0,0,5,0"/>
                 <ComboBox x:Name="AwayTeamCombo" Width="190" SelectionChanged="PreviewChanged" DisplayMemberPath="DisplayName" Margin="0,0,12,0"/>
                 <TextBlock Text="Home" VerticalAlignment="Center" Margin="0,0,5,0"/>
@@ -68,25 +77,80 @@
                         <TextBlock Text="Scoreboard width"/><TextBox x:Name="ScoreboardWidthBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Scoreboard height"/><TextBox x:Name="ScoreboardHeightBox" Margin="0,3,0,8"/>
                         <Button Content="Apply Layout" Click="ApplyLayout_Click" Margin="0,8,0,0" Padding="8"/>
+                        <Separator Margin="0,14,0,10"/>
+                        <TextBlock Text="Editor reference background" FontWeight="Bold"/>
+                        <DockPanel Margin="0,4,0,6">
+                            <Button DockPanel.Dock="Right" Content="Browse..." Click="BrowsePreviewBackground_Click" Margin="6,0,0,0" Padding="8,2"/>
+                            <TextBox x:Name="PreviewBackgroundPathBox" ToolTip="Leave empty to use the built-in basketball image"/>
+                        </DockPanel>
+                        <TextBlock Text="Reference image fit"/>
+                        <ComboBox x:Name="PreviewBackgroundFitCombo" Margin="0,3,0,6"
+                                  SelectionChanged="PreviewBackgroundFit_Changed"/>
+                        <UniformGrid Columns="2">
+                            <Button Content="Apply Background" Click="ApplyPreviewBackground_Click" Margin="0,0,3,0" Padding="8"/>
+                            <Button Content="Use Built-in" Click="ResetPreviewBackground_Click" Margin="3,0,0,0" Padding="8"/>
+                        </UniformGrid>
                         <TextBlock Margin="0,14,0,0" Foreground="#AAB2C0" TextWrapping="Wrap"
                                    Text="Drag an uncovered part of the scoreboard background to reposition the entire scoreboard."/>
                     </StackPanel>
                 </TabItem>
                 <TabItem Header="Element">
-                    <StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
                         <TextBlock Text="Selected element" FontWeight="Bold"/>
                         <ComboBox x:Name="ElementSelector" Margin="0,4,0,5"
                                   SelectionChanged="ElementSelector_SelectionChanged"/>
                         <TextBlock x:Name="SelectedElementLabel" Text="Select or click an element" Margin="0,0,0,12" Foreground="#AAB2C0"/>
+                        <TextBlock Text="Type"/><ComboBox x:Name="ElementTypeCombo"/>
+                        <TextBlock Text="Data binding"/><TextBox x:Name="ElementBindingBox"/>
+                        <TextBlock Text="Static text"/><TextBox x:Name="ElementTextBox"/>
+                        <TextBlock Text="Font preset (blank = default)"/><ComboBox x:Name="ElementFontCombo" IsEditable="True"/>
+                        <TextBlock Text="Image path"/><TextBox x:Name="ElementImageBox"/>
+                        <TextBlock Text="Image fit"/><ComboBox x:Name="ElementImageFitCombo"/>
+                        <TextBlock Text="Opacity (0-255)"/><TextBox x:Name="ElementOpacityBox"/>
                         <UniformGrid Columns="2">
                             <TextBlock Text="X"/><TextBox x:Name="ElementXBox"/>
                             <TextBlock Text="Y"/><TextBox x:Name="ElementYBox"/>
                             <TextBlock Text="Width"/><TextBox x:Name="ElementWidthBox"/>
                             <TextBlock Text="Height"/><TextBox x:Name="ElementHeightBox"/>
                         </UniformGrid>
+                        <TextBlock Text="Z-order" Margin="0,8,0,0"/><TextBox x:Name="ElementZBox"/>
+                        <CheckBox x:Name="ElementVisibleCheck" Content="Visible" Margin="0,8,0,0"/>
+                        <CheckBox x:Name="ElementLockedCheck" Content="Locked in editor"/>
+                        <TextBlock Text="Text alignment" Margin="0,8,0,0"/><ComboBox x:Name="ElementAlignmentCombo"/>
+                        <TextBlock Text="Text overflow" Margin="0,8,0,0"/><ComboBox x:Name="ElementOverflowCombo"/>
+                        <TextBlock Text="Font height (0 = theme default)" Margin="0,8,0,0"/><TextBox x:Name="ElementFontHeightBox"/>
+                        <TextBlock Text="Text color (decimal RGB)"/><TextBox x:Name="ElementTextColorBox"/>
+                        <TextBlock Text="Fill type" Margin="0,8,0,0"/><ComboBox x:Name="ElementFillTypeCombo"/>
+                        <TextBlock Text="Solid color binding"/><TextBox x:Name="ElementFillBindingBox"/>
+                        <TextBlock Text="Solid color (decimal RGB)"/><TextBox x:Name="ElementFillColorBox"/>
+                        <TextBlock Text="Gradient start binding"/><TextBox x:Name="GradientStartBindingBox"/>
+                        <TextBlock Text="Gradient start color"/><TextBox x:Name="GradientStartColorBox"/>
+                        <TextBlock Text="Gradient end binding"/><TextBox x:Name="GradientEndBindingBox"/>
+                        <TextBlock Text="Gradient end color"/><TextBox x:Name="GradientEndColorBox"/>
+                        <TextBlock Text="Gradient direction"/><ComboBox x:Name="GradientDirectionCombo"/>
                         <Button Content="Apply Element Bounds" Click="ApplyElement_Click" Margin="0,12,0,0" Padding="8"/>
                         <TextBlock Text="Drag elements directly on the preview canvas. Use these fields for exact sizing." TextWrapping="Wrap" Foreground="#AAB2C0" Margin="0,14,0,0"/>
-                    </StackPanel>
+                    </StackPanel></ScrollViewer>
+                </TabItem>
+                <TabItem Header="Layers">
+                    <DockPanel Margin="12" TextElement.Foreground="#F3F4F6">
+                        <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
+                            <UniformGrid Columns="2">
+                                <Button Content="Move Up" Click="LayerUp_Click" Margin="2"/>
+                                <Button Content="Move Down" Click="LayerDown_Click" Margin="2"/>
+                                <Button Content="Duplicate" Click="DuplicateLayer_Click" Margin="2"/>
+                                <Button Content="Delete" Click="DeleteLayer_Click" Margin="2"/>
+                            </UniformGrid>
+                            <TextBlock Text="Add layer" Margin="0,8,0,2"/>
+                            <UniformGrid Columns="3">
+                                <Button Content="Rectangle" Click="AddRectangleLayer_Click" Margin="2"/>
+                                <Button Content="Image" Click="AddImageLayer_Click" Margin="2"/>
+                                <Button Content="Text" Click="AddTextLayer_Click" Margin="2"/>
+                            </UniformGrid>
+                        </StackPanel>
+                        <ListBox x:Name="LayersList" DisplayMemberPath="DisplayName"
+                                 SelectionChanged="LayersList_SelectionChanged"/>
+                    </DockPanel>
                 </TabItem>
                 <TabItem Header="Behavior">
                     <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12" TextElement.Foreground="#F3F4F6">

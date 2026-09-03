@@ -108,14 +108,32 @@ bool ReadFile(const char* path, std::string* output)
 size_t ValuePosition(const std::string& json, const char* key)
 {
     std::string token = std::string("\"") + key + "\"";
-    size_t p = json.find(token);
-    if (p == std::string::npos) return p;
-    p = json.find(':', p + token.size());
-    if (p == std::string::npos) return p;
-    do { ++p; } while (p < json.size() &&
-        (json[p] == ' ' || json[p] == '\t' ||
-         json[p] == '\r' || json[p] == '\n'));
-    return p;
+    size_t searchFrom = 0;
+    while (true) {
+        size_t p = json.find(token, searchFrom);
+        if (p == std::string::npos) return p;
+
+        // A token is a property name only when the next non-whitespace
+        // character is ':'.  Editor-generated elements can contain values
+        // such as "id": "backgroundImage" before the top-level
+        // "backgroundImage" property.  The old search mistook that value for
+        // the property name and read the following field instead.
+        size_t colon = p + token.size();
+        while (colon < json.size() &&
+            (json[colon] == ' ' || json[colon] == '\t' ||
+             json[colon] == '\r' || json[colon] == '\n'))
+            ++colon;
+
+        if (colon < json.size() && json[colon] == ':') {
+            p = colon;
+            do { ++p; } while (p < json.size() &&
+                (json[p] == ' ' || json[p] == '\t' ||
+                 json[p] == '\r' || json[p] == '\n'));
+            return p;
+        }
+
+        searchFrom = p + token.size();
+    }
 }
 
 long Integer(const std::string& json, const char* key, long fallback)
@@ -197,6 +215,94 @@ IndicatorMode Indicator(const std::string& value)
     if (value == "bars") return IndicatorMode::Bars;
     if (value == "images") return IndicatorMode::Images;
     return IndicatorMode::None;
+}
+
+size_t MatchingDelimiter(const std::string& text, size_t start,
+                         char open, char close)
+{
+    int depth = 0;
+    bool quoted = false;
+    for (size_t i = start; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (ch == '"' && (i == 0 || text[i - 1] != '\\')) quoted = !quoted;
+        if (quoted) continue;
+        if (ch == open) ++depth;
+        else if (ch == close && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+std::string ObjectValue(const std::string& json, const char* key)
+{
+    size_t p = ValuePosition(json, key);
+    if (p == std::string::npos || p >= json.size() || json[p] != '{')
+        return std::string();
+    size_t end = MatchingDelimiter(json, p, '{', '}');
+    return end == std::string::npos ? std::string() :
+        json.substr(p, end - p + 1);
+}
+
+void ParseElements(const std::string& json, Config* c)
+{
+    c->elementCount = 0;
+    size_t p = ValuePosition(json, "elements");
+    if (p == std::string::npos || p >= json.size() || json[p] != '[') return;
+    const size_t arrayEnd = MatchingDelimiter(json, p, '[', ']');
+    if (arrayEnd == std::string::npos) return;
+    ++p;
+    while (p < arrayEnd && c->elementCount < MAX_ELEMENTS) {
+        p = json.find('{', p);
+        if (p == std::string::npos || p >= arrayEnd) break;
+        const size_t end = MatchingDelimiter(json, p, '{', '}');
+        if (end == std::string::npos || end > arrayEnd) break;
+        const std::string object = json.substr(p, end - p + 1);
+        Element& e = c->elements[c->elementCount];
+        std::memset(&e, 0, sizeof(e));
+        String(object, "id", e.id, sizeof(e.id), "element");
+        const std::string type = StringValue(object, "type", "rectangle");
+        e.type = type == "image" ? ElementType::Image :
+            type == "text" ? ElementType::Text :
+            type == "indicator" ? ElementType::Indicator :
+            ElementType::Rectangle;
+        String(object, "binding", e.binding, sizeof(e.binding), "");
+        String(object, "text", e.text, sizeof(e.text), "");
+        String(object, "image", e.image, sizeof(e.image), "");
+        String(object, "font", e.font, sizeof(e.font), "");
+        e.rect.x = Number(object, "x", 0.0f);
+        e.rect.y = Number(object, "y", 0.0f);
+        e.rect.width = Number(object, "width", 100.0f);
+        e.rect.height = Number(object, "height", 30.0f);
+        e.z = Integer(object, "z", c->elementCount);
+        e.visible = Boolean(object, "visible", true);
+        e.locked = Boolean(object, "locked", false);
+        const std::string imageFit = StringValue(object, "imageFit",
+            std::strcmp(e.id, "backgroundImage") == 0 ? "stretch" : "contain");
+        e.imageFit = imageFit == "stretch" ? ImageFit::Stretch : ImageFit::Contain;
+        const std::string alignment = StringValue(object, "alignment", "center");
+        e.alignment = alignment == "left" ? TextAlignment::Left :
+            alignment == "right" ? TextAlignment::Right : TextAlignment::Center;
+        e.overflow = StringValue(object, "overflow", "overflow") == "fit" ?
+            TextOverflow::Fit : TextOverflow::Overflow;
+        e.fontHeight = Number(object, "fontHeight", 0.0f);
+        e.textColor = Color(object, "textColor", D3DCOLOR_XRGB(255, 255, 255));
+        e.opacity = Integer(object, "opacity", 255);
+
+        const std::string fill = ObjectValue(object, "fill");
+        e.fillType = StringValue(fill, "type", "solid") == "linearGradient" ?
+            FillType::LinearGradient : FillType::Solid;
+        String(fill, "binding", e.fillBinding, sizeof(e.fillBinding), "");
+        e.fillColor = Color(fill, "color", D3DCOLOR_XRGB(255, 255, 255));
+        e.gradientStartColor = Color(fill, "startColor", e.fillColor);
+        e.gradientEndColor = Color(fill, "endColor", D3DCOLOR_XRGB(0, 0, 0));
+        String(fill, "startBinding", e.gradientStartBinding,
+            sizeof(e.gradientStartBinding), "");
+        String(fill, "endBinding", e.gradientEndBinding,
+            sizeof(e.gradientEndBinding), "");
+        e.gradientHorizontal =
+            StringValue(fill, "direction", "vertical") == "horizontal";
+        ++c->elementCount;
+        p = end + 1;
+    }
 }
 
 void Parse(const std::string& json, Config* c)
@@ -294,6 +400,7 @@ void Parse(const std::string& json, Config* c)
     READ_RECT(awayTimeouts); READ_RECT(homeTimeouts);
     READ_RECT(awayBonus); READ_RECT(homeBonus);
 #undef READ_RECT
+    ParseElements(json, c);
 }
 
 } // namespace

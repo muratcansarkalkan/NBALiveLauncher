@@ -21,6 +21,7 @@ constexpr int ATLAS_WIDTH = ATLAS_COLUMNS * CELL_WIDTH;
 constexpr int ATLAS_ROWS =
     (CHARACTER_COUNT + ATLAS_COLUMNS - 1) / ATLAS_COLUMNS;
 constexpr int ATLAS_HEIGHT = ATLAS_ROWS * CELL_HEIGHT;
+constexpr int MAX_FONT_ATLASES = 16;
 
 struct Glyph {
     float u0, v0, u1, v1;
@@ -35,14 +36,27 @@ struct FontVertex {
     float u, v;
 };
 
-IDirect3DTexture9* g_atlas = nullptr;
+struct AtlasState {
+    char id[32];
+    IDirect3DTexture9* texture;
+    Glyph glyphs[CHARACTER_COUNT];
+    float sourceHeight;
+    float spacing;
+    char privateFontPath[MAX_PATH];
+};
+
+AtlasState g_atlases[MAX_FONT_ATLASES] = {};
+int g_atlasCount = 0;
+AtlasState* g_activeAtlas = nullptr;
 IDirect3DDevice9* g_device = nullptr;
-Glyph g_glyphs[CHARACTER_COUNT] = {};
-float g_sourceHeight = 48.0f;
-float g_spacing = 1.0f;
 bool g_attempted = false;
 char g_theme[64] = {};
-char g_privateFontPath[MAX_PATH] = {};
+
+#define g_atlas (g_activeAtlas->texture)
+#define g_glyphs (g_activeAtlas->glyphs)
+#define g_sourceHeight (g_activeAtlas->sourceHeight)
+#define g_spacing (g_activeAtlas->spacing)
+#define g_privateFontPath (g_activeAtlas->privateFontPath)
 
 Style g_style = {
     34.0f, 28.0f, 17.0f,
@@ -85,16 +99,60 @@ bool ReadFile(const char* path, std::string* output)
 size_t FindJsonValue(const std::string& json, const char* key)
 {
     const std::string token = std::string("\"") + key + "\"";
-    size_t position = json.find(token);
-    if (position == std::string::npos) return position;
-    position = json.find(':', position + token.size());
-    if (position == std::string::npos) return position;
-    ++position;
-    while (position < json.size() &&
-           (json[position] == ' ' || json[position] == '\t' ||
-            json[position] == '\r' || json[position] == '\n'))
-        ++position;
-    return position;
+    size_t searchFrom = 0;
+    size_t bestValue = std::string::npos;
+    int bestDepth = 0x7FFFFFFF;
+    while (true) {
+        size_t position = json.find(token, searchFrom);
+        if (position == std::string::npos) return bestValue;
+        size_t colon = position + token.size();
+        while (colon < json.size() &&
+               (json[colon] == ' ' || json[colon] == '\t' ||
+                json[colon] == '\r' || json[colon] == '\n')) ++colon;
+        if (colon < json.size() && json[colon] == ':') {
+            int depth = 0; bool quoted = false;
+            for (size_t i = 0; i < position; ++i) {
+                if (json[i] == '"' && (i == 0 || json[i - 1] != '\\'))
+                    quoted = !quoted;
+                if (!quoted) {
+                    if (json[i] == '{' || json[i] == '[') ++depth;
+                    else if (json[i] == '}' || json[i] == ']') --depth;
+                }
+            }
+            size_t value = colon + 1;
+            while (value < json.size() &&
+                   (json[value] == ' ' || json[value] == '\t' ||
+                    json[value] == '\r' || json[value] == '\n')) ++value;
+            if (depth < bestDepth) {
+                bestDepth = depth;
+                bestValue = value;
+                if (depth <= 1) return bestValue;
+            }
+        }
+        searchFrom = position + token.size();
+    }
+}
+
+size_t MatchingBrace(const std::string& text, size_t start)
+{
+    int depth = 0; bool quoted = false;
+    for (size_t i = start; i < text.size(); ++i) {
+        if (text[i] == '"' && (i == 0 || text[i - 1] != '\\')) quoted = !quoted;
+        if (quoted) continue;
+        if (text[i] == '{') ++depth;
+        else if (text[i] == '}' && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+std::string JsonObject(const std::string& json, const char* key)
+{
+    const size_t start = FindJsonValue(json, key);
+    if (start == std::string::npos || start >= json.size() || json[start] != '{')
+        return std::string();
+    const size_t end = MatchingBrace(json, start);
+    return end == std::string::npos ? std::string() :
+        json.substr(start, end - start + 1);
 }
 
 void ReadJsonString(const std::string& json, const char* key,
@@ -140,35 +198,51 @@ D3DCOLOR ReadJsonColor(const std::string& json, const char* key,
     return 0xFF000000u | static_cast<D3DCOLOR>(value);
 }
 
-void ReleaseAtlas()
+void ReleaseAtlases()
 {
-    if (g_atlas) {
-        g_atlas->Release();
-        g_atlas = nullptr;
+    for (int i = 0; i < g_atlasCount; ++i) {
+        if (g_atlases[i].texture) g_atlases[i].texture->Release();
+        if (g_atlases[i].privateFontPath[0])
+            RemoveFontResourceExA(g_atlases[i].privateFontPath,
+                FR_PRIVATE, nullptr);
     }
+    std::memset(g_atlases, 0, sizeof(g_atlases));
+    g_atlasCount = 0;
+    g_activeAtlas = nullptr;
     g_device = nullptr;
 }
 
-bool BuildAtlas(IDirect3DDevice9* device, const char* themeName)
+bool BuildAtlas(IDirect3DDevice9* device, const char* themeName,
+                const char* fontId)
 {
     const std::string themeDirectory =
         GetGameDirectory() + "\\popups\\" + themeName;
     std::string configuration;
     ReadFile((themeDirectory + "\\popup.json").c_str(), &configuration);
 
+    const bool isDefault = !fontId || !*fontId ||
+        std::strcmp(fontId, "default") == 0;
+    std::string fontConfiguration = configuration;
+    if (!isDefault) {
+        const std::string fonts = JsonObject(configuration, "fonts");
+        fontConfiguration = JsonObject(fonts, fontId);
+        if (fontConfiguration.empty()) return false;
+    }
+
     char fontFile[MAX_PATH] = {};
     char fontFace[LF_FACESIZE] = {};
-    ReadJsonString(configuration, "fontFile", fontFile,
-        sizeof(fontFile), "fonts/scoreboard.ttf");
-    ReadJsonString(configuration, "fontFace", fontFace,
-        sizeof(fontFace), "Arial");
+    ReadJsonString(fontConfiguration, "fontFile", fontFile,
+        sizeof(fontFile), isDefault ? "fonts/scoreboard.ttf" : "");
+    ReadJsonString(fontConfiguration, "fontFace", fontFace,
+        sizeof(fontFace), isDefault ? "Arial" : "");
     const int fontHeight = static_cast<int>(ReadJsonInteger(
-        configuration, "fontSourceHeight", 48));
+        fontConfiguration, "fontSourceHeight", 48));
     const int fontWeight = static_cast<int>(ReadJsonInteger(
-        configuration, "fontWeight", FW_SEMIBOLD));
+        fontConfiguration, "fontWeight", FW_SEMIBOLD));
     g_spacing = static_cast<float>(ReadJsonInteger(
-        configuration, "characterSpacing", 1));
-    g_style.characterSpacing = g_spacing;
+        fontConfiguration, "characterSpacing", 1));
+    if (isDefault) g_style.characterSpacing = g_spacing;
+    if (isDefault) {
     g_style.scoreHeight = static_cast<float>(ReadJsonInteger(
         configuration, "scoreHeight", 34));
     g_style.clockHeight = static_cast<float>(ReadJsonInteger(
@@ -192,6 +266,7 @@ bool BuildAtlas(IDirect3DDevice9* device, const char* themeName)
     g_style.shotClockColor = ReadJsonColor(
         configuration, "shotClockColor",
         D3DCOLOR_XRGB(255, 210, 64));
+    }
 
     std::string fontPath = themeDirectory + "\\" + fontFile;
     for (size_t i = 0; i < fontPath.size(); ++i)
@@ -286,7 +361,9 @@ bool BuildAtlas(IDirect3DDevice9* device, const char* themeName)
     DeleteObject(font);
     DeleteObject(bitmap);
     DeleteDC(dc);
-    if (FAILED(result)) ReleaseAtlas();
+    if (FAILED(result)) {
+        if (g_atlas) { g_atlas->Release(); g_atlas = nullptr; }
+    }
     return SUCCEEDED(result);
 }
 
@@ -314,10 +391,48 @@ bool Begin(IDirect3DDevice9* device, const char* themeName)
         Shutdown();
         g_attempted = true;
         std::strncpy(g_theme, themeName, sizeof(g_theme) - 1);
-        if (!BuildAtlas(device, themeName)) return false;
+        g_activeAtlas = &g_atlases[0];
+        g_atlasCount = 1;
+        std::strcpy(g_activeAtlas->id, "default");
+        if (!BuildAtlas(device, themeName, "default")) {
+            ReleaseAtlases();
+            return false;
+        }
         g_device = device;
     }
+    g_activeAtlas = g_atlasCount > 0 ? &g_atlases[0] : nullptr;
     return g_atlas != nullptr;
+}
+
+bool SelectFont(IDirect3DDevice9* device, const char* themeName,
+                const char* fontId)
+{
+    if (!Begin(device, themeName)) return false;
+    if (!fontId || !*fontId || std::strcmp(fontId, "default") == 0)
+        return true;
+
+    for (int i = 1; i < g_atlasCount; ++i) {
+        if (std::strcmp(g_atlases[i].id, fontId) == 0) {
+            g_activeAtlas = &g_atlases[i];
+            return g_activeAtlas->texture != nullptr;
+        }
+    }
+    if (g_atlasCount >= MAX_FONT_ATLASES) return true;
+
+    AtlasState* candidate = &g_atlases[g_atlasCount];
+    std::memset(candidate, 0, sizeof(*candidate));
+    std::strncpy(candidate->id, fontId, sizeof(candidate->id) - 1);
+    g_activeAtlas = candidate;
+    if (!BuildAtlas(device, themeName, fontId)) {
+        if (candidate->privateFontPath[0])
+            RemoveFontResourceExA(candidate->privateFontPath,
+                FR_PRIVATE, nullptr);
+        std::memset(candidate, 0, sizeof(*candidate));
+        g_activeAtlas = &g_atlases[0];
+        return true;
+    }
+    ++g_atlasCount;
+    return true;
 }
 
 bool Reload(IDirect3DDevice9* device, const char* themeName)
@@ -333,7 +448,8 @@ const Style& GetStyle()
 
 float Measure(const char* text, float height)
 {
-    if (!text || !*text || !g_atlas || g_sourceHeight <= 0.0f)
+    if (!text || !*text || !g_activeAtlas || !g_atlas ||
+        g_sourceHeight <= 0.0f)
         return 0.0f;
     const float scale = height / g_sourceHeight;
     float width = 0.0f;
@@ -351,7 +467,8 @@ float Measure(const char* text, float height)
 void DrawLeft(IDirect3DDevice9* device, const char* text,
               float x, float y, float height, D3DCOLOR color)
 {
-    if (!device || !text || !g_atlas || g_sourceHeight <= 0.0f) return;
+    if (!device || !text || !g_activeAtlas || !g_atlas ||
+        g_sourceHeight <= 0.0f) return;
     const float scale = height / g_sourceHeight;
     device->SetTexture(0, g_atlas);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
@@ -389,11 +506,7 @@ void DrawRight(IDirect3DDevice9* device, const char* text,
 
 void Shutdown()
 {
-    ReleaseAtlas();
-    if (g_privateFontPath[0]) {
-        RemoveFontResourceExA(g_privateFontPath, FR_PRIVATE, nullptr);
-        g_privateFontPath[0] = '\0';
-    }
+    ReleaseAtlases();
     g_attempted = false;
     g_theme[0] = '\0';
 }

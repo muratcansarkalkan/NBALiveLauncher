@@ -433,7 +433,6 @@ bool RenderGenericElements(IDirect3DDevice9* device,
         }
         order[j + 1] = value;
     }
-
     const bool fontReady = popupfont::Begin(device, "TEST");
     const popupfont::Style& style = popupfont::GetStyle();
     for (int n = 0; n < config.elementCount; ++n) {
@@ -459,7 +458,7 @@ bool RenderGenericElements(IDirect3DDevice9* device,
             const D3DCOLOR tint = D3DCOLOR_ARGB(
                 e.opacity < 0 ? 0 : e.opacity > 255 ? 255 : e.opacity,
                 255, 255, 255);
-            if (e.imageFit == scoreboardconfig::ImageFit::Stretch)
+            if (std::strcmp(e.id, "backgroundImage") == 0)
                 DrawTextureStretched(device, texture, r.x, r.y,
                     r.x + r.width, r.y + r.height, tint);
             else
@@ -467,7 +466,6 @@ bool RenderGenericElements(IDirect3DDevice9* device,
                     r.x + r.width, r.y + r.height, tint);
         }
         else if (e.type == scoreboardconfig::ElementType::Text && fontReady) {
-            if (!popupfont::SelectFont(device, "TEST", e.font)) continue;
             char text[128]; float height; D3DCOLOR color;
             if (!ResolveLayerText(e, config, frame, text, sizeof(text),
                     &height, style, &color)) continue;
@@ -481,7 +479,6 @@ bool RenderGenericElements(IDirect3DDevice9* device,
                 e.overflow == scoreboardconfig::TextOverflow::Fit);
         }
         else if (e.type == scoreboardconfig::ElementType::Indicator && fontReady) {
-            if (!popupfont::SelectFont(device, "TEST", e.font)) continue;
             const bool foul = std::strstr(e.binding, "fouls") != nullptr;
             const bool away = std::strncmp(e.binding, "away.", 5) == 0;
             int value = foul ? (away ? frame.awayFouls : frame.homeFouls) :

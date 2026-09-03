@@ -10,12 +10,48 @@ enum class ShotClockVisibility { Always, UnderThreshold, Never };
 enum class TeamNameFormat { Abbreviation, City, Nickname, FullName, ShortCode };
 enum class PeriodFormat { Number, Ordinal, OrdinalQuarter, ShortQuarter, LongQuarter };
 enum class IndicatorMode { None, Number, Text, Dots, Bars, Images };
+enum class ElementType { Rectangle, Image, Text, Indicator };
+enum class TextAlignment { Left, Center, Right };
+enum class TextOverflow { Overflow, Fit };
+enum class FillType { Solid, LinearGradient };
+enum class ImageFit { Contain, Stretch };
 
 struct Rect {
     float x, y, width, height;
 };
 
+struct Element {
+    char id[32];
+    ElementType type;
+    char binding[48];
+    char text[96];
+    char image[MAX_PATH];
+    char font[32];
+    Rect rect;
+    int z;
+    bool visible;
+    bool locked;
+    TextAlignment alignment;
+    TextOverflow overflow;
+    float fontHeight;
+    D3DCOLOR textColor;
+    int opacity;
+    FillType fillType;
+    char fillBinding[48];
+    D3DCOLOR fillColor;
+    D3DCOLOR gradientStartColor;
+    D3DCOLOR gradientEndColor;
+    char gradientStartBinding[48];
+    char gradientEndBinding[48];
+    bool gradientHorizontal;
+    ImageFit imageFit;
+};
+
+constexpr int MAX_ELEMENTS = 64;
+
 struct Config {
+    Element elements[MAX_ELEMENTS];
+    int elementCount;
     int referenceWidth;
     int referenceHeight;
     ScaleMode scaleMode;

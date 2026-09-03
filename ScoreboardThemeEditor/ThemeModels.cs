@@ -4,6 +4,7 @@ namespace NBALiveScoreboardEditor;
 
 public sealed class ScoreboardTheme
 {
+    public List<OverlayElement> Elements { get; set; } = [];
     public int ReferenceWidth { get; set; } = 1366;
     public int ReferenceHeight { get; set; } = 768;
     public string ScaleMode { get; set; } = "uniform";
@@ -80,8 +81,47 @@ public sealed class ScoreboardTheme
     public double HomeBonusWidth { get; set; } = 58; public double HomeBonusHeight { get; set; } = 13;
 }
 
+public sealed class OverlayElement
+{
+    public string Id { get; set; } = "element";
+    public string Type { get; set; } = "rectangle";
+    public string Binding { get; set; } = "";
+    public string Text { get; set; } = "";
+    public string Image { get; set; } = "";
+    public string Font { get; set; } = "";
+    public double X { get; set; }
+    public double Y { get; set; }
+    public double Width { get; set; } = 100;
+    public double Height { get; set; } = 30;
+    public int Z { get; set; }
+    public bool Visible { get; set; } = true;
+    public bool Locked { get; set; }
+    public string ImageFit { get; set; } = "";
+    public string Alignment { get; set; } = "center";
+    public string Overflow { get; set; } = "overflow";
+    public double FontHeight { get; set; }
+    public int TextColor { get; set; } = 16777215;
+    public int Opacity { get; set; } = 255;
+    public OverlayFill Fill { get; set; } = new();
+
+    [JsonIgnore] public string DisplayName => $"{Z,3}  {Id}";
+}
+
+public sealed class OverlayFill
+{
+    public string Type { get; set; } = "solid";
+    public string Binding { get; set; } = "";
+    public int Color { get; set; } = 16777215;
+    public int StartColor { get; set; } = 16777215;
+    public int EndColor { get; set; }
+    public string StartBinding { get; set; } = "";
+    public string EndBinding { get; set; } = "";
+    public string Direction { get; set; } = "vertical";
+}
+
 public sealed class PopupFontTheme
 {
+    public Dictionary<string, FontDefinition> Fonts { get; set; } = [];
     public string FontFile { get; set; } = "fonts/scoreboard.ttf";
     public string FontFace { get; set; } = "Arial";
     public int FontSourceHeight { get; set; } = 48;
@@ -98,6 +138,15 @@ public sealed class PopupFontTheme
     public int ScoreColor { get; set; } = 16777215;
     public int ClockColor { get; set; } = 16777215;
     public int ShotClockColor { get; set; } = 16764480;
+}
+
+public sealed class FontDefinition
+{
+    public string FontFile { get; set; } = "fonts/scoreboard.ttf";
+    public string FontFace { get; set; } = "Arial";
+    public int FontSourceHeight { get; set; } = 48;
+    public int FontWeight { get; set; } = 600;
+    public int CharacterSpacing { get; set; } = 1;
 }
 
 public sealed class TeamDefinition
