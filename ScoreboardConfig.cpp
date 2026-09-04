@@ -10,8 +10,11 @@ namespace scoreboardconfig {
 namespace {
 
 Config g_config = {};
+Config g_violationConfig = {};
 bool g_loaded = false;
+bool g_violationLoaded = false;
 char g_theme[64] = {};
+char g_violationTheme[64] = {};
 char g_lastError[512] = {};
 
 void SetDefaults(Config* c)
@@ -74,6 +77,16 @@ void SetDefaults(Config* c)
     c->homeTimeouts = { 446, 49, 80, 15 };
     c->awayBonus = { 188, 51, 58, 13 };
     c->homeBonus = { 374, 51, 58, 13 };
+    std::strcpy(c->enterAnimation, "slideFade");
+    c->enterFromX = -80.0f;
+    c->enterFromY = 0.0f;
+    c->enterMilliseconds = 250;
+    c->holdMilliseconds = 2500;
+    std::strcpy(c->exitAnimation, "fade");
+    c->exitToX = 0.0f;
+    c->exitToY = 0.0f;
+    c->exitMilliseconds = 200;
+    c->freezeWhilePaused = true;
 }
 
 std::string GameDirectory()
@@ -401,11 +414,30 @@ void Parse(const std::string& json, Config* c)
     READ_RECT(awayBonus); READ_RECT(homeBonus);
 #undef READ_RECT
     ParseElements(json, c);
+
+    const std::string animation = ObjectValue(json, "animation");
+    const std::string enter = ObjectValue(animation, "enter");
+    const std::string exit = ObjectValue(animation, "exit");
+    String(enter, "type", c->enterAnimation,
+        sizeof(c->enterAnimation), "slideFade");
+    c->enterFromX = Number(enter, "fromX", c->enterFromX);
+    c->enterFromY = Number(enter, "fromY", c->enterFromY);
+    c->enterMilliseconds = Integer(enter, "duration", c->enterMilliseconds);
+    c->holdMilliseconds = Integer(animation,
+        "holdMilliseconds", c->holdMilliseconds);
+    String(exit, "type", c->exitAnimation,
+        sizeof(c->exitAnimation), "fade");
+    c->exitToX = Number(exit, "toX", c->exitToX);
+    c->exitToY = Number(exit, "toY", c->exitToY);
+    c->exitMilliseconds = Integer(exit, "duration", c->exitMilliseconds);
+    c->freezeWhilePaused = Boolean(animation,
+        "freezeWhilePaused", c->freezeWhilePaused);
 }
 
 } // namespace
 
 const Config& Get() { return g_config; }
+const Config& GetViolation() { return g_violationConfig; }
 
 bool Load(const char* themeName)
 {
@@ -413,7 +445,7 @@ bool Load(const char* themeName)
     Config next;
     SetDefaults(&next);
     std::string path = GameDirectory() + "\\popups\\" +
-        themeName + "\\scoreboard.json";
+        themeName + "\\scoreboard\\scoreboard.json";
     std::string json;
     if (!ReadFile(path.c_str(), &json)) {
         std::snprintf(g_lastError, sizeof(g_lastError),
@@ -436,6 +468,43 @@ bool Reload(const char* themeName)
     g_loaded = false;
     g_theme[0] = '\0';
     return Load(themeName);
+}
+
+bool LoadViolation(const char* themeName)
+{
+    if (g_violationLoaded &&
+        std::strcmp(g_violationTheme, themeName) == 0) return true;
+    Config next;
+    SetDefaults(&next);
+    next.width = 420.0f;
+    next.height = 80.0f;
+    next.offsetY = 90.0f;
+    std::string path = GameDirectory() + "\\popups\\" + themeName +
+        "\\violation\\violation.json";
+    std::string json;
+    if (!ReadFile(path.c_str(), &json)) {
+        std::snprintf(g_lastError, sizeof(g_lastError),
+            "Could not read %s", path.c_str());
+        g_violationConfig = next;
+        g_violationLoaded = true;
+        std::strncpy(g_violationTheme, themeName,
+            sizeof(g_violationTheme) - 1);
+        return false;
+    }
+    Parse(json, &next);
+    g_violationConfig = next;
+    g_violationLoaded = true;
+    std::strncpy(g_violationTheme, themeName,
+        sizeof(g_violationTheme) - 1);
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool ReloadViolation(const char* themeName)
+{
+    g_violationLoaded = false;
+    g_violationTheme[0] = '\0';
+    return LoadViolation(themeName);
 }
 
 const char* GetLastError() { return g_lastError; }

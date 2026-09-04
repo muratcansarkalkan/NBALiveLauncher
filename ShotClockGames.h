@@ -20,6 +20,8 @@ struct GameAddresses {
     uintptr_t getTeamFouls;
     uintptr_t getTeamTimeoutsLeft;
     uintptr_t getOverlayData;
+    uintptr_t violationRequestCall;
+    uintptr_t violationDataStoreCall;
     unsigned int getQuarterSlot;
     unsigned int isGameClockValidSlot;
 };

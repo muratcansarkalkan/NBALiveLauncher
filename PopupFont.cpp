@@ -213,10 +213,11 @@ void ReleaseAtlases()
 }
 
 bool BuildAtlas(IDirect3DDevice9* device, const char* themeName,
-                const char* fontId)
+                const char* fontId, const char* overlayDirectory)
 {
     const std::string themeDirectory =
-        GetGameDirectory() + "\\popups\\" + themeName;
+        GetGameDirectory() + "\\popups\\" + themeName + "\\" +
+        overlayDirectory;
     std::string configuration;
     ReadFile((themeDirectory + "\\popup.json").c_str(), &configuration);
 
@@ -384,17 +385,22 @@ void DrawGlyph(IDirect3DDevice9* device, const Glyph& glyph,
 
 } // namespace
 
-bool Begin(IDirect3DDevice9* device, const char* themeName)
+bool Begin(IDirect3DDevice9* device, const char* themeName,
+           const char* overlayDirectory)
 {
-    if (!device || !themeName || !*themeName) return false;
-    if (g_device != device || std::strcmp(g_theme, themeName) != 0) {
+    if (!device || !themeName || !*themeName || !overlayDirectory ||
+        !*overlayDirectory) return false;
+    char themeKey[sizeof(g_theme)] = {};
+    std::snprintf(themeKey, sizeof(themeKey), "%s|%s",
+        themeName, overlayDirectory);
+    if (g_device != device || std::strcmp(g_theme, themeKey) != 0) {
         Shutdown();
         g_attempted = true;
-        std::strncpy(g_theme, themeName, sizeof(g_theme) - 1);
+        std::strncpy(g_theme, themeKey, sizeof(g_theme) - 1);
         g_activeAtlas = &g_atlases[0];
         g_atlasCount = 1;
         std::strcpy(g_activeAtlas->id, "default");
-        if (!BuildAtlas(device, themeName, "default")) {
+        if (!BuildAtlas(device, themeName, "default", overlayDirectory)) {
             ReleaseAtlases();
             return false;
         }
@@ -405,9 +411,9 @@ bool Begin(IDirect3DDevice9* device, const char* themeName)
 }
 
 bool SelectFont(IDirect3DDevice9* device, const char* themeName,
-                const char* fontId)
+                const char* fontId, const char* overlayDirectory)
 {
-    if (!Begin(device, themeName)) return false;
+    if (!Begin(device, themeName, overlayDirectory)) return false;
     if (!fontId || !*fontId || std::strcmp(fontId, "default") == 0)
         return true;
 
@@ -423,7 +429,7 @@ bool SelectFont(IDirect3DDevice9* device, const char* themeName,
     std::memset(candidate, 0, sizeof(*candidate));
     std::strncpy(candidate->id, fontId, sizeof(candidate->id) - 1);
     g_activeAtlas = candidate;
-    if (!BuildAtlas(device, themeName, fontId)) {
+    if (!BuildAtlas(device, themeName, fontId, overlayDirectory)) {
         if (candidate->privateFontPath[0])
             RemoveFontResourceExA(candidate->privateFontPath,
                 FR_PRIVATE, nullptr);
@@ -435,10 +441,11 @@ bool SelectFont(IDirect3DDevice9* device, const char* themeName,
     return true;
 }
 
-bool Reload(IDirect3DDevice9* device, const char* themeName)
+bool Reload(IDirect3DDevice9* device, const char* themeName,
+            const char* overlayDirectory)
 {
     Shutdown();
-    return Begin(device, themeName);
+    return Begin(device, themeName, overlayDirectory);
 }
 
 const Style& GetStyle()

@@ -114,11 +114,25 @@ struct Config {
     Rect homeTimeouts;
     Rect awayBonus;
     Rect homeBonus;
+
+    char enterAnimation[16];
+    float enterFromX;
+    float enterFromY;
+    unsigned int enterMilliseconds;
+    unsigned int holdMilliseconds;
+    char exitAnimation[16];
+    float exitToX;
+    float exitToY;
+    unsigned int exitMilliseconds;
+    bool freezeWhilePaused;
 };
 
 const Config& Get();
+const Config& GetViolation();
 bool Load(const char* themeName);
 bool Reload(const char* themeName);
+bool LoadViolation(const char* themeName);
+bool ReloadViolation(const char* themeName);
 const char* GetLastError();
 
 } // namespace scoreboardconfig

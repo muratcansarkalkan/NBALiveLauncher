@@ -37,6 +37,7 @@ using GetTeamScoreFn = int (__thiscall *)(GdInfoCentral*, int);
 using GetTeamIDFromSideFn = IDTeam* (__stdcall *)(IDTeam*, int);
 using GetTeamValueFn = int (__stdcall *)(int);
 using GetOverlayDataFn = DWORD (__thiscall *)(DWORD*, int, int);
+using StoreOverlayDataFn = void (__thiscall *)(void*, DWORD*);
 
 const GameAddresses* g_game = nullptr;
 SendEventFn g_originalSendEvent = nullptr;
@@ -122,6 +123,21 @@ BroadcastIdentity g_broadcast = {
     D3DCOLOR_XRGB(46, 63, 92), D3DCOLOR_XRGB(152, 30, 45)
 };
 
+struct ViolationState {
+    char title[96];
+    char possession[96];
+    D3DCOLOR teamColor;
+    unsigned int payloadHash;
+    DWORD startedAt;
+    DWORD pausedAt;
+    bool active;
+    bool paused;
+};
+
+ViolationState g_violation = {};
+bool g_violationPresentationSuppressed = false;
+DWORD g_violationTransitionHiddenAt = 0;
+
 using Direct3DCreate9Fn = IDirect3D9* (WINAPI *)(UINT);
 using PresentFn = HRESULT (WINAPI *)(IDirect3DDevice9*, const RECT*,
     const RECT*, HWND, const RGNDATA*);
@@ -141,6 +157,64 @@ DWORD g_visibilityLastTick = 0;
 unsigned int g_scoreboardShowRemaining = 0;
 ULONGLONG g_reloadFileStamp = 0;
 DWORD g_reloadFileLastCheck = 0;
+bool g_customOverlayEnabled = true;
+char g_customOverlayName[64] = "TEST";
+char g_customOverlayIniPath[MAX_PATH] = {};
+char g_customOverlayScoreboardPath[MAX_PATH] = {};
+
+StoreOverlayDataFn g_originalViolationDataStore = nullptr;
+
+bool __stdcall SuppressNativeViolationRequest(void*)
+{
+    // Matches sub_55B020's one stack argument and returns AL=1 so
+    // sub_597270 continues into its normal payload-storage branch.
+    return true;
+}
+
+bool IsSafeOverlayName(const char* name)
+{
+    if (!name || !*name || std::strstr(name, "..")) return false;
+    for (const unsigned char* p =
+             reinterpret_cast<const unsigned char*>(name); *p; ++p) {
+        if (!((*p >= 'a' && *p <= 'z') ||
+              (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
+            return false;
+    }
+    return true;
+}
+
+void LoadCustomOverlaySettings()
+{
+    char iniPath[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameA(nullptr, iniPath, MAX_PATH);
+    if (!length || length >= MAX_PATH) return;
+    char* slash = std::strrchr(iniPath, '\\');
+    if (!slash) return;
+    std::strcpy(slash + 1, "main.ini");
+    std::strncpy(g_customOverlayIniPath, iniPath,
+        sizeof(g_customOverlayIniPath) - 1);
+
+    g_customOverlayEnabled = GetPrivateProfileIntA(
+        "OVERLAY", "CUSTOM_OVERLAY", 1, iniPath) != 0;
+
+    char configuredName[64] = {};
+    GetPrivateProfileStringA("OVERLAY", "CUSTOM_OVERLAY_NAME", "TEST",
+        configuredName, sizeof(configuredName), iniPath);
+    if (IsSafeOverlayName(configuredName)) {
+        std::strncpy(g_customOverlayName, configuredName,
+            sizeof(g_customOverlayName) - 1);
+        g_customOverlayName[sizeof(g_customOverlayName) - 1] = '\0';
+    }
+    else
+        std::strcpy(g_customOverlayName, "TEST");
+
+    std::snprintf(slash + 1,
+        MAX_PATH - static_cast<size_t>(slash + 1 - iniPath),
+        "popups\\%s\\scoreboard\\scoreboard.json", g_customOverlayName);
+    std::strncpy(g_customOverlayScoreboardPath, iniPath,
+        sizeof(g_customOverlayScoreboardPath) - 1);
+}
 
 ULONGLONG GetPopupReloadFileStamp()
 {
@@ -149,7 +223,8 @@ ULONGLONG GetPopupReloadFileStamp()
     if (!length || length >= MAX_PATH) return 0;
     char* slash = std::strrchr(path, '\\');
     if (!slash) return 0;
-    std::strcpy(slash + 1, "popups\\TEST\\.reload");
+    std::snprintf(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - path),
+        "popups\\%s\\.reload", g_customOverlayName);
     WIN32_FILE_ATTRIBUTE_DATA data = {};
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &data)) return 0;
     return (static_cast<ULONGLONG>(data.ftLastWriteTime.dwHighDateTime) << 32) |
@@ -292,6 +367,51 @@ void CaptureBroadcastIdentity(int type, const BBallString* values, int count)
         else if (logoId && std::strcmp(logoId, g_broadcast.awayLogoId) == 0)
             g_broadcast.awayColor = color;
     }
+}
+
+void CaptureViolationPayload(DWORD* vector)
+{
+    if (!g_customOverlayEnabled || !vector) return;
+    __try {
+        const int count = static_cast<int>(vector[3]);
+        const BBallString* values = reinterpret_cast<const BBallString*>(
+            vector[0]);
+        if (count != 3 || !values) return;
+        const unsigned int hash = HashOverlayPayload(1, values, count);
+        if (g_violation.active && g_violation.payloadHash == hash) return;
+        CopyText(g_violation.title, sizeof(g_violation.title),
+            values[0].sharedstring);
+        CopyText(g_violation.possession, sizeof(g_violation.possession),
+            values[1].sharedstring);
+        g_violation.teamColor = ParsePackedColor(values[2].sharedstring,
+            D3DCOLOR_XRGB(40, 40, 40));
+        g_violation.payloadHash = hash;
+        g_violation.startedAt = GetTickCount();
+        g_violation.pausedAt = 0;
+        g_violation.paused = false;
+        g_violation.active = true;
+        if (g_violationPresentationSuppressed)
+            g_violationTransitionHiddenAt = g_violation.startedAt;
+        scoreboardconfig::LoadViolation(g_customOverlayName);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_violation.active = false;
+    }
+}
+
+void __fastcall HookViolationDataStore(
+    void* thisPtr, void*, DWORD* vector)
+{
+    // sub_597270 has already converted the three violation parameters into
+    // the same BBallString vector later returned by GetOverlayData(type 1).
+    // Capture it here because the native overlay request immediately before
+    // this call is intentionally bypassed.
+    CaptureViolationPayload(vector);
+
+    // Preserve the game's internal payload state even though no native movie
+    // instance is being requested. This keeps event bookkeeping intact.
+    if (g_originalViolationDataStore)
+        g_originalViolationDataStore(thisPtr, vector);
 }
 
 void LogOverlayPayload(int type, DWORD* vector)
@@ -555,6 +675,50 @@ int __cdecl HookSendEvent(
         const bool pauseEvent =
             std::strstr(name, "Pause") != nullptr && !resumeEvent;
 
+        // Mirror FEOverlayViolation's presentation lifecycle without loading
+        // overlays~viol.big. Full-screen transitions temporarily hide/freeze
+        // the active custom instance; pauses permanently dismiss it.
+        if (pauseEvent) {
+            g_violationPresentationSuppressed = true;
+            g_violation.active = false;
+            g_violation.paused = false;
+            g_violation.pausedAt = 0;
+            g_violationTransitionHiddenAt = 0;
+        }
+        else if (std::strcmp(name, "HideOverlaysEvent") == 0) {
+            if (!g_violationPresentationSuppressed && g_violation.active)
+                g_violationTransitionHiddenAt = GetTickCount();
+            g_violationPresentationSuppressed = true;
+        }
+        else if (std::strcmp(name, "ShowOverlaysEvent") == 0) {
+            if (g_violationPresentationSuppressed && g_violation.active &&
+                g_violationTransitionHiddenAt) {
+                g_violation.startedAt +=
+                    GetTickCount() - g_violationTransitionHiddenAt;
+            }
+            g_violationPresentationSuppressed = false;
+            g_violationTransitionHiddenAt = 0;
+        }
+        else if (resumeEvent) {
+            // A pause killed the previous instance; resume merely allows the
+            // next native violation request to create a new custom one.
+            g_violationPresentationSuppressed = false;
+            g_violationTransitionHiddenAt = 0;
+        }
+
+        const bool freezeViolation =
+            scoreboardconfig::GetViolation().freezeWhilePaused;
+        if (pauseEvent && freezeViolation && g_violation.active &&
+            !g_violation.paused) {
+            g_violation.paused = true;
+            g_violation.pausedAt = GetTickCount();
+        }
+        else if (resumeEvent && g_violation.active && g_violation.paused) {
+            g_violation.startedAt += GetTickCount() - g_violation.pausedAt;
+            g_violation.paused = false;
+            g_violation.pausedAt = 0;
+        }
+
         if (pauseEvent) {
             g_scoreboardSuppressed = true;
             g_scoreboardVisible = false;
@@ -627,7 +791,7 @@ int __cdecl HookSendEvent(
     // Keep ScoreShowEvent available to the custom scoreboard lifecycle code
     // above, but do not forward it to the original Flash/APT main-screen
     // receiver in games whose native show-state wrappers are neutralized.
-    if (g_game &&
+    if (g_customOverlayEnabled && g_game &&
         (g_game->version == GameVersion::Live2005 ||
         g_game->version == GameVersion::Live2006 ||
         g_game->version == GameVersion::Live2007 ||
@@ -641,7 +805,7 @@ int __cdecl HookSendEvent(
     // hook. Preserve the pause/overlay manager, then hide only the native
     // scoreboard. Call the original directly for the synthetic hide so our
     // custom scoreboard lifecycle is not suppressed.
-    if (g_game &&
+    if (g_customOverlayEnabled && g_game &&
         (g_game->version == GameVersion::Live2007 ||
             g_game->version == GameVersion::Live2008) &&
         name && std::strcmp(name, "ShowOverlayManager") == 0) {
@@ -661,6 +825,8 @@ DWORD __fastcall HookGetOverlayData(
     const auto original = reinterpret_cast<GetOverlayDataFn>(
         g_game->getOverlayData);
     const DWORD result = original(thisPtr, outputVector, type);
+    if (type == 1)
+        CaptureViolationPayload(reinterpret_cast<DWORD*>(outputVector));
     LogOverlayPayload(type, reinterpret_cast<DWORD*>(outputVector));
     // Fouls, timeouts, substitutions and other presentation state can change
     // between whole-second score-clock events.
@@ -822,16 +988,14 @@ const char* SelectTeamName(const popup::TeamVisual* team,
 
 void RenderNativeScoreboard(IDirect3DDevice9* device)
 {
-    if (!device || !RefreshRealtimeScoreboardState() ||
+    if (!g_customOverlayEnabled || !device || !RefreshRealtimeScoreboardState() ||
         g_lastState.gameValid != 1 ||
         g_lastState.homeScore < 0 || g_lastState.awayScore < 0 ||
         !g_lastState.clockUnitsPerSecond)
         return;
 
-    // TEST is the first external popup package. Team data is keyed by the
-    // zero-based database ID, not by the runtime IDTeam value.
-    popup::Load("TEST");
-    scoreboardconfig::Load("TEST");
+    popup::Load(g_customOverlayName);
+    scoreboardconfig::Load(g_customOverlayName);
     if (!ThemeVisibilityAllowsScoreboard(g_lastState))
         return;
     const scoreboardconfig::Config& scoreboardSettings =
@@ -891,7 +1055,78 @@ void RenderNativeScoreboard(IDirect3DDevice9* device)
     frame.homeTeamName = SelectTeamName(homeTeam,
         scoreboardSettings.teamNameFormat,
         homeFullName, sizeof(homeFullName), g_broadcast.homeName);
-    scoreboard::Render(device, frame);
+    scoreboard::Render(device, frame, g_customOverlayName);
+}
+
+float SmoothStep(float value)
+{
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+    return value * value * (3.0f - 2.0f * value);
+}
+
+void RenderViolationOverlay(IDirect3DDevice9* device)
+{
+    if (!g_customOverlayEnabled || !g_violation.active ||
+        g_violationPresentationSuppressed || !device) return;
+    scoreboardconfig::LoadViolation(g_customOverlayName);
+    const scoreboardconfig::Config& config = scoreboardconfig::GetViolation();
+    const DWORD now = g_violation.paused ? g_violation.pausedAt : GetTickCount();
+    const DWORD elapsed = now - g_violation.startedAt;
+    const DWORD enterEnd = config.enterMilliseconds;
+    const DWORD holdEnd = enterEnd + config.holdMilliseconds;
+    const DWORD total = holdEnd + config.exitMilliseconds;
+    if (elapsed >= total) { g_violation.active = false; return; }
+
+    float x = 0.0f, y = 0.0f, opacity = 1.0f;
+    if (elapsed < enterEnd && enterEnd > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed) / enterEnd);
+        if (_stricmp(config.enterAnimation, "slide") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0) {
+            x = config.enterFromX * (1.0f - p);
+            y = config.enterFromY * (1.0f - p);
+        }
+        if (_stricmp(config.enterAnimation, "fade") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0)
+            opacity = p;
+    }
+    else if (elapsed >= holdEnd && config.exitMilliseconds > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed - holdEnd) /
+            config.exitMilliseconds);
+        if (_stricmp(config.exitAnimation, "slide") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0) {
+            x = config.exitToX * p;
+            y = config.exitToY * p;
+        }
+        if (_stricmp(config.exitAnimation, "fade") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0)
+            opacity = 1.0f - p;
+    }
+
+    popup::Load(g_customOverlayName);
+    const popup::TeamVisual* away = popup::FindTeam(g_lastState.awayTeamDBID);
+    const popup::TeamVisual* home = popup::FindTeam(g_lastState.homeTeamDBID);
+    const D3DCOLOR rgb = g_violation.teamColor & 0x00FFFFFFu;
+    const bool awaySide = away &&
+        (away->primaryColor & 0x00FFFFFFu) == rgb;
+    const bool homeSide = home &&
+        (home->primaryColor & 0x00FFFFFFu) == rgb;
+    const popup::TeamVisual* team = awaySide ? away : homeSide ? home : nullptr;
+
+    scoreboard::Frame frame = {};
+    frame.violationTitle = g_violation.title;
+    frame.violationPossession = g_violation.possession;
+    frame.violationTeamColor = g_violation.teamColor;
+    frame.violationTeamName = team ? team->teamName : "";
+    char violationLogoPath[MAX_PATH] = {};
+    if (team && team->shortCode[0])
+        std::snprintf(violationLogoPath, sizeof(violationLogoPath),
+            "teams\\%s.png", team->shortCode);
+    frame.violationTeamLogo = violationLogoPath[0] ?
+        popup::GetOverlayTexture(device, g_customOverlayName,
+            "violation", violationLogoPath) : nullptr;
+    scoreboard::RenderViolation(device, frame, g_customOverlayName,
+        x, y, opacity);
 }
 
 void CheckPopupHotReload(IDirect3DDevice9* device)
@@ -909,17 +1144,20 @@ void CheckPopupHotReload(IDirect3DDevice9* device)
     if (reloadRequested) {
         // This runs on the Present/render thread, so cached D3D resources are
         // never released concurrently with scoreboard drawing.
-        const bool themeLoaded = popup::Reload("TEST");
-        const bool fontLoaded = popupfont::Reload(device, "TEST");
-        const bool scoreboardLoaded = scoreboardconfig::Reload("TEST");
+        const bool themeLoaded = popup::Reload(g_customOverlayName);
+        const bool fontLoaded = popupfont::Reload(device, g_customOverlayName);
+        const bool scoreboardLoaded = scoreboardconfig::Reload(g_customOverlayName);
+        const bool violationLoaded = scoreboardconfig::ReloadViolation(
+            g_customOverlayName);
         g_loggedAwayLogoTeam = INT_MIN;
         g_loggedHomeLogoTeam = INT_MIN;
         AppendDiagnostic(
-            "Popup hot reload: teams=%s font=%s scoreboard=%s error=%s\n",
+            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s error=%s\n",
             themeLoaded ? "OK" : "FAILED",
             fontLoaded ? "OK" : "FAILED",
             scoreboardLoaded ? "OK" : "FAILED",
-            themeLoaded && scoreboardLoaded ? "<none>" :
+            violationLoaded ? "OK" : "FAILED",
+            themeLoaded && scoreboardLoaded && violationLoaded ? "<none>" :
                 (!themeLoaded ? popup::GetLastError() :
                     scoreboardconfig::GetLastError()));
     }
@@ -941,6 +1179,7 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* device, const RECT* sourceRect,
     CheckPopupHotReload(device);
     if (SUCCEEDED(device->BeginScene())) {
         RenderNativeScoreboard(device);
+        RenderViolationOverlay(device);
         device->EndScene();
     }
     return g_originalPresent(device, sourceRect, destinationRect,
@@ -1329,12 +1568,24 @@ unsigned int RedirectDirectCalls(uintptr_t target, void* replacement)
     return count;
 }
 
+uintptr_t GetDirectCallDestination(uintptr_t callAddress)
+{
+    if (!callAddress) return 0;
+    const unsigned char* instruction =
+        reinterpret_cast<const unsigned char*>(callAddress);
+    if (instruction[0] != 0xE8) return 0;
+    const int32_t displacement =
+        *reinterpret_cast<const int32_t*>(instruction + 1);
+    return callAddress + 5 + displacement;
+}
+
 void Initialize(const GameAddresses& game)
 {
     g_game = &game;
     g_originalSendEvent = reinterpret_cast<SendEventFn>(game.sendEvent);
+    LoadCustomOverlaySettings();
 
-    if (game.version == GameVersion::Live2005) {
+    if (g_customOverlayEnabled && game.version == GameVersion::Live2005) {
         patch::SetUChar(0x0054023F + 3, 0); // Generic show
         patch::SetUChar(0x0055AA7F + 3, 0); // JumpBallToss
         patch::SetUChar(0x0055AADF + 3, 0); // QuarterStart
@@ -1345,7 +1596,7 @@ void Initialize(const GameAddresses& game)
     // [this+0x24] before sending ScoreShowEvent. Keep that flag cleared so a
     // later ShowOverlaysEvent (notably pause/resume) cannot resurrect the
     // native scoreboard. The immediate byte of C6 41 24 01 is at +3.
-    if (game.version == GameVersion::Live2006)
+    if (g_customOverlayEnabled && game.version == GameVersion::Live2006)
         patch::SetUChar(0x0053AB8F + 3, 0);
 
     // Live 06 also has three overlay-manager ScoreShowEvent wrappers. Each
@@ -1353,13 +1604,13 @@ void Initialize(const GameAddresses& game)
     // The pause path uses the third wrapper (call logged at 0x0055B1CE), so
     // merely consuming ScoreShowEvent is too late: ShowOverlayManager sees the
     // byte and restores the native board. Keep all three wrapper flags clear.
-    if (game.version == GameVersion::Live2006) {
+    if (g_customOverlayEnabled && game.version == GameVersion::Live2006) {
         patch::SetUChar(0x0055B12F + 3, 0);
         patch::SetUChar(0x0055B18F + 3, 0);
         patch::SetUChar(0x0055B1BF + 3, 0);
     }
 
-    if (game.version == GameVersion::Live2007) {
+    if (g_customOverlayEnabled && game.version == GameVersion::Live2007) {
         patch::SetUChar(0x0054DC8F + 3, 0);
         patch::SetUChar(0x0054E1CF + 3, 0);
         patch::SetUChar(0x0054E232 + 3, 0);
@@ -1371,7 +1622,7 @@ void Initialize(const GameAddresses& game)
     // NBA Live 08 uses +0x30 for the native scoreboard controller-visible
     // byte. Neutralize every known ScoreShowEvent wrapper, including the two
     // overlay-manager paths used while restoring overlays after pause.
-    if (game.version == GameVersion::Live2008) {
+    if (g_customOverlayEnabled && game.version == GameVersion::Live2008) {
         patch::SetUChar(0x005547BF + 3, 0);
         patch::SetUChar(0x00554D3F + 3, 0);
         patch::SetUChar(0x00554DA2 + 3, 0);
@@ -1412,6 +1663,18 @@ void Initialize(const GameAddresses& game)
         std::fclose(file);
     }
 
+    AppendDiagnostic(
+        "Custom overlay: enabled=%s name=%s\n"
+        "main.ini=%s exists=%s\n"
+        "scoreboard.json=%s exists=%s\n",
+        g_customOverlayEnabled ? "yes" : "no", g_customOverlayName,
+        g_customOverlayIniPath,
+        GetFileAttributesA(g_customOverlayIniPath) != INVALID_FILE_ATTRIBUTES
+            ? "yes" : "no",
+        g_customOverlayScoreboardPath,
+        GetFileAttributesA(g_customOverlayScoreboardPath) !=
+            INVALID_FILE_ATTRIBUTES ? "yes" : "no");
+
     const unsigned int sendEventCalls = RedirectDirectCalls(
         game.sendEvent, reinterpret_cast<void*>(&HookSendEvent));
     AppendDiagnostic("Redirected SendEvent calls: %u\n", sendEventCalls);
@@ -1433,7 +1696,44 @@ void Initialize(const GameAddresses& game)
             overlayCalls);
     }
 
-    InitializeNativeScoreboard();
+    // Every supported FEOverlayViolation builder first submits the native
+    // overlays~viol.big request, then stores its completed three-value
+    // BBallString vector. Replace the request with a stack-compatible success
+    // stub and capture the vector at the following store call.
+    if (g_customOverlayEnabled && game.violationRequestCall &&
+        game.violationDataStoreCall) {
+        const uintptr_t requestDestination = GetDirectCallDestination(
+            game.violationRequestCall);
+        const uintptr_t storeDestination = GetDirectCallDestination(
+            game.violationDataStoreCall);
+        if (!requestDestination || !storeDestination) {
+            AppendDiagnostic(
+                "Native violation suppression skipped: invalid calls "
+                "request=%08X store=%08X.\n",
+                static_cast<unsigned int>(game.violationRequestCall),
+                static_cast<unsigned int>(game.violationDataStoreCall));
+        }
+        else {
+            patch::RedirectCall(
+                static_cast<unsigned int>(game.violationRequestCall),
+                reinterpret_cast<void*>(&SuppressNativeViolationRequest));
+
+            g_originalViolationDataStore =
+                reinterpret_cast<StoreOverlayDataFn>(storeDestination);
+            patch::RedirectCall(
+                static_cast<unsigned int>(game.violationDataStoreCall),
+                reinterpret_cast<void*>(&HookViolationDataStore));
+            AppendDiagnostic(
+                "Native violation movie request disabled: "
+                "request=%08X store=%08X target=%08X.\n",
+                static_cast<unsigned int>(game.violationRequestCall),
+                static_cast<unsigned int>(game.violationDataStoreCall),
+                static_cast<unsigned int>(storeDestination));
+        }
+    }
+
+    if (g_customOverlayEnabled)
+        InitializeNativeScoreboard();
 }
 
 } // namespace

@@ -5,6 +5,7 @@ namespace NBALiveScoreboardEditor;
 public sealed class ScoreboardTheme
 {
     public List<OverlayElement> Elements { get; set; } = [];
+    public OverlayAnimation Animation { get; set; } = new();
     public int ReferenceWidth { get; set; } = 1366;
     public int ReferenceHeight { get; set; } = 768;
     public string ScaleMode { get; set; } = "uniform";
@@ -79,6 +80,30 @@ public sealed class ScoreboardTheme
     public double AwayBonusWidth { get; set; } = 58; public double AwayBonusHeight { get; set; } = 13;
     public double HomeBonusX { get; set; } = 374; public double HomeBonusY { get; set; } = 51;
     public double HomeBonusWidth { get; set; } = 58; public double HomeBonusHeight { get; set; } = 13;
+}
+
+public sealed class OverlayAnimation
+{
+    public AnimationTransition Enter { get; set; } = new()
+    {
+        Type = "slideFade", FromX = -80, Duration = 250
+    };
+    public int HoldMilliseconds { get; set; } = 2500;
+    public AnimationTransition Exit { get; set; } = new()
+    {
+        Type = "fade", Duration = 200
+    };
+    public bool FreezeWhilePaused { get; set; } = true;
+}
+
+public sealed class AnimationTransition
+{
+    public string Type { get; set; } = "none";
+    public double FromX { get; set; }
+    public double FromY { get; set; }
+    public double ToX { get; set; }
+    public double ToY { get; set; }
+    public int Duration { get; set; }
 }
 
 public sealed class OverlayElement

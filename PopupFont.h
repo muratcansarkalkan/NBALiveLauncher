@@ -21,12 +21,15 @@ struct Style {
 
 // Creates a GDI-backed glyph atlas using the active popup's TTF file.
 // Returns false only when even the Windows fallback font cannot be created.
-bool Begin(IDirect3DDevice9* device, const char* themeName);
+bool Begin(IDirect3DDevice9* device, const char* themeName,
+           const char* overlayDirectory = "scoreboard");
 // Selects a named entry from popup.json's optional "fonts" object.
 // Empty, missing, or invalid IDs fall back to the legacy default font.
 bool SelectFont(IDirect3DDevice9* device, const char* themeName,
-                const char* fontId);
-bool Reload(IDirect3DDevice9* device, const char* themeName);
+                const char* fontId,
+                const char* overlayDirectory = "scoreboard");
+bool Reload(IDirect3DDevice9* device, const char* themeName,
+            const char* overlayDirectory = "scoreboard");
 const Style& GetStyle();
 
 float Measure(const char* text, float height);

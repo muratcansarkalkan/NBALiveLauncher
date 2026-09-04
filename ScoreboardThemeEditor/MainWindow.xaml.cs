@@ -7,6 +7,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 
 namespace NBALiveScoreboardEditor;
 
@@ -54,6 +55,11 @@ public partial class MainWindow : Window
     private bool _loadingControls;
     private bool _loadingPreviewSettings;
     private EditorSettings _editorSettings = new();
+    private readonly DispatcherTimer _animationPreviewTimer = new()
+    {
+        Interval = TimeSpan.FromMilliseconds(16)
+    };
+    private DateTime _animationPreviewStarted;
 
     private static string EditorSettingsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -62,6 +68,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _animationPreviewTimer.Tick += AnimationPreview_Tick;
         VisibilityCombo.ItemsSource = new[] { "always", "afterScore", "lateGameOnly", "afterScoreAndLateGame" };
         ShotVisibilityCombo.ItemsSource = new[] { "always", "underThreshold", "never" };
         TeamFormatCombo.ItemsSource = new[] { "abbreviation", "city", "nickname", "fullName", "shortCode" };
@@ -80,6 +87,8 @@ public partial class MainWindow : Window
         ElementOverflowCombo.ItemsSource = new[] { "overflow", "fit" };
         ElementFillTypeCombo.ItemsSource = new[] { "solid", "linearGradient" };
         GradientDirectionCombo.ItemsSource = new[] { "vertical", "horizontal" };
+        EnterAnimationCombo.ItemsSource = ExitAnimationCombo.ItemsSource =
+            new[] { "none", "slide", "fade", "slideFade" };
         LoadEditorSettings();
         EnsureElements();
         ElementSelector.SelectedItem = "awayPanel";
@@ -195,28 +204,13 @@ public partial class MainWindow : Window
     {
         OpenFileDialog dialog = new()
         {
-            Title = "Open a popup scoreboard layout",
-            Filter = "NBA Live scoreboard layout|scoreboard.json|JSON files|*.json"
+            Title = "Open an NBA Live overlay layout",
+            Filter = "NBA Live overlay layouts|*.json|JSON files|*.json"
         };
         if (dialog.ShowDialog(this) != true) return;
         try
         {
-            _themeDirectory = Path.GetDirectoryName(dialog.FileName)!;
-            _activeDocumentPath = Path.GetFullPath(dialog.FileName);
-            _theme = JsonSerializer.Deserialize<ScoreboardTheme>(
-                File.ReadAllText(dialog.FileName), JsonOptions) ?? new();
-            EnsureElements();
-            string popupPath = Path.Combine(_themeDirectory, "popup.json");
-            _font = File.Exists(popupPath)
-                ? JsonSerializer.Deserialize<PopupFontTheme>(
-                    File.ReadAllText(popupPath), JsonOptions) ?? new()
-                : new();
-            _font.Fonts ??= [];
-            LoadTeams();
-            LoadControls();
-            RebuildPreview();
-            UpdateDocumentCaption();
-            StatusText.Text = $"Loaded {_activeDocumentPath}";
+            LoadDocument(Path.GetFullPath(dialog.FileName));
         }
         catch (Exception exception)
         {
@@ -225,10 +219,71 @@ public partial class MainWindow : Window
         }
     }
 
+    private void LoadDocument(string path)
+    {
+        _themeDirectory = Path.GetDirectoryName(path)!;
+        _activeDocumentPath = path;
+        _theme = JsonSerializer.Deserialize<ScoreboardTheme>(
+            File.ReadAllText(path), JsonOptions) ?? new();
+        _theme.Animation ??= new();
+        _theme.Animation.Enter ??= new();
+        _theme.Animation.Exit ??= new();
+        EnsureElements();
+        string popupPath = Path.Combine(_themeDirectory, "popup.json");
+        _font = File.Exists(popupPath)
+            ? JsonSerializer.Deserialize<PopupFontTheme>(
+                File.ReadAllText(popupPath), JsonOptions) ?? new()
+            : new();
+        _font.Fonts ??= [];
+        LoadTeams();
+        LoadControls();
+        string screen = Path.GetFileName(_themeDirectory);
+        _loadingControls = true;
+        ScreenCombo.SelectedIndex = screen.Equals("violation",
+            StringComparison.OrdinalIgnoreCase) ? 3 : 0;
+        _loadingControls = false;
+        RebuildPreview();
+        UpdateDocumentCaption();
+        StatusText.Text = $"Loaded {_activeDocumentPath}";
+    }
+
+    private void ScreenCombo_SelectionChanged(object sender,
+        SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded || _loadingControls || _themeDirectory is null) return;
+        string? selected = (ScreenCombo.SelectedItem as ComboBoxItem)?.Content
+            ?.ToString();
+        if (selected is not ("Scoreboard" or "Violation")) return;
+        string currentScreen = Path.GetFileName(_themeDirectory);
+        string packageDirectory = currentScreen.Equals("scoreboard",
+                StringComparison.OrdinalIgnoreCase) ||
+            currentScreen.Equals("violation", StringComparison.OrdinalIgnoreCase)
+            ? Directory.GetParent(_themeDirectory)?.FullName ?? _themeDirectory
+            : _themeDirectory;
+        string directoryName = selected.ToLowerInvariant();
+        string fileName = selected == "Scoreboard"
+            ? "scoreboard.json" : "violation.json";
+        string path = Path.Combine(packageDirectory, directoryName, fileName);
+        if (!File.Exists(path)) {
+            StatusText.Text = $"Overlay layout not found: {path}";
+            return;
+        }
+        try { LoadDocument(path); }
+        catch (Exception exception) {
+            MessageBox.Show(this, exception.Message, "Unable to switch overlay",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
     private void LoadTeams()
     {
         _teams.Clear();
         string path = Path.Combine(_themeDirectory!, "teams.json");
+        if (!File.Exists(path) && string.Equals(
+                Path.GetFileName(_themeDirectory), "violation",
+                StringComparison.OrdinalIgnoreCase))
+            path = Path.Combine(Directory.GetParent(_themeDirectory!)?.FullName
+                ?? _themeDirectory!, "scoreboard", "teams.json");
         if (!File.Exists(path)) return;
         using JsonDocument document = JsonDocument.Parse(File.ReadAllText(path));
         if (!document.RootElement.TryGetProperty("teams", out JsonElement teams)) return;
@@ -300,15 +355,29 @@ public partial class MainWindow : Window
             UpdateDocumentCaption();
 
             if (reload)
-                File.WriteAllText(Path.Combine(destinationDirectory, ".reload"),
+            {
+                string reloadDirectory = destinationDirectory;
+                string screenDirectory = Path.GetFileName(destinationDirectory);
+                if (screenDirectory.Equals("scoreboard",
+                        StringComparison.OrdinalIgnoreCase) ||
+                    screenDirectory.Equals("violation",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    reloadDirectory = Directory.GetParent(destinationDirectory)?.FullName
+                        ?? destinationDirectory;
+                }
+                File.WriteAllText(Path.Combine(reloadDirectory, ".reload"),
                     DateTime.UtcNow.Ticks.ToString());
+            }
             bool gameLoadsActiveDocument =
                 string.Equals(Path.GetFileName(savePath), "scoreboard.json",
+                    StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(Path.GetFileName(savePath), "violation.json",
                     StringComparison.OrdinalIgnoreCase);
             StatusText.Text = reload && gameLoadsActiveDocument
-                ? "Saved scoreboard.json. The running game will reload within 500 ms."
+                ? $"Saved {Path.GetFileName(savePath)}. The running game will reload within 500 ms."
                 : reload
-                    ? $"Saved {Path.GetFileName(savePath)}. The game currently loads scoreboard.json."
+                    ? $"Saved {Path.GetFileName(savePath)}."
                     : $"Saved {savePath}.";
         }
         catch (Exception exception)
@@ -353,6 +422,16 @@ public partial class MainWindow : Window
         TimeoutModeCombo.SelectedItem = _theme.TimeoutMode;
         ShowBonusCheck.IsChecked = _theme.ShowBonus;
         BonusThresholdBox.Text = _theme.BonusThreshold.ToString();
+        EnterAnimationCombo.SelectedItem = _theme.Animation.Enter.Type;
+        EnterFromXBox.Text = _theme.Animation.Enter.FromX.ToString("0.##");
+        EnterFromYBox.Text = _theme.Animation.Enter.FromY.ToString("0.##");
+        EnterDurationBox.Text = _theme.Animation.Enter.Duration.ToString();
+        HoldDurationBox.Text = _theme.Animation.HoldMilliseconds.ToString();
+        ExitAnimationCombo.SelectedItem = _theme.Animation.Exit.Type;
+        ExitToXBox.Text = _theme.Animation.Exit.ToX.ToString("0.##");
+        ExitToYBox.Text = _theme.Animation.Exit.ToY.ToString("0.##");
+        ExitDurationBox.Text = _theme.Animation.Exit.Duration.ToString();
+        FreezeAnimationCheck.IsChecked = _theme.Animation.FreezeWhilePaused;
         ScaleModeCombo.SelectedItem = _theme.ScaleMode;
         ReferenceWidthBox.Text = _theme.ReferenceWidth.ToString();
         ReferenceHeightBox.Text = _theme.ReferenceHeight.ToString();
@@ -465,6 +544,75 @@ public partial class MainWindow : Window
         RebuildPreview();
     }
 
+    private void PreviewAnimation_Click(object sender, RoutedEventArgs e)
+    {
+        ApplyBehaviorFromControls();
+        _animationPreviewStarted = DateTime.UtcNow;
+        _animationPreviewTimer.Start();
+        ApplyAnimationPreview(0);
+    }
+
+    private void AnimationPreview_Tick(object? sender, EventArgs e)
+    {
+        double elapsed = (DateTime.UtcNow - _animationPreviewStarted)
+            .TotalMilliseconds;
+        ApplyAnimationPreview(elapsed);
+    }
+
+    private static double AnimationEase(double value)
+    {
+        value = Math.Clamp(value, 0, 1);
+        return value * value * (3 - 2 * value);
+    }
+
+    private void ApplyAnimationPreview(double elapsed)
+    {
+        double enterEnd = _theme.Animation.Enter.Duration;
+        double holdEnd = enterEnd + _theme.Animation.HoldMilliseconds;
+        double total = holdEnd + _theme.Animation.Exit.Duration;
+        if (elapsed >= total)
+        {
+            _animationPreviewTimer.Stop();
+            PreviewCanvas.Opacity = 1;
+            UpdatePreviewStage();
+            return;
+        }
+
+        double x = 0, y = 0, opacity = 1;
+        if (elapsed < enterEnd && enterEnd > 0)
+        {
+            double progress = AnimationEase(elapsed / enterEnd);
+            if (_theme.Animation.Enter.Type is "slide" or "slideFade")
+            {
+                x = _theme.Animation.Enter.FromX * (1 - progress);
+                y = _theme.Animation.Enter.FromY * (1 - progress);
+            }
+            if (_theme.Animation.Enter.Type is "fade" or "slideFade")
+                opacity = progress;
+        }
+        else if (elapsed >= holdEnd && _theme.Animation.Exit.Duration > 0)
+        {
+            double progress = AnimationEase((elapsed - holdEnd) /
+                _theme.Animation.Exit.Duration);
+            if (_theme.Animation.Exit.Type is "slide" or "slideFade")
+            {
+                x = _theme.Animation.Exit.ToX * progress;
+                y = _theme.Animation.Exit.ToY * progress;
+            }
+            if (_theme.Animation.Exit.Type is "fade" or "slideFade")
+                opacity = 1 - progress;
+        }
+
+        UpdatePreviewStage();
+        double offsetScale = _theme.ScaleMode == "uniform"
+            ? ((ScaleTransform)PreviewCanvas.RenderTransform).ScaleX : 1;
+        Canvas.SetLeft(PreviewCanvas,
+            Canvas.GetLeft(PreviewCanvas) + x * offsetScale);
+        Canvas.SetTop(PreviewCanvas,
+            Canvas.GetTop(PreviewCanvas) + y * offsetScale);
+        PreviewCanvas.Opacity = opacity;
+    }
+
     private void ApplyLayout_Click(object sender, RoutedEventArgs e)
     {
         ApplyLayoutFromControls();
@@ -515,6 +663,22 @@ public partial class MainWindow : Window
         _theme.TimeoutMode = TimeoutModeCombo.SelectedItem as string ?? "none";
         _theme.ShowBonus = ShowBonusCheck.IsChecked == true;
         _theme.BonusThreshold = Int(BonusThresholdBox, 5);
+        _theme.Animation.Enter.Type = EnterAnimationCombo.SelectedItem as string
+            ?? "none";
+        _theme.Animation.Enter.FromX = Double(EnterFromXBox, 0);
+        _theme.Animation.Enter.FromY = Double(EnterFromYBox, 0);
+        _theme.Animation.Enter.Duration = Math.Max(0,
+            Int(EnterDurationBox, 250));
+        _theme.Animation.HoldMilliseconds = Math.Max(0,
+            Int(HoldDurationBox, 2500));
+        _theme.Animation.Exit.Type = ExitAnimationCombo.SelectedItem as string
+            ?? "none";
+        _theme.Animation.Exit.ToX = Double(ExitToXBox, 0);
+        _theme.Animation.Exit.ToY = Double(ExitToYBox, 0);
+        _theme.Animation.Exit.Duration = Math.Max(0,
+            Int(ExitDurationBox, 200));
+        _theme.Animation.FreezeWhilePaused =
+            FreezeAnimationCheck.IsChecked == true;
         _theme.ScaleMode = ScaleModeCombo.SelectedItem as string ?? "uniform";
         // Once elements[] exists, layer properties are authoritative. Mirror
         // them back into the legacy fields instead of overwriting layer edits
@@ -670,6 +834,7 @@ public partial class MainWindow : Window
                     "away.secondaryColor" => away.SecondaryColor,
                     "home.primaryColor" => home.PrimaryColor,
                     "home.secondaryColor" => home.SecondaryColor,
+                    "violation.teamColor" => Int(ViolationColorBox, 18050),
                     _ => fallback
                 };
                 int start = Resolve(layer.Fill.StartBinding, layer.Fill.StartColor);
@@ -686,6 +851,7 @@ public partial class MainWindow : Window
                 {
                     "away.logo" => TeamLogoPath(away),
                     "home.logo" => TeamLogoPath(home),
+                    "violation.teamLogo" => ViolationLogoPath(away, home),
                     _ when _themeDirectory is not null && layer.Image.Length > 0 =>
                         Path.GetFullPath(Path.Combine(_themeDirectory,
                             layer.Image.Replace('/', Path.DirectorySeparatorChar))),
@@ -737,6 +903,9 @@ public partial class MainWindow : Window
         "away.timeouts" => AwayTimeoutsBox.Text,
         "home.timeouts" => HomeTimeoutsBox.Text,
         "away.bonus" or "home.bonus" => _theme.BonusText,
+        "violation.title" => ViolationTitleBox.Text,
+        "violation.possession" => ViolationPossessionBox.Text,
+        "violation.teamName" => ViolationTeam(away, home).TeamName,
         _ => fallback
     };
 
@@ -748,8 +917,28 @@ public partial class MainWindow : Window
         "away.fouls" or "home.fouls" => _font.FoulHeight,
         "away.timeouts" or "home.timeouts" => _font.TimeoutHeight,
         "away.bonus" or "home.bonus" => _font.BonusHeight,
+        "violation.title" => _font.ScoreHeight,
+        "violation.possession" or "violation.teamName" => _font.TeamNameHeight,
         _ => _font.TeamNameHeight
     };
+
+    private TeamDefinition ViolationTeam(TeamDefinition away,
+        TeamDefinition home)
+    {
+        int color = Int(ViolationColorBox, 18050);
+        if (away.PrimaryColor == color) return away;
+        if (home.PrimaryColor == color) return home;
+        return away;
+    }
+
+    private string? ViolationLogoPath(TeamDefinition away,
+        TeamDefinition home)
+    {
+        if (_themeDirectory is null) return null;
+        TeamDefinition team = ViolationTeam(away, home);
+        if (string.IsNullOrWhiteSpace(team.ShortCode)) return null;
+        return Path.Combine(_themeDirectory, "teams", team.ShortCode + ".png");
+    }
 
     private void UpdatePreviewStage()
     {

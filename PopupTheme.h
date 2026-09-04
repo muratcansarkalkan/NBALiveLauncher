@@ -26,6 +26,9 @@ IDirect3DTexture9* GetLogoTexture(
     IDirect3DDevice9* device, int databaseTeamID);
 IDirect3DTexture9* GetThemeTexture(
     IDirect3DDevice9* device, const char* relativePath);
+IDirect3DTexture9* GetOverlayTexture(IDirect3DDevice9* device,
+    const char* themeName, const char* overlayDirectory,
+    const char* relativePath);
 
 // Human-readable reason for the most recent theme/logo loading failure.
 const char* GetLastError();

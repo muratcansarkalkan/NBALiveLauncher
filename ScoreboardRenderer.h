@@ -26,8 +26,17 @@ struct Frame {
     IDirect3DTexture9* homeLogo;
     const char* awayTeamName;
     const char* homeTeamName;
+    const char* violationTitle;
+    const char* violationPossession;
+    const char* violationTeamName;
+    D3DCOLOR violationTeamColor;
+    IDirect3DTexture9* violationTeamLogo;
 };
 
-void Render(IDirect3DDevice9* device, const Frame& frame);
+void Render(IDirect3DDevice9* device, const Frame& frame,
+            const char* overlayName);
+void RenderViolation(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity);
 
 } // namespace scoreboard

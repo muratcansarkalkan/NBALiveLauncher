@@ -279,7 +279,7 @@ bool Load(const char* themeName)
         return false;
     }
     const std::string themeDirectory =
-        gameDirectory + "\\popups\\" + themeName;
+        gameDirectory + "\\popups\\" + themeName + "\\scoreboard";
     std::strncpy(g_themeDirectory, themeDirectory.c_str(), MAX_PATH - 1);
     const std::string jsonPath = themeDirectory + "\\teams.json";
     std::string json;
@@ -389,6 +389,47 @@ IDirect3DTexture9* GetThemeTexture(
     const D3DXCreateTextureFromFileExAFn loadTexture = GetTextureLoader();
     if (!loadTexture) return nullptr;
     HRESULT result = loadTexture(device, fullPath,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 1, 0, D3DFMT_UNKNOWN,
+        D3DPOOL_MANAGED, 0x00000003u, 0x00000003u,
+        0, nullptr, nullptr, &asset.texture);
+    if (FAILED(result)) {
+        asset.texture = nullptr;
+        SetLastError("D3DX failed to load %s (HRESULT=%08X).",
+            fullPath, static_cast<unsigned int>(result));
+    }
+    g_assets.push_back(asset);
+    return asset.texture;
+}
+
+IDirect3DTexture9* GetOverlayTexture(IDirect3DDevice9* device,
+    const char* themeName, const char* overlayDirectory,
+    const char* relativePath)
+{
+    if (!device || !themeName || !*themeName || !overlayDirectory ||
+        !*overlayDirectory || !relativePath || !*relativePath) return nullptr;
+    if (device != g_textureDevice) {
+        ReleaseTextures();
+        g_textureDevice = device;
+    }
+    const std::string path = GetGameDirectory() + "\\popups\\" + themeName +
+        "\\" + overlayDirectory + "\\" + relativePath;
+    char fullPath[MAX_PATH] = {};
+    std::strncpy(fullPath, path.c_str(), MAX_PATH - 1);
+    for (char* p = fullPath; *p; ++p) if (*p == '/') *p = '\\';
+    for (size_t i = 0; i < g_assets.size(); ++i)
+        if (_stricmp(g_assets[i].path, fullPath) == 0)
+            return g_assets[i].texture;
+
+    AssetTexture asset = {};
+    std::strncpy(asset.path, fullPath, MAX_PATH - 1);
+    if (GetFileAttributesA(fullPath) == INVALID_FILE_ATTRIBUTES) {
+        SetLastError("Overlay image does not exist: %s", fullPath);
+        g_assets.push_back(asset);
+        return nullptr;
+    }
+    const D3DXCreateTextureFromFileExAFn loadTexture = GetTextureLoader();
+    if (!loadTexture) return nullptr;
+    const HRESULT result = loadTexture(device, fullPath,
         0xFFFFFFFFu, 0xFFFFFFFFu, 1, 0, D3DFMT_UNKNOWN,
         D3DPOOL_MANAGED, 0x00000003u, 0x00000003u,
         0, nullptr, nullptr, &asset.texture);
