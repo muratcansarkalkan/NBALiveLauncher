@@ -43,6 +43,8 @@ struct Frame {
     D3DCOLOR statSecondaryColor;
     IDirect3DTexture9* statTeamLogo;
     IDirect3DTexture9* playerPortrait;
+    const char* statValues[15];
+    int statValueCount;
 };
 
 void Render(IDirect3DDevice9* device, const Frame& frame,
@@ -51,6 +53,9 @@ void RenderViolation(IDirect3DDevice9* device, const Frame& frame,
     const char* overlayName, float animationOffsetX,
     float animationOffsetY, float animationOpacity);
 void RenderPlayerFoul(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity);
+void RenderStat(IDirect3DDevice9* device, const Frame& frame,
     const char* overlayName, float animationOffsetX,
     float animationOffsetY, float animationOpacity);
 

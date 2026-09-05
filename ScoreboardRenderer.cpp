@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cmath>
 #include <cctype>
+#include <cstdlib>
 
 namespace scoreboard {
 namespace {
@@ -483,6 +484,20 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
             frame.statTeamName;
         std::snprintf(output, capacity, "%s", value ? value : "");
         *defaultHeight = style.teamNameHeight; return true;
+    }
+    if (std::strncmp(b, "stat.raw", 8) == 0) {
+        const char* indexText = b + 8;
+        char* end = nullptr;
+        const long index = std::strtol(indexText, &end, 10);
+        if (end != indexText && *end == '\0' && index >= 0 &&
+            index < frame.statValueCount && index < 15) {
+            const char* value = frame.statValues[index];
+            std::snprintf(output, capacity, "%s", value ? value : "");
+            *defaultHeight = style.teamNameHeight;
+            return true;
+        }
+        output[0] = '\0';
+        return true;
     }
     if (std::strcmp(b, "away.score") == 0) {
         std::snprintf(output, capacity, "%d", frame.awayScore);
@@ -1020,6 +1035,48 @@ void RenderPlayerFoul(IDirect3DDevice9* device, const Frame& frame,
     device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
     const scoreboardconfig::Config& config = scoreboardconfig::GetPlayerFoul();
+    float scale = 1.0f;
+    if (config.scaleMode == scoreboardconfig::ScaleMode::Uniform) {
+        const float sx = static_cast<float>(viewport.Width) / config.referenceWidth;
+        const float sy = static_cast<float>(viewport.Height) / config.referenceHeight;
+        scale = sx < sy ? sx : sy;
+    }
+    const float offsetScale = config.scaleMode ==
+        scoreboardconfig::ScaleMode::Uniform ? scale : 1.0f;
+    const float left = (static_cast<float>(viewport.Width) -
+        config.width * scale) * 0.5f +
+        (config.offsetX + animationOffsetX) * offsetScale;
+    const float top = (config.offsetY + animationOffsetY) * offsetScale;
+    RenderGenericElements(device, config, frame, left, top, scale,
+        overlayName, "stats", animationOpacity);
+    if (stateBlock) { stateBlock->Apply(); stateBlock->Release(); }
+}
+
+void RenderStat(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity)
+{
+    if (!device || !overlayName || !*overlayName ||
+        frame.statValueCount <= 0 || animationOpacity <= 0.0f)
+        return;
+    D3DVIEWPORT9 viewport = {};
+    if (FAILED(device->GetViewport(&viewport))) return;
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
+        stateBlock->Capture();
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetVertexShader(nullptr); device->SetPixelShader(nullptr);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    const scoreboardconfig::Config& config = scoreboardconfig::GetStat();
     float scale = 1.0f;
     if (config.scaleMode == scoreboardconfig::ScaleMode::Uniform) {
         const float sx = static_cast<float>(viewport.Width) / config.referenceWidth;

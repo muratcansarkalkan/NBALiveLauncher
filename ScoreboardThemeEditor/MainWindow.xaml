@@ -29,7 +29,8 @@
                     <ComboBoxItem Content="Playcall" IsEnabled="False"/>
                 </ComboBox>
                 <TextBlock Text="Subtype" VerticalAlignment="Center" Margin="0,0,5,0"/>
-                <ComboBox x:Name="SubtypeCombo" Width="90" SelectedIndex="0" Margin="0,0,18,0">
+                <ComboBox x:Name="SubtypeCombo" Width="110" SelectedIndex="0" Margin="0,0,18,0"
+                          SelectionChanged="SubtypeCombo_SelectionChanged">
                     <ComboBoxItem Content="Default"/>
                 </ComboBox>
                 <TextBlock Text="Away" VerticalAlignment="Center" Margin="0,0,5,0"/>
@@ -73,6 +74,9 @@
                         <TextBlock Text="Violation" Margin="6" VerticalAlignment="Center"/><TextBox x:Name="ViolationTitleBox" Text="Defensive Foul" Width="120" Margin="3" TextChanged="PreviewTextChanged"/>
                         <TextBlock Text="Possession" Margin="6" VerticalAlignment="Center"/><TextBox x:Name="ViolationPossessionBox" Text="Minnesota Ball" Width="110" Margin="3" TextChanged="PreviewTextChanged"/>
                         <TextBlock Text="Team RGB" Margin="6" VerticalAlignment="Center"/><TextBox x:Name="ViolationColorBox" Text="18050" Width="72" Margin="3" TextChanged="PreviewTextChanged"/>
+                        <TextBlock Text="Stat values 0–14 (use |)" Margin="6" VerticalAlignment="Center"/>
+                        <TextBox x:Name="StatValuesBox" Text="Lamar|Odom|Personal Fouls|1|Team|1|||||||4925563|ll|LAODOM_"
+                                 Width="520" Margin="3" TextChanged="PreviewTextChanged"/>
                     </WrapPanel>
                 </GroupBox>
             </Grid>

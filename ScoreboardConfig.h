@@ -137,12 +137,17 @@ struct Config {
 const Config& Get();
 const Config& GetViolation();
 const Config& GetPlayerFoul();
+const Config& GetStat();
 bool Load(const char* themeName);
 bool Reload(const char* themeName);
 bool LoadViolation(const char* themeName);
 bool ReloadViolation(const char* themeName);
 bool LoadPlayerFoul(const char* themeName);
 bool ReloadPlayerFoul(const char* themeName);
+bool LoadStat(const char* themeName, const char* subtypeKey,
+    bool playerPayload, int valueCase = 0);
+bool ReloadStat(const char* themeName, const char* subtypeKey,
+    bool playerPayload, int valueCase = 0);
 const char* GetLastError();
 
 } // namespace scoreboardconfig

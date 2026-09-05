@@ -288,7 +288,10 @@ public partial class MainWindow : Window
             : _themeDirectory;
         string directoryName = selected.ToLowerInvariant();
         string fileName = selected == "Scoreboard" ? "scoreboard.json" :
-            selected == "Violation" ? "violation.json" : "player_foul.json";
+            selected == "Violation" ? "violation.json" : "player.json";
+        if (selected == "Stats" && !File.Exists(Path.Combine(
+                packageDirectory, directoryName, fileName)))
+            fileName = "player_foul.json";
         string path = Path.Combine(packageDirectory, directoryName, fileName);
         if (!File.Exists(path)) {
             StatusText.Text = $"Overlay layout not found: {path}";
@@ -301,13 +304,75 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SetSubtypeOptions(bool playerFoul)
+    private void SetSubtypeOptions(bool stats)
     {
+        bool wasLoading = _loadingControls;
+        _loadingControls = true;
         SubtypeCombo.Items.Clear();
-        SubtypeCombo.Items.Add(new ComboBoxItem {
-            Content = playerFoul ? "Player Foul" : "Default"
-        });
-        SubtypeCombo.SelectedIndex = 0;
+        if (stats)
+        {
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Player — fallback", Tag = "player.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Player — 1 value", Tag = "player_1.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Player — 2 values", Tag = "player_2.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Player — 3 values", Tag = "player_3.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Player — 4 values", Tag = "player_4.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Player — 5 values", Tag = "player_5.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Team — fallback", Tag = "team.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Team — 1 column", Tag = "team_1.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Team — 2 columns", Tag = "team_2.json" });
+            SubtypeCombo.Items.Add(new ComboBoxItem {
+                Content = "Team — 3 columns", Tag = "team_3.json" });
+            string active = Path.GetFileName(_activeDocumentPath ?? "");
+            string[] files = {
+                "player.json", "player_1.json", "player_2.json",
+                "player_3.json", "player_4.json", "player_5.json",
+                "team.json", "team_1.json", "team_2.json", "team_3.json"
+            };
+            int selected = Array.FindIndex(files, file => active.Equals(file,
+                StringComparison.OrdinalIgnoreCase));
+            SubtypeCombo.SelectedIndex = selected >= 0 ? selected : 0;
+        }
+        else
+        {
+            SubtypeCombo.Items.Add(new ComboBoxItem { Content = "Default" });
+            SubtypeCombo.SelectedIndex = 0;
+        }
+        _loadingControls = wasLoading;
+    }
+
+    private void SubtypeCombo_SelectionChanged(object sender,
+        SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded || _loadingControls || _themeDirectory is null ||
+            (ScreenCombo.SelectedItem as ComboBoxItem)?.Content?.ToString() != "Stats" ||
+            SubtypeCombo.SelectedItem is not ComboBoxItem item ||
+            item.Tag is not string fileName)
+            return;
+        string statsDirectory = Path.GetFileName(_themeDirectory).Equals("stats",
+            StringComparison.OrdinalIgnoreCase) ? _themeDirectory :
+            Path.Combine(Directory.GetParent(_themeDirectory)?.FullName ??
+                _themeDirectory, "stats");
+        string path = Path.Combine(statsDirectory, fileName);
+        if (!File.Exists(path))
+        {
+            StatusText.Text = $"Stat family layout not found: {path}";
+            return;
+        }
+        try { LoadDocument(path); }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, exception.Message, "Unable to switch stat layout",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     private void LoadTeams()
@@ -398,6 +463,8 @@ public partial class MainWindow : Window
                 if (screenDirectory.Equals("scoreboard",
                         StringComparison.OrdinalIgnoreCase) ||
                     screenDirectory.Equals("violation",
+                        StringComparison.OrdinalIgnoreCase) ||
+                    screenDirectory.Equals("stats",
                         StringComparison.OrdinalIgnoreCase))
                 {
                     reloadDirectory = Directory.GetParent(destinationDirectory)?.FullName
@@ -410,7 +477,9 @@ public partial class MainWindow : Window
                 string.Equals(Path.GetFileName(savePath), "scoreboard.json",
                     StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(Path.GetFileName(savePath), "violation.json",
-                    StringComparison.OrdinalIgnoreCase);
+                    StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(Path.GetFileName(Path.GetDirectoryName(savePath)),
+                    "stats", StringComparison.OrdinalIgnoreCase);
             StatusText.Text = reload && gameLoadsActiveDocument
                 ? $"Saved {Path.GetFileName(savePath)}. The running game will reload within 500 ms."
                 : reload
@@ -1035,6 +1104,10 @@ public partial class MainWindow : Window
                     "right" => TextAlignment.Right,
                     _ => TextAlignment.Center
                 };
+                // A Viewbox measures its child by content unless the text has
+                // an explicit width. Keep the same text box used by the game
+                // so left/center/right remains visible when overflow is "fit".
+                text.Width = Math.Max(1, layer.Width);
                 text.HorizontalAlignment = HorizontalAlignment.Stretch;
                 border.Child = layer.Overflow == "fit"
                     ? new Viewbox { Stretch = Stretch.Uniform, Child = text }
@@ -1176,6 +1249,7 @@ public partial class MainWindow : Window
                 };
                 // Fill the layer's complete width so TextAlignment describes
                 // alignment inside the same box used by the game renderer.
+                text.Width = Math.Max(1, layer.Width);
                 text.HorizontalAlignment = HorizontalAlignment.Stretch;
                 border.Child = layer.Overflow == "fit"
                     ? new Viewbox { Stretch = Stretch.Uniform, Child = text }
@@ -1190,9 +1264,24 @@ public partial class MainWindow : Window
         _themeDirectory is null || string.IsNullOrWhiteSpace(team.Logo) ? null :
         Path.Combine(_themeDirectory, team.Logo.Replace('/', Path.DirectorySeparatorChar));
 
-    private string ResolvePreviewBinding(string binding, TeamDefinition away,
-        TeamDefinition home, string fallback) => binding switch
+    private string StatPreviewValue(int index)
     {
+        string[] values = StatValuesBox.Text.Split('|');
+        return index >= 0 && index < values.Length ? values[index] : "";
+    }
+
+    private string ResolvePreviewBinding(string binding, TeamDefinition away,
+        TeamDefinition home, string fallback)
+    {
+        const string rawPrefix = "stat.raw";
+        if (binding.StartsWith(rawPrefix, StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(binding[rawPrefix.Length..], out int rawIndex) &&
+            rawIndex >= 0 && rawIndex < 15)
+        {
+            return StatPreviewValue(rawIndex);
+        }
+        return binding switch
+        {
         "away.score" => AwayScoreBox.Text, "home.score" => HomeScoreBox.Text,
         "game.clock" => ClockBox.Text, "game.shotClock" => ShotBox.Text,
         "game.period" => FormatPeriod(), "away.name" => FormatTeam(away),
@@ -1204,16 +1293,17 @@ public partial class MainWindow : Window
         "violation.title" => ViolationTitleBox.Text,
         "violation.possession" => ViolationPossessionBox.Text,
         "violation.teamName" => ViolationTeam(away, home).TeamName,
-        "player.firstName" => "Lamar",
-        "player.lastName" => "Odom",
-        "player.fullName" => "Lamar Odom",
+        "player.firstName" => StatPreviewValue(0),
+        "player.lastName" => StatPreviewValue(1),
+        "player.fullName" => $"{StatPreviewValue(0)} {StatPreviewValue(1)}".Trim(),
         "stat.label1" => "Personal Fouls",
         "stat.value1" => "1",
         "stat.label2" => "Team",
         "stat.value2" => "1",
         "stat.teamName" => away.TeamName,
-        _ => fallback
-    };
+            _ => fallback
+        };
+    }
 
     private double DefaultFontHeight(string binding) => binding switch
     {
@@ -1343,7 +1433,28 @@ public partial class MainWindow : Window
     private void AddText(string prefix, string text, double height, Brush? brush = null)
     {
         Border border = CreateBorder(prefix);
-        border.Child = PreviewText(text, height, brush ?? Brushes.White);
+        TextBlock preview = PreviewText(text, height, brush ?? Brushes.White);
+        OverlayElement? layer = Layer(prefix);
+
+        if (layer is not null)
+        {
+            preview.TextAlignment = layer.Alignment switch
+            {
+                "left" => TextAlignment.Left,
+                "right" => TextAlignment.Right,
+                _ => TextAlignment.Center
+            };
+            preview.Width = Math.Max(1, layer.Width);
+            preview.HorizontalAlignment = HorizontalAlignment.Stretch;
+
+            border.Child = layer.Overflow == "fit"
+                ? new Viewbox { Stretch = Stretch.Uniform, Child = preview }
+                : preview;
+        }
+        else
+        {
+            border.Child = preview;
+        }
         AddToCanvas(border, prefix);
     }
 

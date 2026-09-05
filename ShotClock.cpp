@@ -15,6 +15,7 @@
 #include "PopupTheme.h"
 #include "PopupFont.h"
 #include "ScoreboardConfig.h"
+#include "StatOverlayTypes.h"
 
 #pragma comment(lib, "d3d9.lib")
 
@@ -161,6 +162,36 @@ bool g_playerFoulLayoutAvailable = false;
 bool g_suppressCurrentStatsRequest = false;
 bool g_statsRequestHookInstalled = false;
 char g_loggedStatTeamCode[32] = {};
+
+struct GenericStatState {
+    char values[15][128];
+    int count;
+    char subtypeKey[64];
+    char teamCode[32];
+    char portraitId[32];
+    D3DCOLOR teamColor;
+    DWORD startedAt;
+    int valueCase;
+    bool playerPayload;
+    bool active;
+};
+
+GenericStatState g_genericStat = {};
+bool g_genericStatPresentationSuppressed = false;
+DWORD g_genericStatTransitionHiddenAt = 0;
+
+struct StatCatalogEntry {
+    DWORD control14;
+    DWORD control18;
+    DWORD control1C;
+    int count;
+    uint64_t nonEmptyMask;
+    unsigned int occurrences;
+    bool used;
+};
+
+constexpr unsigned int MAX_STAT_CATALOG_ENTRIES = 96;
+StatCatalogEntry g_statCatalog[MAX_STAT_CATALOG_ENTRIES] = {};
 
 using Direct3DCreate9Fn = IDirect3D9* (WINAPI *)(UINT);
 using PresentFn = HRESULT (WINAPI *)(IDirect3DDevice9*, const RECT*,
@@ -447,6 +478,47 @@ void __fastcall HookViolationDataStore(
         g_originalViolationDataStore(thisPtr, vector);
 }
 
+const char* GetKnownStatSubtypeName(DWORD control18, DWORD control1C)
+{
+    if (!g_game)
+        return "unidentified";
+    return statoverlay::Resolve(
+        g_game->version,
+        static_cast<unsigned int>(control18),
+        static_cast<unsigned int>(control1C)).key;
+}
+
+StatCatalogEntry* FindStatCatalogEntry(
+    DWORD control14, DWORD control18, DWORD control1C,
+    int count, uint64_t nonEmptyMask, bool& created)
+{
+    created = false;
+    StatCatalogEntry* freeEntry = nullptr;
+    for (unsigned int i = 0; i < MAX_STAT_CATALOG_ENTRIES; ++i) {
+        StatCatalogEntry& entry = g_statCatalog[i];
+        if (!entry.used) {
+            if (!freeEntry) freeEntry = &entry;
+            continue;
+        }
+        if (entry.control14 == control14 &&
+            entry.control18 == control18 &&
+            entry.control1C == control1C &&
+            entry.count == count &&
+            entry.nonEmptyMask == nonEmptyMask)
+            return &entry;
+    }
+    if (!freeEntry) return nullptr;
+    freeEntry->control14 = control14;
+    freeEntry->control18 = control18;
+    freeEntry->control1C = control1C;
+    freeEntry->count = count;
+    freeEntry->nonEmptyMask = nonEmptyMask;
+    freeEntry->occurrences = 0;
+    freeEntry->used = true;
+    created = true;
+    return freeEntry;
+}
+
 void LogCompletedStatPayload(DWORD* payload)
 {
     if (!g_logReady || !payload)
@@ -462,7 +534,15 @@ void LogCompletedStatPayload(DWORD* payload)
         if (count > 0 && !values)
             return;
 
+        uint64_t nonEmptyMask = 0;
+        for (int i = 0; i < count && i < 64; ++i) {
+            const char* value = values[i].sharedstring;
+            if (value && *value)
+                nonEmptyMask |= uint64_t(1) << i;
+        }
+
         FILE* file = nullptr;
+        FILE* catalogFile = nullptr;
         EnterCriticalSection(&g_logLock);
         __try {
             file = std::fopen("stat_payloads.log", "a");
@@ -480,9 +560,38 @@ void LogCompletedStatPayload(DWORD* payload)
                 }
                 std::fputs("]\n", file);
             }
+
+            bool created = false;
+            StatCatalogEntry* entry = FindStatCatalogEntry(
+                payload[5], payload[6], payload[7], count,
+                nonEmptyMask, created);
+            if (entry) ++entry->occurrences;
+            if (created) {
+                catalogFile = std::fopen("stat_catalog.log", "a");
+                if (catalogFile) {
+                    std::fprintf(catalogFile,
+                        "discovered tick=%lu name=%s count=%d "
+                        "control14=%u control18=%u control1C=%u "
+                        "nonEmptyMask=%016llX values=[",
+                        static_cast<unsigned long>(GetTickCount()),
+                        GetKnownStatSubtypeName(payload[6], payload[7]),
+                        count,
+                        static_cast<unsigned int>(payload[5]),
+                        static_cast<unsigned int>(payload[6]),
+                        static_cast<unsigned int>(payload[7]),
+                        static_cast<unsigned long long>(nonEmptyMask));
+                    for (int i = 0; i < count; ++i) {
+                        if (i) std::fputs(", ", catalogFile);
+                        std::fprintf(catalogFile, "%d=", i);
+                        WriteEscaped(catalogFile, values[i].sharedstring);
+                    }
+                    std::fputs("]\n", catalogFile);
+                }
+            }
         }
         __finally {
             if (file) std::fclose(file);
+            if (catalogFile) std::fclose(catalogFile);
             LeaveCriticalSection(&g_logLock);
         }
     }
@@ -495,13 +604,28 @@ void __fastcall HookStatsDataStore(void* thisPtr, void*, DWORD* payload)
 {
     LogCompletedStatPayload(payload);
     bool playerFoul = false;
-    if (g_customOverlayEnabled && g_playerFoulLayoutAvailable && payload) {
+    bool genericStat = false;
+    if (g_customOverlayEnabled && payload) {
         __try {
             const int count = static_cast<int>(payload[3]);
             const BBallString* values = reinterpret_cast<const BBallString*>(
                 payload[0]);
-            playerFoul = count >= 15 && values &&
-                payload[6] == 1 && payload[7] == 10;
+            // A new native stat request replaces the previous stat instance,
+            // even when this particular request falls back to the game.
+            g_playerFoul.active = false;
+            g_genericStat.active = false;
+            const statoverlay::Subtype subtype = g_game ?
+                statoverlay::Resolve(g_game->version,
+                    static_cast<unsigned int>(payload[6]),
+                    static_cast<unsigned int>(payload[7])) :
+                statoverlay::Subtype{ "unidentified", false, false };
+            playerFoul = g_playerFoulLayoutAvailable &&
+                count >= 15 && values && subtype.supported &&
+                std::strcmp(subtype.key, "player_foul") == 0 &&
+                ((values[0].sharedstring && *values[0].sharedstring) ||
+                 (values[1].sharedstring && *values[1].sharedstring)) &&
+                ((values[2].sharedstring && *values[2].sharedstring) ||
+                 (values[4].sharedstring && *values[4].sharedstring));
             if (playerFoul) {
                 const unsigned int hash = HashOverlayPayload(0, values, count);
                 CopyText(g_playerFoul.firstName,
@@ -528,16 +652,169 @@ void __fastcall HookStatsDataStore(void* thisPtr, void*, DWORD* payload)
                 if (g_playerFoulPresentationSuppressed)
                     g_playerFoulTransitionHiddenAt = g_playerFoul.startedAt;
             }
+            else if (g_customOverlayEnabled && g_statsRequestHookInstalled &&
+                subtype.supported && values &&
+                ((subtype.playerPayload && count >= 15) ||
+                 (!subtype.playerPayload && count >= 14))) {
+                bool hasContent = false;
+                const int contentCount = 12;
+                for (int i = 0; i < count && i < contentCount; ++i) {
+                    if (values[i].sharedstring && *values[i].sharedstring) {
+                        hasContent = true;
+                        break;
+                    }
+                }
+                int valueCase = 0;
+                if (subtype.playerPayload) {
+                    // Player payloads expose up to five label/value pairs in
+                    // raw2..raw11. Count populated pairs independently so a
+                    // gap does not select the wrong visual case.
+                    for (int pair = 0; pair < 5; ++pair) {
+                        const int labelIndex = 2 + pair * 2;
+                        const int valueIndex = labelIndex + 1;
+                        const bool hasLabel = labelIndex < count &&
+                            values[labelIndex].sharedstring &&
+                            *values[labelIndex].sharedstring;
+                        const bool hasValue = valueIndex < count &&
+                            values[valueIndex].sharedstring &&
+                            *values[valueIndex].sharedstring;
+                        if (hasLabel || hasValue)
+                            ++valueCase;
+                    }
+                }
+                else {
+                    // Team payload columns are raw1/raw5/raw9,
+                    // raw2/raw6/raw10, and raw3/raw7/raw11. A column is
+                    // present if its heading or either row contains data.
+                    for (int column = 0; column < 3; ++column) {
+                        const int indices[3] = {
+                            1 + column, 5 + column, 9 + column
+                        };
+                        bool populated = false;
+                        for (int field = 0; field < 3; ++field) {
+                            const int index = indices[field];
+                            if (index < count && values[index].sharedstring &&
+                                *values[index].sharedstring) {
+                                populated = true;
+                                break;
+                            }
+                        }
+                        if (populated)
+                            ++valueCase;
+                    }
+                    // Message-style team payloads use raw4/raw8 without
+                    // headings or numeric columns. They intentionally share
+                    // team_1.json; its empty fields simply render nothing.
+                    if (valueCase == 0 && hasContent)
+                        valueCase = 1;
+                }
+                genericStat = hasContent &&
+                    valueCase > 0 &&
+                    scoreboardconfig::LoadStat(g_customOverlayName,
+                        subtype.key, subtype.playerPayload, valueCase);
+                if (genericStat) {
+                    std::memset(&g_genericStat, 0, sizeof(g_genericStat));
+                    g_genericStat.count = count < 15 ? count : 15;
+                    for (int i = 0; i < g_genericStat.count; ++i)
+                        CopyText(g_genericStat.values[i],
+                            sizeof(g_genericStat.values[i]),
+                            values[i].sharedstring);
+                    if (subtype.playerPayload) {
+                        // Compact valid pairs into raw2..raw11. Layout files
+                        // can always bind pairs 1..5 without knowing which
+                        // source pair happened to be empty.
+                        for (int i = 2; i <= 11; ++i)
+                            g_genericStat.values[i][0] = '\0';
+                        int destinationPair = 0;
+                        for (int pair = 0; pair < 5; ++pair) {
+                            const int labelIndex = 2 + pair * 2;
+                            const int valueIndex = labelIndex + 1;
+                            const char* label = labelIndex < count ?
+                                values[labelIndex].sharedstring : nullptr;
+                            const char* value = valueIndex < count ?
+                                values[valueIndex].sharedstring : nullptr;
+                            if ((!label || !*label) && (!value || !*value))
+                                continue;
+                            const int destination = 2 + destinationPair * 2;
+                            CopyText(g_genericStat.values[destination],
+                                sizeof(g_genericStat.values[destination]), label);
+                            CopyText(g_genericStat.values[destination + 1],
+                                sizeof(g_genericStat.values[destination + 1]), value);
+                            ++destinationPair;
+                        }
+                    }
+                    else {
+                        // Compact team headings and both value rows together,
+                        // preserving the relationship between each column.
+                        char compactHeadings[3][128] = {};
+                        char compactLeft[3][128] = {};
+                        char compactRight[3][128] = {};
+                        int destinationColumn = 0;
+                        for (int column = 0; column < 3; ++column) {
+                            const int headingIndex = 1 + column;
+                            const int leftIndex = 5 + column;
+                            const int rightIndex = 9 + column;
+                            const char* heading = headingIndex < count ?
+                                values[headingIndex].sharedstring : nullptr;
+                            const char* left = leftIndex < count ?
+                                values[leftIndex].sharedstring : nullptr;
+                            const char* right = rightIndex < count ?
+                                values[rightIndex].sharedstring : nullptr;
+                            if ((!heading || !*heading) &&
+                                (!left || !*left) && (!right || !*right))
+                                continue;
+                            CopyText(compactHeadings[destinationColumn],
+                                sizeof(compactHeadings[destinationColumn]), heading);
+                            CopyText(compactLeft[destinationColumn],
+                                sizeof(compactLeft[destinationColumn]), left);
+                            CopyText(compactRight[destinationColumn],
+                                sizeof(compactRight[destinationColumn]), right);
+                            ++destinationColumn;
+                        }
+                        for (int column = 0; column < 3; ++column) {
+                            CopyText(g_genericStat.values[1 + column],
+                                sizeof(g_genericStat.values[1 + column]),
+                                compactHeadings[column]);
+                            CopyText(g_genericStat.values[5 + column],
+                                sizeof(g_genericStat.values[5 + column]),
+                                compactLeft[column]);
+                            CopyText(g_genericStat.values[9 + column],
+                                sizeof(g_genericStat.values[9 + column]),
+                                compactRight[column]);
+                        }
+                    }
+                    CopyText(g_genericStat.subtypeKey,
+                        sizeof(g_genericStat.subtypeKey), subtype.key);
+                    CopyText(g_genericStat.teamCode,
+                        sizeof(g_genericStat.teamCode),
+                        count > 13 ? values[13].sharedstring : "");
+                    CopyText(g_genericStat.portraitId,
+                        sizeof(g_genericStat.portraitId),
+                        count > 14 ? values[14].sharedstring : "");
+                    g_genericStat.teamColor = ParsePackedColor(
+                        count > 12 ? values[12].sharedstring : "",
+                        D3DCOLOR_XRGB(40, 40, 40));
+                    g_genericStat.startedAt = GetTickCount();
+                    g_genericStat.valueCase = valueCase;
+                    g_genericStat.playerPayload = subtype.playerPayload;
+                    g_genericStat.active = true;
+                    if (g_genericStatPresentationSuppressed)
+                        g_genericStatTransitionHiddenAt =
+                            g_genericStat.startedAt;
+                }
+            }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             playerFoul = false;
+            genericStat = false;
             g_playerFoul.active = false;
+            g_genericStat.active = false;
         }
     }
 
     // sub_584890 still performs all native payload storage/bookkeeping. Its
     // internal movie request is the only operation conditionally suppressed.
-    g_suppressCurrentStatsRequest = playerFoul;
+    g_suppressCurrentStatsRequest = playerFoul || genericStat;
     __try {
         if (g_originalStatsDataStore)
             g_originalStatsDataStore(thisPtr, payload);
@@ -820,6 +1097,9 @@ int __cdecl HookSendEvent(
             g_playerFoulPresentationSuppressed = true;
             g_playerFoul.active = false;
             g_playerFoulTransitionHiddenAt = 0;
+            g_genericStatPresentationSuppressed = true;
+            g_genericStat.active = false;
+            g_genericStatTransitionHiddenAt = 0;
         }
         else if (std::strcmp(name, "HideOverlaysEvent") == 0) {
             if (!g_violationPresentationSuppressed && g_violation.active)
@@ -828,6 +1108,9 @@ int __cdecl HookSendEvent(
             if (!g_playerFoulPresentationSuppressed && g_playerFoul.active)
                 g_playerFoulTransitionHiddenAt = GetTickCount();
             g_playerFoulPresentationSuppressed = true;
+            if (!g_genericStatPresentationSuppressed && g_genericStat.active)
+                g_genericStatTransitionHiddenAt = GetTickCount();
+            g_genericStatPresentationSuppressed = true;
         }
         else if (std::strcmp(name, "ShowOverlaysEvent") == 0) {
             if (g_violationPresentationSuppressed && g_violation.active &&
@@ -843,6 +1126,12 @@ int __cdecl HookSendEvent(
                     GetTickCount() - g_playerFoulTransitionHiddenAt;
             g_playerFoulPresentationSuppressed = false;
             g_playerFoulTransitionHiddenAt = 0;
+            if (g_genericStatPresentationSuppressed && g_genericStat.active &&
+                g_genericStatTransitionHiddenAt)
+                g_genericStat.startedAt +=
+                    GetTickCount() - g_genericStatTransitionHiddenAt;
+            g_genericStatPresentationSuppressed = false;
+            g_genericStatTransitionHiddenAt = 0;
         }
         else if (resumeEvent) {
             // A pause killed the previous instance; resume merely allows the
@@ -851,6 +1140,8 @@ int __cdecl HookSendEvent(
             g_violationTransitionHiddenAt = 0;
             g_playerFoulPresentationSuppressed = false;
             g_playerFoulTransitionHiddenAt = 0;
+            g_genericStatPresentationSuppressed = false;
+            g_genericStatTransitionHiddenAt = 0;
         }
 
         const bool freezeViolation =
@@ -1370,6 +1661,86 @@ void RenderPlayerFoulOverlay(IDirect3DDevice9* device)
         x, y, opacity);
 }
 
+void RenderGenericStatOverlay(IDirect3DDevice9* device)
+{
+    if (!g_customOverlayEnabled || !g_genericStat.active ||
+        g_genericStatPresentationSuppressed || !device)
+        return;
+    const scoreboardconfig::Config& config = scoreboardconfig::GetStat();
+    const DWORD elapsed = GetTickCount() - g_genericStat.startedAt;
+    const DWORD enterEnd = config.enterMilliseconds;
+    const DWORD holdEnd = enterEnd + config.holdMilliseconds;
+    const DWORD total = holdEnd + config.exitMilliseconds;
+    if (elapsed >= total) { g_genericStat.active = false; return; }
+
+    float x = 0.0f, y = 0.0f, opacity = 1.0f;
+    if (elapsed < enterEnd && enterEnd > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed) / enterEnd);
+        if (_stricmp(config.enterAnimation, "slide") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0) {
+            x = config.enterFromX * (1.0f - p);
+            y = config.enterFromY * (1.0f - p);
+        }
+        if (_stricmp(config.enterAnimation, "fade") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0)
+            opacity = p;
+    }
+    else if (elapsed >= holdEnd && config.exitMilliseconds > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed - holdEnd) /
+            config.exitMilliseconds);
+        if (_stricmp(config.exitAnimation, "slide") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0) {
+            x = config.exitToX * p;
+            y = config.exitToY * p;
+        }
+        if (_stricmp(config.exitAnimation, "fade") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0)
+            opacity = 1.0f - p;
+    }
+
+    popup::Load(g_customOverlayName);
+    const popup::TeamVisual* team = popup::FindTeamByShortCode(
+        g_genericStat.teamCode);
+    scoreboard::Frame frame = {};
+    frame.playerFirstName = g_genericStat.count > 0 ?
+        g_genericStat.values[0] : "";
+    frame.playerLastName = g_genericStat.count > 1 ?
+        g_genericStat.values[1] : "";
+    frame.statLabel1 = g_genericStat.count > 2 ?
+        g_genericStat.values[2] : "";
+    frame.statValue1 = g_genericStat.count > 3 ?
+        g_genericStat.values[3] : "";
+    frame.statLabel2 = g_genericStat.count > 4 ?
+        g_genericStat.values[4] : "";
+    frame.statValue2 = g_genericStat.count > 5 ?
+        g_genericStat.values[5] : "";
+    frame.statTeamName = team ? team->teamName : "";
+    frame.statTeamColor = g_genericStat.teamColor;
+    frame.statPrimaryColor = team ? team->primaryColor :
+        g_genericStat.teamColor;
+    frame.statSecondaryColor = team ? team->secondaryColor :
+        g_genericStat.teamColor;
+    frame.statValueCount = g_genericStat.count;
+    for (int i = 0; i < g_genericStat.count && i < 15; ++i)
+        frame.statValues[i] = g_genericStat.values[i];
+
+    char logoPath[MAX_PATH] = {};
+    char portraitPath[MAX_PATH] = {};
+    if (g_genericStat.teamCode[0])
+        std::snprintf(logoPath, sizeof(logoPath), "teams\\%s.png",
+            g_genericStat.teamCode);
+    if (g_genericStat.portraitId[0] &&
+        _stricmp(g_genericStat.portraitId, "blank__") != 0)
+        std::snprintf(portraitPath, sizeof(portraitPath),
+            "portraits\\%s.png", g_genericStat.portraitId);
+    frame.statTeamLogo = logoPath[0] ? popup::GetOverlayTexture(device,
+        g_customOverlayName, "stats", logoPath) : nullptr;
+    frame.playerPortrait = portraitPath[0] ? popup::GetOverlayTexture(device,
+        g_customOverlayName, "stats", portraitPath) : nullptr;
+    scoreboard::RenderStat(device, frame, g_customOverlayName,
+        x, y, opacity);
+}
+
 using OverlayRenderFn = void (*)(IDirect3DDevice9*);
 
 void RenderConfiguredOverlays(IDirect3DDevice9* device)
@@ -1388,7 +1759,9 @@ void RenderConfiguredOverlays(IDirect3DDevice9* device)
         { scoreboardconfig::GetViolation().overlayZ, 1,
             &RenderViolationOverlay },
         { scoreboardconfig::GetPlayerFoul().overlayZ, 2,
-            &RenderPlayerFoulOverlay }
+            &RenderPlayerFoulOverlay },
+        { scoreboardconfig::GetStat().overlayZ, 3,
+            &RenderGenericStatOverlay }
     };
     const int count = sizeof(entries) / sizeof(entries[0]);
     for (int i = 1; i < count; ++i) {
@@ -1427,21 +1800,26 @@ void CheckPopupHotReload(IDirect3DDevice9* device)
             g_customOverlayName);
         const bool playerFoulLoaded = scoreboardconfig::ReloadPlayerFoul(
             g_customOverlayName);
+        const bool genericStatLoaded = scoreboardconfig::ReloadStat(
+            g_customOverlayName, g_genericStat.subtypeKey,
+            g_genericStat.playerPayload, g_genericStat.valueCase);
         g_playerFoulLayoutAvailable = playerFoulLoaded &&
             g_statsRequestHookInstalled;
         if (!playerFoulLoaded) g_playerFoul.active = false;
+        if (!genericStatLoaded) g_genericStat.active = false;
         g_loggedAwayLogoTeam = INT_MIN;
         g_loggedHomeLogoTeam = INT_MIN;
         g_loggedStatTeamCode[0] = '\0';
         AppendDiagnostic(
-            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s playerFoul=%s error=%s\n",
+            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s playerFoul=%s stat=%s error=%s\n",
             themeLoaded ? "OK" : "FAILED",
             fontLoaded ? "OK" : "FAILED",
             scoreboardLoaded ? "OK" : "FAILED",
             violationLoaded ? "OK" : "FAILED",
             playerFoulLoaded ? "OK" : "FAILED",
+            genericStatLoaded ? "OK" : "FAILED",
             themeLoaded && scoreboardLoaded && violationLoaded &&
-                playerFoulLoaded ? "<none>" :
+                playerFoulLoaded && genericStatLoaded ? "<none>" :
                 (!themeLoaded ? popup::GetLastError() :
                     scoreboardconfig::GetLastError()));
     }
@@ -1979,10 +2357,10 @@ void Initialize(const GameAddresses& game)
             overlayCalls);
     }
 
-    // Live 06 FEOverlayStats builders all converge here after completing
-    // their owned BBallString vectors. The player-foul subtype (1/10) gets a
-    // custom instance only when its layout exists; all other stat requests
-    // continue to the native overlay unchanged.
+    // FEOverlayStats builders in every supported game converge here after
+    // completing their owned BBallString vectors. A request gets a custom
+    // instance only when its subtype-specific or family layout exists;
+    // unknown, invalid and unconfigured requests remain native.
     if (game.statsDataStore) {
         file = std::fopen("stat_payloads.log", "w");
         if (file) {
@@ -1991,6 +2369,17 @@ void Initialize(const GameAddresses& game)
                 "Store=%08X\n\n",
                 game.name,
                 static_cast<unsigned int>(game.statsDataStore));
+            std::fclose(file);
+        }
+
+        std::memset(g_statCatalog, 0, sizeof(g_statCatalog));
+        file = std::fopen("stat_catalog.log", "w");
+        if (file) {
+            std::fprintf(file,
+                "%s deduplicated FEOverlayStats subtype catalog\n"
+                "One representative is recorded for each distinct "
+                "control/count/non-empty-slot layout.\n\n",
+                game.name);
             std::fclose(file);
         }
 

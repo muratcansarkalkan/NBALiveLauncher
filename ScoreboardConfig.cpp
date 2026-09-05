@@ -12,12 +12,19 @@ namespace {
 Config g_config = {};
 Config g_violationConfig = {};
 Config g_playerFoulConfig = {};
+Config g_statConfig = {};
 bool g_loaded = false;
 bool g_violationLoaded = false;
 bool g_playerFoulLoaded = false;
+bool g_statLoaded = false;
+bool g_playerFoulAvailable = false;
+bool g_statAvailable = false;
 char g_theme[64] = {};
 char g_violationTheme[64] = {};
 char g_playerFoulTheme[64] = {};
+char g_statTheme[64] = {};
+char g_statSubtype[64] = {};
+int g_statValueCase = 0;
 char g_lastError[512] = {};
 
 void SetDefaults(Config* c)
@@ -459,6 +466,7 @@ void Parse(const std::string& json, Config* c)
 const Config& Get() { return g_config; }
 const Config& GetViolation() { return g_violationConfig; }
 const Config& GetPlayerFoul() { return g_playerFoulConfig; }
+const Config& GetStat() { return g_statConfig; }
 
 bool Load(const char* themeName)
 {
@@ -532,7 +540,8 @@ bool ReloadViolation(const char* themeName)
 bool LoadPlayerFoul(const char* themeName)
 {
     if (g_playerFoulLoaded &&
-        std::strcmp(g_playerFoulTheme, themeName) == 0) return true;
+        std::strcmp(g_playerFoulTheme, themeName) == 0)
+        return g_playerFoulAvailable;
     Config next;
     SetDefaults(&next);
     next.width = 520.0f;
@@ -543,17 +552,24 @@ bool LoadPlayerFoul(const char* themeName)
         "\\stats\\player_foul.json";
     std::string json;
     if (!ReadFile(path.c_str(), &json)) {
-        std::snprintf(g_lastError, sizeof(g_lastError),
-            "Could not read %s", path.c_str());
-        g_playerFoulConfig = next;
-        g_playerFoulLoaded = true;
-        std::strncpy(g_playerFoulTheme, themeName,
-            sizeof(g_playerFoulTheme) - 1);
-        return false;
+        path = GameDirectory() + "\\popups\\" + themeName +
+            "\\stats\\player.json";
+        if (!ReadFile(path.c_str(), &json)) {
+            std::snprintf(g_lastError, sizeof(g_lastError),
+                "Could not read player_foul.json or player.json");
+            g_playerFoulConfig = next;
+            g_playerFoulLoaded = true;
+            g_playerFoulAvailable = false;
+            std::strncpy(g_playerFoulTheme, themeName,
+                sizeof(g_playerFoulTheme) - 1);
+            g_playerFoulTheme[sizeof(g_playerFoulTheme) - 1] = '\0';
+            return false;
+        }
     }
     Parse(json, &next);
     g_playerFoulConfig = next;
     g_playerFoulLoaded = true;
+    g_playerFoulAvailable = true;
     std::strncpy(g_playerFoulTheme, themeName,
         sizeof(g_playerFoulTheme) - 1);
     g_lastError[0] = '\0';
@@ -563,8 +579,86 @@ bool LoadPlayerFoul(const char* themeName)
 bool ReloadPlayerFoul(const char* themeName)
 {
     g_playerFoulLoaded = false;
+    g_playerFoulAvailable = false;
     g_playerFoulTheme[0] = '\0';
     return LoadPlayerFoul(themeName);
+}
+
+bool LoadStat(const char* themeName, const char* subtypeKey,
+    bool playerPayload, int valueCase)
+{
+    if (!themeName || !subtypeKey || !*subtypeKey)
+        return false;
+    if (g_statLoaded && std::strcmp(g_statTheme, themeName) == 0 &&
+        std::strcmp(g_statSubtype, subtypeKey) == 0 &&
+        g_statValueCase == valueCase)
+        return g_statAvailable;
+
+    Config next;
+    SetDefaults(&next);
+    next.width = playerPayload ? 520.0f : 560.0f;
+    next.height = playerPayload ? 100.0f : 90.0f;
+    next.offsetY = 90.0f;
+    next.overlayZ = 20;
+
+    const std::string base = GameDirectory() + "\\popups\\" + themeName +
+        "\\stats\\";
+    std::string path = base + subtypeKey + ".json";
+    std::string json;
+    if (!ReadFile(path.c_str(), &json)) {
+        // Generic player and team layouts may provide different geometry for
+        // one, two, or three populated value groups/columns.
+        const int maximumCase = playerPayload ? 5 : 3;
+        if (valueCase >= 1 && valueCase <= maximumCase) {
+            char caseName[32];
+            std::snprintf(caseName, sizeof(caseName),
+                "%s_%d.json", playerPayload ? "player" : "team",
+                valueCase);
+            path = base + caseName;
+            ReadFile(path.c_str(), &json);
+        }
+        if (json.empty())
+            path = base + (playerPayload ? "player.json" : "team.json");
+        if (json.empty() && !ReadFile(path.c_str(), &json)) {
+            std::snprintf(g_lastError, sizeof(g_lastError),
+                "Could not read subtype or family stat layout for %s", subtypeKey);
+            g_statLoaded = true;
+            g_statAvailable = false;
+            std::strncpy(g_statTheme, themeName,
+                sizeof(g_statTheme) - 1);
+            g_statTheme[sizeof(g_statTheme) - 1] = '\0';
+            std::strncpy(g_statSubtype, subtypeKey,
+                sizeof(g_statSubtype) - 1);
+            g_statSubtype[sizeof(g_statSubtype) - 1] = '\0';
+            g_statValueCase = valueCase;
+            return false;
+        }
+    }
+
+    Parse(json, &next);
+    g_statConfig = next;
+    g_statLoaded = true;
+    g_statAvailable = true;
+    std::strncpy(g_statTheme, themeName, sizeof(g_statTheme) - 1);
+    g_statTheme[sizeof(g_statTheme) - 1] = '\0';
+    std::strncpy(g_statSubtype, subtypeKey, sizeof(g_statSubtype) - 1);
+    g_statSubtype[sizeof(g_statSubtype) - 1] = '\0';
+    g_statValueCase = valueCase;
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool ReloadStat(const char* themeName, const char* subtypeKey,
+    bool playerPayload, int valueCase)
+{
+    g_statLoaded = false;
+    g_statAvailable = false;
+    g_statTheme[0] = '\0';
+    g_statSubtype[0] = '\0';
+    g_statValueCase = 0;
+    if (!subtypeKey || !*subtypeKey)
+        return true;
+    return LoadStat(themeName, subtypeKey, playerPayload, valueCase);
 }
 
 const char* GetLastError() { return g_lastError; }
