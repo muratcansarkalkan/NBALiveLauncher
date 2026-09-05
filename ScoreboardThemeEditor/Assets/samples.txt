@@ -1,0 +1,18 @@
+player_1
+Kobe|Bryant|Points|24|||||||||4925563|ll|KOBRYAN
+player_2
+Kobe|Bryant|1st Half|14|2nd Half|10|||||||4925563|ll|KOBRYAN
+player_3
+Kobe|Bryant|Points|24|Assists|7|Steals|3|||||4925563|ll|KOBRYAN
+player_4
+Kobe|Bryant|Points|24|Assists|7|Rebounds|6|Steals|3|||4925563|ll|KOBRYAN
+player_5
+Kobe|Bryant|Points|24|Assists|7|Rebounds|6|Steals|3|Blocks|2|4925563|ll|KOBRYAN
+team_1
+Team Leaders|Ast|||S. Marion|3|||T. Parker|4|||149632|le
+team_2
+Turnovers|1st Half|2nd Half||Sacramento|7|6||LA Lakers|8|6||149632|le
+team_3
+Shooting Guards|Pts|Ast|TO|B. Wells|14|4|3|K. Bryant|24|7|2|149632|le
+player_foul
+Kobe|Bryant|Personal Fouls|1|Team Fouls|3|||||||4925563|ll|KOBRYAN
