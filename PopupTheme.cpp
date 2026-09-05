@@ -312,6 +312,36 @@ const TeamVisual* FindTeam(int databaseTeamID)
     return nullptr;
 }
 
+const TeamVisual* FindTeamByShortCode(const char* shortCode)
+{
+    if (!shortCode || !*shortCode) return nullptr;
+    char wanted[3] = {};
+    int wantedLength = 0;
+    for (const unsigned char* p =
+             reinterpret_cast<const unsigned char*>(shortCode);
+         *p && wantedLength < 2; ++p) {
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') continue;
+        wanted[wantedLength++] = static_cast<char>(
+            *p >= 'A' && *p <= 'Z' ? *p - 'A' + 'a' : *p);
+    }
+    if (wantedLength != 2) return nullptr;
+
+    for (const TeamVisual& team : g_teams) {
+        char candidate[3] = {};
+        int candidateLength = 0;
+        for (const unsigned char* p = reinterpret_cast<const unsigned char*>(
+                 team.shortCode); *p && candidateLength < 2; ++p) {
+            if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') continue;
+            candidate[candidateLength++] = static_cast<char>(
+                *p >= 'A' && *p <= 'Z' ? *p - 'A' + 'a' : *p);
+        }
+        if (candidateLength == 2 && candidate[0] == wanted[0] &&
+            candidate[1] == wanted[1])
+            return &team;
+    }
+    return nullptr;
+}
+
 IDirect3DTexture9* GetLogoTexture(
     IDirect3DDevice9* device, int databaseTeamID)
 {

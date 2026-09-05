@@ -31,11 +31,26 @@ struct Frame {
     const char* violationTeamName;
     D3DCOLOR violationTeamColor;
     IDirect3DTexture9* violationTeamLogo;
+    const char* playerFirstName;
+    const char* playerLastName;
+    const char* statLabel1;
+    const char* statValue1;
+    const char* statLabel2;
+    const char* statValue2;
+    const char* statTeamName;
+    D3DCOLOR statTeamColor;
+    D3DCOLOR statPrimaryColor;
+    D3DCOLOR statSecondaryColor;
+    IDirect3DTexture9* statTeamLogo;
+    IDirect3DTexture9* playerPortrait;
 };
 
 void Render(IDirect3DDevice9* device, const Frame& frame,
             const char* overlayName);
 void RenderViolation(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity);
+void RenderPlayerFoul(IDirect3DDevice9* device, const Frame& frame,
     const char* overlayName, float animationOffsetX,
     float animationOffsetY, float animationOpacity);
 

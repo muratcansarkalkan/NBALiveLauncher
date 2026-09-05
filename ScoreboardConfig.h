@@ -13,6 +13,7 @@ enum class IndicatorMode { None, Number, Text, Dots, Bars, Images };
 enum class ElementType { Rectangle, Image, Text, Indicator };
 enum class TextAlignment { Left, Center, Right };
 enum class TextOverflow { Overflow, Fit };
+enum class TextTransform { None, Uppercase, Lowercase, Capitalize, SmallCaps };
 enum class FillType { Solid, LinearGradient };
 enum class ImageFit { Contain, Stretch };
 
@@ -33,6 +34,8 @@ struct Element {
     bool locked;
     TextAlignment alignment;
     TextOverflow overflow;
+    TextTransform textTransform;
+    float smallCapsScale;
     float fontHeight;
     D3DCOLOR textColor;
     int opacity;
@@ -45,6 +48,9 @@ struct Element {
     char gradientEndBinding[48];
     bool gradientHorizontal;
     ImageFit imageFit;
+    bool tintEnabled;
+    char tintBinding[48];
+    D3DCOLOR tintColor;
 };
 
 constexpr int MAX_ELEMENTS = 64;
@@ -59,6 +65,7 @@ struct Config {
     float offsetY;
     float width;
     float height;
+    int overlayZ;
     D3DCOLOR backgroundColor;
     int backgroundAlpha;
     bool showBackgroundImage;
@@ -129,10 +136,13 @@ struct Config {
 
 const Config& Get();
 const Config& GetViolation();
+const Config& GetPlayerFoul();
 bool Load(const char* themeName);
 bool Reload(const char* themeName);
 bool LoadViolation(const char* themeName);
 bool ReloadViolation(const char* themeName);
+bool LoadPlayerFoul(const char* themeName);
+bool ReloadPlayerFoul(const char* themeName);
 const char* GetLastError();
 
 } // namespace scoreboardconfig

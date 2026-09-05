@@ -1,4 +1,9 @@
 @echo off
+taskkill /F /IM nba2005.exe
+taskkill /F /IM nbalive06.exe
+taskkill /F /IM nbalive07.exe
+taskkill /F /IM nbalive08.exe
+
 setlocal
 cd /d "%~dp0"
 where py >nul 2>nul

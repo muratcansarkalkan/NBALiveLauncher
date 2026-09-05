@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cctype>
 
 namespace scoreboard {
 namespace {
@@ -78,7 +79,8 @@ struct TextureVertex {
 
 void DrawTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture,
                  float left, float top, float right, float bottom,
-                 D3DCOLOR color = 0xFFFFFFFFu)
+                 D3DCOLOR color = 0xFFFFFFFFu,
+                 bool replaceRgb = false)
 {
     if (!texture) return;
     D3DSURFACE_DESC description = {};
@@ -110,7 +112,8 @@ void DrawTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture,
     };
     device->SetTexture(0, texture);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_COLOROP,
+        replaceRgb ? D3DTOP_SELECTARG2 : D3DTOP_MODULATE);
     device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
     device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
@@ -123,7 +126,7 @@ void DrawTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture,
 void DrawTextureStretched(IDirect3DDevice9* device,
                           IDirect3DTexture9* texture,
                           float left, float top, float right, float bottom,
-                          D3DCOLOR color)
+                          D3DCOLOR color, bool replaceRgb = false)
 {
     if (!texture) return;
     const TextureVertex vertices[4] = {
@@ -134,7 +137,8 @@ void DrawTextureStretched(IDirect3DDevice9* device,
     };
     device->SetTexture(0, texture);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_COLOROP,
+        replaceRgb ? D3DTOP_SELECTARG2 : D3DTOP_MODULATE);
     device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
     device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
@@ -289,11 +293,67 @@ void FormatPeriod(int zeroBasedQuarter,
     }
 }
 
-void DrawBoundText(IDirect3DDevice9* device, const char* text,
+void TransformText(const char* source, scoreboardconfig::TextTransform transform,
+                   char* output, size_t capacity)
+{
+    if (!output || !capacity) return;
+    size_t i = 0;
+    bool wordStart = true;
+    for (; source && source[i] && i + 1 < capacity; ++i) {
+        const unsigned char c = static_cast<unsigned char>(source[i]);
+        if (transform == scoreboardconfig::TextTransform::Uppercase)
+            output[i] = static_cast<char>(std::toupper(c));
+        else if (transform == scoreboardconfig::TextTransform::Lowercase)
+            output[i] = static_cast<char>(std::tolower(c));
+        else if (transform == scoreboardconfig::TextTransform::Capitalize) {
+            output[i] = static_cast<char>(wordStart ? std::toupper(c) : std::tolower(c));
+            wordStart = !std::isalnum(c);
+        }
+        else output[i] = source[i];
+    }
+    output[i] = '\0';
+}
+
+float MeasureSmallCaps(const char* text, float height, float smallScale)
+{
+    float width = 0.0f;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
+         p && *p; ++p) {
+        char glyph[2] = { static_cast<char>(std::islower(*p) ?
+            std::toupper(*p) : *p), '\0' };
+        width += popupfont::Measure(glyph,
+            std::islower(*p) ? height * smallScale : height);
+    }
+    return width;
+}
+
+void DrawSmallCapsLeft(IDirect3DDevice9* device, const char* text,
+                       float x, float y, float height, float smallScale,
+                       D3DCOLOR color)
+{
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
+         p && *p; ++p) {
+        const bool isSmallCap = std::islower(*p) != 0;
+        const float glyphHeight = isSmallCap ? height * smallScale : height;
+        char glyph[2] = { static_cast<char>(isSmallCap ?
+            std::toupper(*p) : *p), '\0' };
+        popupfont::DrawLeft(device, glyph, x, y + height - glyphHeight,
+            glyphHeight, color);
+        x += popupfont::Measure(glyph, glyphHeight);
+    }
+}
+
+void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
                    const scoreboardconfig::Rect& rectangle,
                    float height, D3DCOLOR color, int alignment,
-                   bool fit = false)
+                   bool fit = false,
+                   scoreboardconfig::TextTransform transform =
+                       scoreboardconfig::TextTransform::None,
+                   float smallCapsScale = 0.75f)
 {
+    char transformed[128] = {};
+    TransformText(sourceText, transform, transformed, sizeof(transformed));
+    const char* text = transformed;
     // The rectangle is an alignment box, not a font-size ceiling. Keeping
     // the requested height allows the editor's score/clock/shot-clock font
     // controls to grow text beyond the original default element bounds.
@@ -301,12 +361,24 @@ void DrawBoundText(IDirect3DDevice9* device, const char* text,
     if (fit && rectangle.height > 0.0f && actualHeight > rectangle.height)
         actualHeight = rectangle.height;
     if (fit && rectangle.width > 0.0f) {
-        const float measured = popupfont::Measure(text, actualHeight);
+        const float measured = transform == scoreboardconfig::TextTransform::SmallCaps ?
+            MeasureSmallCaps(sourceText, actualHeight, smallCapsScale) :
+            popupfont::Measure(text, actualHeight);
         if (measured > rectangle.width && measured > 0.0f)
             actualHeight *= rectangle.width / measured;
     }
     const float y = rectangle.y +
         (rectangle.height - actualHeight) * 0.5f;
+    if (transform == scoreboardconfig::TextTransform::SmallCaps) {
+        const float measured = MeasureSmallCaps(sourceText, actualHeight,
+            smallCapsScale);
+        const float x = alignment < 0 ? rectangle.x : alignment > 0 ?
+            rectangle.x + rectangle.width - measured :
+            rectangle.x + (rectangle.width - measured) * 0.5f;
+        DrawSmallCapsLeft(device, sourceText, x, y, actualHeight,
+            smallCapsScale, color);
+        return;
+    }
     if (alignment < 0)
         popupfont::DrawLeft(device, text, rectangle.x, y,
             actualHeight, color);
@@ -340,6 +412,12 @@ D3DCOLOR ResolveLayerColor(const char* binding, D3DCOLOR fallback,
         color = frame.homeSecondaryColor;
     else if (binding && std::strcmp(binding, "violation.teamColor") == 0)
         color = frame.violationTeamColor;
+    else if (binding && std::strcmp(binding, "stat.teamColor") == 0)
+        color = frame.statTeamColor;
+    else if (binding && std::strcmp(binding, "stat.primaryColor") == 0)
+        color = frame.statPrimaryColor;
+    else if (binding && std::strcmp(binding, "stat.secondaryColor") == 0)
+        color = frame.statSecondaryColor;
     return WithOpacity(color, opacity);
 }
 
@@ -375,6 +453,35 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
     if (std::strcmp(b, "violation.teamName") == 0) {
         std::snprintf(output, capacity, "%s",
             frame.violationTeamName ? frame.violationTeamName : "");
+        *defaultHeight = style.teamNameHeight; return true;
+    }
+    if (std::strcmp(b, "player.firstName") == 0 ||
+        std::strcmp(b, "player.lastName") == 0 ||
+        std::strcmp(b, "player.fullName") == 0) {
+        if (std::strcmp(b, "player.firstName") == 0)
+            std::snprintf(output, capacity, "%s",
+                frame.playerFirstName ? frame.playerFirstName : "");
+        else if (std::strcmp(b, "player.lastName") == 0)
+            std::snprintf(output, capacity, "%s",
+                frame.playerLastName ? frame.playerLastName : "");
+        else
+            std::snprintf(output, capacity, "%s%s%s",
+                frame.playerFirstName ? frame.playerFirstName : "",
+                frame.playerFirstName && *frame.playerFirstName ? " " : "",
+                frame.playerLastName ? frame.playerLastName : "");
+        *defaultHeight = style.teamNameHeight; return true;
+    }
+    if (std::strcmp(b, "stat.label1") == 0 ||
+        std::strcmp(b, "stat.value1") == 0 ||
+        std::strcmp(b, "stat.label2") == 0 ||
+        std::strcmp(b, "stat.value2") == 0 ||
+        std::strcmp(b, "stat.teamName") == 0) {
+        const char* value = std::strcmp(b, "stat.label1") == 0 ? frame.statLabel1 :
+            std::strcmp(b, "stat.value1") == 0 ? frame.statValue1 :
+            std::strcmp(b, "stat.label2") == 0 ? frame.statLabel2 :
+            std::strcmp(b, "stat.value2") == 0 ? frame.statValue2 :
+            frame.statTeamName;
+        std::snprintf(output, capacity, "%s", value ? value : "");
         *defaultHeight = style.teamNameHeight; return true;
     }
     if (std::strcmp(b, "away.score") == 0) {
@@ -479,17 +586,22 @@ bool RenderGenericElements(IDirect3DDevice9* device,
             else if (std::strcmp(e.binding, "home.logo") == 0) texture = frame.homeLogo;
             else if (std::strcmp(e.binding, "violation.teamLogo") == 0)
                 texture = frame.violationTeamLogo;
+            else if (std::strcmp(e.binding, "stat.teamLogo") == 0)
+                texture = frame.statTeamLogo;
+            else if (std::strcmp(e.binding, "player.portrait") == 0)
+                texture = frame.playerPortrait;
             else if (e.image[0]) texture = popup::GetOverlayTexture(device,
                 overlayName, overlayDirectory, e.image);
-            const D3DCOLOR tint = D3DCOLOR_ARGB(
-                opacity < 0 ? 0 : opacity > 255 ? 255 : opacity,
-                255, 255, 255);
+            const D3DCOLOR tint = e.tintEnabled ? ResolveLayerColor(
+                e.tintBinding, e.tintColor, frame, opacity) :
+                D3DCOLOR_ARGB(opacity < 0 ? 0 : opacity > 255 ? 255 : opacity,
+                    255, 255, 255);
             if (e.imageFit == scoreboardconfig::ImageFit::Stretch)
                 DrawTextureStretched(device, texture, r.x, r.y,
-                    r.x + r.width, r.y + r.height, tint);
+                    r.x + r.width, r.y + r.height, tint, e.tintEnabled);
             else
                 DrawTexture(device, texture, r.x, r.y,
-                    r.x + r.width, r.y + r.height, tint);
+                    r.x + r.width, r.y + r.height, tint, e.tintEnabled);
         }
         else if (e.type == scoreboardconfig::ElementType::Text && fontReady) {
             if (!popupfont::SelectFont(device, overlayName, e.font,
@@ -504,7 +616,8 @@ bool RenderGenericElements(IDirect3DDevice9* device,
                 -1 : e.alignment == scoreboardconfig::TextAlignment::Right ? 1 : 0;
             DrawBoundText(device, text, r, height * scale,
                 WithOpacity(color, opacity), alignment,
-                e.overflow == scoreboardconfig::TextOverflow::Fit);
+                e.overflow == scoreboardconfig::TextOverflow::Fit,
+                e.textTransform, e.smallCapsScale);
         }
         else if (e.type == scoreboardconfig::ElementType::Indicator && fontReady) {
             if (!popupfont::SelectFont(device, overlayName, e.font,
@@ -879,6 +992,48 @@ void RenderViolation(IDirect3DDevice9* device, const Frame& frame,
     const float top = (config.offsetY + animationOffsetY) * offsetScale;
     RenderGenericElements(device, config, frame, left, top, scale,
         overlayName, "violation", animationOpacity);
+    if (stateBlock) { stateBlock->Apply(); stateBlock->Release(); }
+}
+
+void RenderPlayerFoul(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity)
+{
+    if (!device || !overlayName || !*overlayName ||
+        !frame.playerLastName || !*frame.playerLastName ||
+        animationOpacity <= 0.0f) return;
+    D3DVIEWPORT9 viewport = {};
+    if (FAILED(device->GetViewport(&viewport))) return;
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
+        stateBlock->Capture();
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetVertexShader(nullptr); device->SetPixelShader(nullptr);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    const scoreboardconfig::Config& config = scoreboardconfig::GetPlayerFoul();
+    float scale = 1.0f;
+    if (config.scaleMode == scoreboardconfig::ScaleMode::Uniform) {
+        const float sx = static_cast<float>(viewport.Width) / config.referenceWidth;
+        const float sy = static_cast<float>(viewport.Height) / config.referenceHeight;
+        scale = sx < sy ? sx : sy;
+    }
+    const float offsetScale = config.scaleMode ==
+        scoreboardconfig::ScaleMode::Uniform ? scale : 1.0f;
+    const float left = (static_cast<float>(viewport.Width) -
+        config.width * scale) * 0.5f +
+        (config.offsetX + animationOffsetX) * offsetScale;
+    const float top = (config.offsetY + animationOffsetY) * offsetScale;
+    RenderGenericElements(device, config, frame, left, top, scale,
+        overlayName, "stats", animationOpacity);
     if (stateBlock) { stateBlock->Apply(); stateBlock->Release(); }
 }
 

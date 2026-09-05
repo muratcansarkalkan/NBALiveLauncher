@@ -20,6 +20,7 @@ struct TeamVisual {
 bool Load(const char* themeName);
 bool Reload(const char* themeName);
 const TeamVisual* FindTeam(int databaseTeamID);
+const TeamVisual* FindTeamByShortCode(const char* shortCode);
 
 // Loaded lazily from TeamVisual::logoPath and cached per D3D device.
 IDirect3DTexture9* GetLogoTexture(

@@ -23,7 +23,7 @@
                 <ComboBox x:Name="ScreenCombo" Width="105" SelectedIndex="0" Margin="0,0,8,0"
                           SelectionChanged="ScreenCombo_SelectionChanged">
                     <ComboBoxItem Content="Scoreboard" IsEnabled="True"/>
-                    <ComboBoxItem Content="Stats" IsEnabled="False"/>
+                    <ComboBoxItem Content="Stats" IsEnabled="True"/>
                     <ComboBoxItem Content="Intro" IsEnabled="False"/>
                     <ComboBoxItem Content="Violation" IsEnabled="True"/>
                     <ComboBoxItem Content="Playcall" IsEnabled="False"/>
@@ -49,7 +49,10 @@
                     <Viewbox Stretch="Uniform">
                         <Canvas x:Name="PreviewStage" Width="1366" Height="768" Background="#090B10">
                             <Image x:Name="PreviewBackground" Width="1366" Height="768"
-                                   Source="Assets/broadcast-court.png" Stretch="UniformToFill"/>
+                                   Source="Assets/broadcast-court.png" Stretch="UniformToFill"
+                                   Panel.ZIndex="-100000"/>
+                            <Canvas x:Name="ReferenceOverlayHost" Width="1366" Height="768"
+                                    IsHitTestVisible="False" Panel.ZIndex="-99999"/>
                             <Canvas x:Name="PreviewCanvas" Width="620" Height="68" Background="#E80F1218"
                                     MouseLeftButtonDown="PreviewCanvas_MouseLeftButtonDown"
                                     MouseMove="Canvas_MouseMove" MouseLeftButtonUp="Canvas_MouseLeftButtonUp"/>
@@ -76,7 +79,7 @@
 
             <TabControl Grid.Column="1" Margin="0,14,14,14" Background="#222630">
                 <TabItem Header="Layout">
-                    <StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
                         <TextBlock Text="Reference width"/><TextBox x:Name="ReferenceWidthBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Reference height"/><TextBox x:Name="ReferenceHeightBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Scale mode"/><ComboBox x:Name="LayoutScaleModeCombo" Margin="0,3,0,8"/>
@@ -84,7 +87,16 @@
                         <TextBlock Text="Scoreboard Y offset"/><TextBox x:Name="ScoreboardOffsetYBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Scoreboard width"/><TextBox x:Name="ScoreboardWidthBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Scoreboard height"/><TextBox x:Name="ScoreboardHeightBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Overlay Z-order"/><TextBox x:Name="OverlayZBox" Margin="0,3,0,8"/>
                         <Button Content="Apply Layout" Click="ApplyLayout_Click" Margin="0,8,0,0" Padding="8"/>
+                        <Separator Margin="0,14,0,10"/>
+                        <TextBlock Text="Additional preview overlays" FontWeight="Bold"/>
+                        <ComboBox x:Name="PreviewOverlayCombo" Margin="0,4,0,6"/>
+                        <UniformGrid Columns="3">
+                            <Button Content="Add..." Click="AddPreviewOverlay_Click" Margin="0,0,3,0" Padding="5"/>
+                            <Button Content="Remove" Click="RemovePreviewOverlay_Click" Margin="3,0" Padding="5"/>
+                            <Button Content="Clear" Click="ClearPreviewOverlays_Click" Margin="3,0,0,0" Padding="5"/>
+                        </UniformGrid>
                         <Separator Margin="0,14,0,10"/>
                         <TextBlock Text="Editor reference background" FontWeight="Bold"/>
                         <DockPanel Margin="0,4,0,6">
@@ -100,7 +112,7 @@
                         </UniformGrid>
                         <TextBlock Margin="0,14,0,0" Foreground="#AAB2C0" TextWrapping="Wrap"
                                    Text="Drag an uncovered part of the scoreboard background to reposition the entire scoreboard."/>
-                    </StackPanel>
+                    </StackPanel></ScrollViewer>
                 </TabItem>
                 <TabItem Header="Element">
                     <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
@@ -114,6 +126,9 @@
                         <TextBlock Text="Font preset (blank = default)"/><ComboBox x:Name="ElementFontCombo" IsEditable="True"/>
                         <TextBlock Text="Image path"/><TextBox x:Name="ElementImageBox"/>
                         <TextBlock Text="Image fit"/><ComboBox x:Name="ElementImageFitCombo"/>
+                        <CheckBox x:Name="ElementTintEnabledCheck" Content="Tint image" Margin="0,8,0,0"/>
+                        <TextBlock Text="Image tint binding"/><TextBox x:Name="ElementTintBindingBox"/>
+                        <TextBlock Text="Image tint color (decimal RGB)"/><TextBox x:Name="ElementTintColorBox"/>
                         <TextBlock Text="Opacity (0-255)"/><TextBox x:Name="ElementOpacityBox"/>
                         <UniformGrid Columns="2">
                             <TextBlock Text="X"/><TextBox x:Name="ElementXBox"/>
@@ -126,6 +141,8 @@
                         <CheckBox x:Name="ElementLockedCheck" Content="Locked in editor"/>
                         <TextBlock Text="Text alignment" Margin="0,8,0,0"/><ComboBox x:Name="ElementAlignmentCombo"/>
                         <TextBlock Text="Text overflow" Margin="0,8,0,0"/><ComboBox x:Name="ElementOverflowCombo"/>
+                        <TextBlock Text="Text transform" Margin="0,8,0,0"/><ComboBox x:Name="ElementTextTransformCombo"/>
+                        <TextBlock Text="Small caps scale (0.1-1.0)"/><TextBox x:Name="ElementSmallCapsScaleBox"/>
                         <TextBlock Text="Font height (0 = theme default)" Margin="0,8,0,0"/><TextBox x:Name="ElementFontHeightBox"/>
                         <TextBlock Text="Text color (decimal RGB)"/><TextBox x:Name="ElementTextColorBox"/>
                         <TextBlock Text="Fill type" Margin="0,8,0,0"/><ComboBox x:Name="ElementFillTypeCombo"/>

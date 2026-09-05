@@ -11,10 +11,13 @@ namespace {
 
 Config g_config = {};
 Config g_violationConfig = {};
+Config g_playerFoulConfig = {};
 bool g_loaded = false;
 bool g_violationLoaded = false;
+bool g_playerFoulLoaded = false;
 char g_theme[64] = {};
 char g_violationTheme[64] = {};
+char g_playerFoulTheme[64] = {};
 char g_lastError[512] = {};
 
 void SetDefaults(Config* c)
@@ -27,6 +30,7 @@ void SetDefaults(Config* c)
     c->offsetY = 18.0f;
     c->width = 620.0f;
     c->height = 68.0f;
+    c->overlayZ = 10;
     c->backgroundColor = D3DCOLOR_XRGB(15, 18, 24);
     c->backgroundAlpha = 232;
     c->showBackgroundImage = false;
@@ -291,11 +295,26 @@ void ParseElements(const std::string& json, Config* c)
         const std::string imageFit = StringValue(object, "imageFit",
             std::strcmp(e.id, "backgroundImage") == 0 ? "stretch" : "contain");
         e.imageFit = imageFit == "stretch" ? ImageFit::Stretch : ImageFit::Contain;
+        e.tintEnabled = Boolean(object, "tintEnabled", false);
+        String(object, "tintBinding", e.tintBinding,
+            sizeof(e.tintBinding), "");
+        e.tintColor = Color(object, "tintColor",
+            D3DCOLOR_XRGB(255, 255, 255));
         const std::string alignment = StringValue(object, "alignment", "center");
         e.alignment = alignment == "left" ? TextAlignment::Left :
             alignment == "right" ? TextAlignment::Right : TextAlignment::Center;
         e.overflow = StringValue(object, "overflow", "overflow") == "fit" ?
             TextOverflow::Fit : TextOverflow::Overflow;
+        const std::string textTransform = StringValue(object,
+            "textTransform", "none");
+        e.textTransform = textTransform == "uppercase" ? TextTransform::Uppercase :
+            textTransform == "lowercase" ? TextTransform::Lowercase :
+            textTransform == "capitalize" ? TextTransform::Capitalize :
+            textTransform == "smallCaps" ? TextTransform::SmallCaps :
+            TextTransform::None;
+        e.smallCapsScale = Number(object, "smallCapsScale", 0.75f);
+        if (e.smallCapsScale <= 0.0f) e.smallCapsScale = 0.75f;
+        if (e.smallCapsScale > 1.0f) e.smallCapsScale = 1.0f;
         e.fontHeight = Number(object, "fontHeight", 0.0f);
         e.textColor = Color(object, "textColor", D3DCOLOR_XRGB(255, 255, 255));
         e.opacity = Integer(object, "opacity", 255);
@@ -329,6 +348,7 @@ void Parse(const std::string& json, Config* c)
     c->offsetY = Number(json, "offsetY", c->offsetY);
     c->width = Number(json, "scoreboardWidth", c->width);
     c->height = Number(json, "scoreboardHeight", c->height);
+    c->overlayZ = Integer(json, "overlayZ", c->overlayZ);
     c->backgroundColor = Color(json,
         "backgroundColor", c->backgroundColor);
     c->backgroundAlpha = Integer(json,
@@ -438,6 +458,7 @@ void Parse(const std::string& json, Config* c)
 
 const Config& Get() { return g_config; }
 const Config& GetViolation() { return g_violationConfig; }
+const Config& GetPlayerFoul() { return g_playerFoulConfig; }
 
 bool Load(const char* themeName)
 {
@@ -479,6 +500,7 @@ bool LoadViolation(const char* themeName)
     next.width = 420.0f;
     next.height = 80.0f;
     next.offsetY = 90.0f;
+    next.overlayZ = 30;
     std::string path = GameDirectory() + "\\popups\\" + themeName +
         "\\violation\\violation.json";
     std::string json;
@@ -505,6 +527,44 @@ bool ReloadViolation(const char* themeName)
     g_violationLoaded = false;
     g_violationTheme[0] = '\0';
     return LoadViolation(themeName);
+}
+
+bool LoadPlayerFoul(const char* themeName)
+{
+    if (g_playerFoulLoaded &&
+        std::strcmp(g_playerFoulTheme, themeName) == 0) return true;
+    Config next;
+    SetDefaults(&next);
+    next.width = 520.0f;
+    next.height = 100.0f;
+    next.offsetY = 90.0f;
+    next.overlayZ = 20;
+    std::string path = GameDirectory() + "\\popups\\" + themeName +
+        "\\stats\\player_foul.json";
+    std::string json;
+    if (!ReadFile(path.c_str(), &json)) {
+        std::snprintf(g_lastError, sizeof(g_lastError),
+            "Could not read %s", path.c_str());
+        g_playerFoulConfig = next;
+        g_playerFoulLoaded = true;
+        std::strncpy(g_playerFoulTheme, themeName,
+            sizeof(g_playerFoulTheme) - 1);
+        return false;
+    }
+    Parse(json, &next);
+    g_playerFoulConfig = next;
+    g_playerFoulLoaded = true;
+    std::strncpy(g_playerFoulTheme, themeName,
+        sizeof(g_playerFoulTheme) - 1);
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool ReloadPlayerFoul(const char* themeName)
+{
+    g_playerFoulLoaded = false;
+    g_playerFoulTheme[0] = '\0';
+    return LoadPlayerFoul(themeName);
 }
 
 const char* GetLastError() { return g_lastError; }

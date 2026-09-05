@@ -38,6 +38,7 @@ using GetTeamIDFromSideFn = IDTeam* (__stdcall *)(IDTeam*, int);
 using GetTeamValueFn = int (__stdcall *)(int);
 using GetOverlayDataFn = DWORD (__thiscall *)(DWORD*, int, int);
 using StoreOverlayDataFn = void (__thiscall *)(void*, DWORD*);
+using StatsRequestFn = bool (__thiscall *)(void*, void*);
 
 const GameAddresses* g_game = nullptr;
 SendEventFn g_originalSendEvent = nullptr;
@@ -138,6 +139,29 @@ ViolationState g_violation = {};
 bool g_violationPresentationSuppressed = false;
 DWORD g_violationTransitionHiddenAt = 0;
 
+struct PlayerFoulState {
+    char firstName[64];
+    char lastName[64];
+    char label1[64];
+    char value1[32];
+    char label2[64];
+    char value2[32];
+    char logoId[32];
+    char portraitId[32];
+    D3DCOLOR teamColor;
+    unsigned int payloadHash;
+    DWORD startedAt;
+    bool active;
+};
+
+PlayerFoulState g_playerFoul = {};
+bool g_playerFoulPresentationSuppressed = false;
+DWORD g_playerFoulTransitionHiddenAt = 0;
+bool g_playerFoulLayoutAvailable = false;
+bool g_suppressCurrentStatsRequest = false;
+bool g_statsRequestHookInstalled = false;
+char g_loggedStatTeamCode[32] = {};
+
 using Direct3DCreate9Fn = IDirect3D9* (WINAPI *)(UINT);
 using PresentFn = HRESULT (WINAPI *)(IDirect3DDevice9*, const RECT*,
     const RECT*, HWND, const RGNDATA*);
@@ -163,12 +187,21 @@ char g_customOverlayIniPath[MAX_PATH] = {};
 char g_customOverlayScoreboardPath[MAX_PATH] = {};
 
 StoreOverlayDataFn g_originalViolationDataStore = nullptr;
+StoreOverlayDataFn g_originalStatsDataStore = nullptr;
+StatsRequestFn g_originalStatsRequest = nullptr;
 
 bool __stdcall SuppressNativeViolationRequest(void*)
 {
     // Matches sub_55B020's one stack argument and returns AL=1 so
     // sub_597270 continues into its normal payload-storage branch.
     return true;
+}
+
+bool __fastcall HookStatsNativeRequest(void* thisPtr, void*, void* request)
+{
+    if (g_suppressCurrentStatsRequest)
+        return true;
+    return g_originalStatsRequest ? g_originalStatsRequest(thisPtr, request) : false;
 }
 
 bool IsSafeOverlayName(const char* name)
@@ -412,6 +445,106 @@ void __fastcall HookViolationDataStore(
     // instance is being requested. This keeps event bookkeeping intact.
     if (g_originalViolationDataStore)
         g_originalViolationDataStore(thisPtr, vector);
+}
+
+void LogCompletedStatPayload(DWORD* payload)
+{
+    if (!g_logReady || !payload)
+        return;
+
+    __try {
+        const int count = static_cast<int>(payload[3]);
+        if (count < 0 || count > 128)
+            return;
+
+        const BBallString* values = reinterpret_cast<const BBallString*>(
+            payload[0]);
+        if (count > 0 && !values)
+            return;
+
+        FILE* file = nullptr;
+        EnterCriticalSection(&g_logLock);
+        __try {
+            file = std::fopen("stat_payloads.log", "a");
+            if (file) {
+                std::fprintf(file,
+                    "tick=%lu count=%d control14=%u control18=%u "
+                    "control1C=%u values=[",
+                    static_cast<unsigned long>(GetTickCount()), count,
+                    static_cast<unsigned int>(payload[5]),
+                    static_cast<unsigned int>(payload[6]),
+                    static_cast<unsigned int>(payload[7]));
+                for (int i = 0; i < count; ++i) {
+                    if (i) std::fputs(", ", file);
+                    WriteEscaped(file, values[i].sharedstring);
+                }
+                std::fputs("]\n", file);
+            }
+        }
+        __finally {
+            if (file) std::fclose(file);
+            LeaveCriticalSection(&g_logLock);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // A transient or malformed game-owned payload must not affect play.
+    }
+}
+
+void __fastcall HookStatsDataStore(void* thisPtr, void*, DWORD* payload)
+{
+    LogCompletedStatPayload(payload);
+    bool playerFoul = false;
+    if (g_customOverlayEnabled && g_playerFoulLayoutAvailable && payload) {
+        __try {
+            const int count = static_cast<int>(payload[3]);
+            const BBallString* values = reinterpret_cast<const BBallString*>(
+                payload[0]);
+            playerFoul = count >= 15 && values &&
+                payload[6] == 1 && payload[7] == 10;
+            if (playerFoul) {
+                const unsigned int hash = HashOverlayPayload(0, values, count);
+                CopyText(g_playerFoul.firstName,
+                    sizeof(g_playerFoul.firstName), values[0].sharedstring);
+                CopyText(g_playerFoul.lastName,
+                    sizeof(g_playerFoul.lastName), values[1].sharedstring);
+                CopyText(g_playerFoul.label1,
+                    sizeof(g_playerFoul.label1), values[2].sharedstring);
+                CopyText(g_playerFoul.value1,
+                    sizeof(g_playerFoul.value1), values[3].sharedstring);
+                CopyText(g_playerFoul.label2,
+                    sizeof(g_playerFoul.label2), values[4].sharedstring);
+                CopyText(g_playerFoul.value2,
+                    sizeof(g_playerFoul.value2), values[5].sharedstring);
+                CopyText(g_playerFoul.logoId,
+                    sizeof(g_playerFoul.logoId), values[13].sharedstring);
+                CopyText(g_playerFoul.portraitId,
+                    sizeof(g_playerFoul.portraitId), values[14].sharedstring);
+                g_playerFoul.teamColor = ParsePackedColor(
+                    values[12].sharedstring, D3DCOLOR_XRGB(40, 40, 40));
+                g_playerFoul.payloadHash = hash;
+                g_playerFoul.startedAt = GetTickCount();
+                g_playerFoul.active = true;
+                if (g_playerFoulPresentationSuppressed)
+                    g_playerFoulTransitionHiddenAt = g_playerFoul.startedAt;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            playerFoul = false;
+            g_playerFoul.active = false;
+        }
+    }
+
+    // sub_584890 still performs all native payload storage/bookkeeping. Its
+    // internal movie request is the only operation conditionally suppressed.
+    g_suppressCurrentStatsRequest = playerFoul;
+    __try {
+        if (g_originalStatsDataStore)
+            g_originalStatsDataStore(thisPtr, payload);
+    }
+    __finally {
+        g_suppressCurrentStatsRequest = false;
+    }
 }
 
 void LogOverlayPayload(int type, DWORD* vector)
@@ -684,11 +817,17 @@ int __cdecl HookSendEvent(
             g_violation.paused = false;
             g_violation.pausedAt = 0;
             g_violationTransitionHiddenAt = 0;
+            g_playerFoulPresentationSuppressed = true;
+            g_playerFoul.active = false;
+            g_playerFoulTransitionHiddenAt = 0;
         }
         else if (std::strcmp(name, "HideOverlaysEvent") == 0) {
             if (!g_violationPresentationSuppressed && g_violation.active)
                 g_violationTransitionHiddenAt = GetTickCount();
             g_violationPresentationSuppressed = true;
+            if (!g_playerFoulPresentationSuppressed && g_playerFoul.active)
+                g_playerFoulTransitionHiddenAt = GetTickCount();
+            g_playerFoulPresentationSuppressed = true;
         }
         else if (std::strcmp(name, "ShowOverlaysEvent") == 0) {
             if (g_violationPresentationSuppressed && g_violation.active &&
@@ -698,12 +837,20 @@ int __cdecl HookSendEvent(
             }
             g_violationPresentationSuppressed = false;
             g_violationTransitionHiddenAt = 0;
+            if (g_playerFoulPresentationSuppressed && g_playerFoul.active &&
+                g_playerFoulTransitionHiddenAt)
+                g_playerFoul.startedAt +=
+                    GetTickCount() - g_playerFoulTransitionHiddenAt;
+            g_playerFoulPresentationSuppressed = false;
+            g_playerFoulTransitionHiddenAt = 0;
         }
         else if (resumeEvent) {
             // A pause killed the previous instance; resume merely allows the
             // next native violation request to create a new custom one.
             g_violationPresentationSuppressed = false;
             g_violationTransitionHiddenAt = 0;
+            g_playerFoulPresentationSuppressed = false;
+            g_playerFoulTransitionHiddenAt = 0;
         }
 
         const bool freezeViolation =
@@ -1129,6 +1276,135 @@ void RenderViolationOverlay(IDirect3DDevice9* device)
         x, y, opacity);
 }
 
+void RenderPlayerFoulOverlay(IDirect3DDevice9* device)
+{
+    if (!g_customOverlayEnabled || !g_playerFoulLayoutAvailable ||
+        !g_playerFoul.active || g_playerFoulPresentationSuppressed || !device)
+        return;
+    const scoreboardconfig::Config& config =
+        scoreboardconfig::GetPlayerFoul();
+    const DWORD elapsed = GetTickCount() - g_playerFoul.startedAt;
+    const DWORD enterEnd = config.enterMilliseconds;
+    const DWORD holdEnd = enterEnd + config.holdMilliseconds;
+    const DWORD total = holdEnd + config.exitMilliseconds;
+    if (elapsed >= total) { g_playerFoul.active = false; return; }
+
+    float x = 0.0f, y = 0.0f, opacity = 1.0f;
+    if (elapsed < enterEnd && enterEnd > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed) / enterEnd);
+        if (_stricmp(config.enterAnimation, "slide") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0) {
+            x = config.enterFromX * (1.0f - p);
+            y = config.enterFromY * (1.0f - p);
+        }
+        if (_stricmp(config.enterAnimation, "fade") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0)
+            opacity = p;
+    }
+    else if (elapsed >= holdEnd && config.exitMilliseconds > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed - holdEnd) /
+            config.exitMilliseconds);
+        if (_stricmp(config.exitAnimation, "slide") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0) {
+            x = config.exitToX * p;
+            y = config.exitToY * p;
+        }
+        if (_stricmp(config.exitAnimation, "fade") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0)
+            opacity = 1.0f - p;
+    }
+
+    popup::Load(g_customOverlayName);
+    const popup::TeamVisual* away = popup::FindTeam(g_lastState.awayTeamDBID);
+    const popup::TeamVisual* home = popup::FindTeam(g_lastState.homeTeamDBID);
+    const D3DCOLOR rgb = g_playerFoul.teamColor & 0x00FFFFFFu;
+    // Player-stat value 13 is the game's two-character team abbreviation.
+    // Match it directly against TEAMABR2 from scoreboard/teams.json.
+    const popup::TeamVisual* team = popup::FindTeamByShortCode(
+        g_playerFoul.logoId);
+    if (!team)
+        team = away && (away->primaryColor & 0x00FFFFFFu) == rgb ? away :
+            home && (home->primaryColor & 0x00FFFFFFu) == rgb ? home : nullptr;
+
+    scoreboard::Frame frame = {};
+    frame.playerFirstName = g_playerFoul.firstName;
+    frame.playerLastName = g_playerFoul.lastName;
+    frame.statLabel1 = g_playerFoul.label1;
+    frame.statValue1 = g_playerFoul.value1;
+    frame.statLabel2 = g_playerFoul.label2;
+    frame.statValue2 = g_playerFoul.value2;
+    frame.statTeamName = team ? team->teamName : "";
+    frame.statTeamColor = g_playerFoul.teamColor;
+    frame.statPrimaryColor = team ? team->primaryColor :
+        g_playerFoul.teamColor;
+    frame.statSecondaryColor = team ? team->secondaryColor :
+        g_playerFoul.teamColor;
+    if (_stricmp(g_loggedStatTeamCode, g_playerFoul.logoId) != 0) {
+        std::strncpy(g_loggedStatTeamCode, g_playerFoul.logoId,
+            sizeof(g_loggedStatTeamCode) - 1);
+        g_loggedStatTeamCode[sizeof(g_loggedStatTeamCode) - 1] = '\0';
+        AppendDiagnostic(
+            "Player-foul team mapping: payload TEAMABR2='%s' matched=%s "
+            "databaseTeamID=%d primary=%u secondary=%u raw=%u.\n",
+            g_playerFoul.logoId, team ? team->teamName : "<none>",
+            team ? team->databaseTeamID : -1,
+            static_cast<unsigned int>(frame.statPrimaryColor & 0x00FFFFFFu),
+            static_cast<unsigned int>(frame.statSecondaryColor & 0x00FFFFFFu),
+            static_cast<unsigned int>(frame.statTeamColor & 0x00FFFFFFu));
+    }
+
+    char logoPath[MAX_PATH] = {};
+    char portraitPath[MAX_PATH] = {};
+    if (g_playerFoul.logoId[0])
+        std::snprintf(logoPath, sizeof(logoPath),
+            "teams\\%s.png", g_playerFoul.logoId);
+    if (g_playerFoul.portraitId[0] &&
+        _stricmp(g_playerFoul.portraitId, "blank__") != 0)
+        std::snprintf(portraitPath, sizeof(portraitPath),
+            "portraits\\%s.png", g_playerFoul.portraitId);
+    frame.statTeamLogo = logoPath[0] ? popup::GetOverlayTexture(device,
+        g_customOverlayName, "stats", logoPath) : nullptr;
+    frame.playerPortrait = portraitPath[0] ? popup::GetOverlayTexture(device,
+        g_customOverlayName, "stats", portraitPath) : nullptr;
+    scoreboard::RenderPlayerFoul(device, frame, g_customOverlayName,
+        x, y, opacity);
+}
+
+using OverlayRenderFn = void (*)(IDirect3DDevice9*);
+
+void RenderConfiguredOverlays(IDirect3DDevice9* device)
+{
+    scoreboardconfig::Load(g_customOverlayName);
+    scoreboardconfig::LoadViolation(g_customOverlayName);
+    scoreboardconfig::LoadPlayerFoul(g_customOverlayName);
+
+    struct RenderEntry {
+        int z;
+        int sequence;
+        OverlayRenderFn render;
+    };
+    RenderEntry entries[] = {
+        { scoreboardconfig::Get().overlayZ, 0, &RenderNativeScoreboard },
+        { scoreboardconfig::GetViolation().overlayZ, 1,
+            &RenderViolationOverlay },
+        { scoreboardconfig::GetPlayerFoul().overlayZ, 2,
+            &RenderPlayerFoulOverlay }
+    };
+    const int count = sizeof(entries) / sizeof(entries[0]);
+    for (int i = 1; i < count; ++i) {
+        const RenderEntry value = entries[i];
+        int j = i - 1;
+        while (j >= 0 && (entries[j].z > value.z ||
+            (entries[j].z == value.z && entries[j].sequence > value.sequence))) {
+            entries[j + 1] = entries[j];
+            --j;
+        }
+        entries[j + 1] = value;
+    }
+    for (int i = 0; i < count; ++i)
+        entries[i].render(device);
+}
+
 void CheckPopupHotReload(IDirect3DDevice9* device)
 {
     const bool keyDown = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
@@ -1149,15 +1425,23 @@ void CheckPopupHotReload(IDirect3DDevice9* device)
         const bool scoreboardLoaded = scoreboardconfig::Reload(g_customOverlayName);
         const bool violationLoaded = scoreboardconfig::ReloadViolation(
             g_customOverlayName);
+        const bool playerFoulLoaded = scoreboardconfig::ReloadPlayerFoul(
+            g_customOverlayName);
+        g_playerFoulLayoutAvailable = playerFoulLoaded &&
+            g_statsRequestHookInstalled;
+        if (!playerFoulLoaded) g_playerFoul.active = false;
         g_loggedAwayLogoTeam = INT_MIN;
         g_loggedHomeLogoTeam = INT_MIN;
+        g_loggedStatTeamCode[0] = '\0';
         AppendDiagnostic(
-            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s error=%s\n",
+            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s playerFoul=%s error=%s\n",
             themeLoaded ? "OK" : "FAILED",
             fontLoaded ? "OK" : "FAILED",
             scoreboardLoaded ? "OK" : "FAILED",
             violationLoaded ? "OK" : "FAILED",
-            themeLoaded && scoreboardLoaded && violationLoaded ? "<none>" :
+            playerFoulLoaded ? "OK" : "FAILED",
+            themeLoaded && scoreboardLoaded && violationLoaded &&
+                playerFoulLoaded ? "<none>" :
                 (!themeLoaded ? popup::GetLastError() :
                     scoreboardconfig::GetLastError()));
     }
@@ -1178,8 +1462,7 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* device, const RECT* sourceRect,
     }
     CheckPopupHotReload(device);
     if (SUCCEEDED(device->BeginScene())) {
-        RenderNativeScoreboard(device);
-        RenderViolationOverlay(device);
+        RenderConfiguredOverlays(device);
         device->EndScene();
     }
     return g_originalPresent(device, sourceRect, destinationRect,
@@ -1694,6 +1977,64 @@ void Initialize(const GameAddresses& game)
             reinterpret_cast<void*>(&HookGetOverlayData));
         AppendDiagnostic("Redirected GetOverlayData calls: %u\n",
             overlayCalls);
+    }
+
+    // Live 06 FEOverlayStats builders all converge here after completing
+    // their owned BBallString vectors. The player-foul subtype (1/10) gets a
+    // custom instance only when its layout exists; all other stat requests
+    // continue to the native overlay unchanged.
+    if (game.statsDataStore) {
+        file = std::fopen("stat_payloads.log", "w");
+        if (file) {
+            std::fprintf(file,
+                "%s completed FEOverlayStats payload log\n"
+                "Store=%08X\n\n",
+                game.name,
+                static_cast<unsigned int>(game.statsDataStore));
+            std::fclose(file);
+        }
+
+        g_originalStatsDataStore =
+            reinterpret_cast<StoreOverlayDataFn>(game.statsDataStore);
+        const bool playerFoulLayoutLoaded = g_customOverlayEnabled &&
+            scoreboardconfig::LoadPlayerFoul(g_customOverlayName);
+        g_playerFoulLayoutAvailable = false;
+
+        if (g_customOverlayEnabled && game.statsRequestCall) {
+            const uintptr_t requestDestination = GetDirectCallDestination(
+                game.statsRequestCall);
+            if (requestDestination) {
+                g_originalStatsRequest =
+                    reinterpret_cast<StatsRequestFn>(requestDestination);
+                patch::RedirectCall(
+                    static_cast<unsigned int>(game.statsRequestCall),
+                    reinterpret_cast<void*>(&HookStatsNativeRequest));
+                g_statsRequestHookInstalled = true;
+                g_playerFoulLayoutAvailable = playerFoulLayoutLoaded;
+                AppendDiagnostic(
+                    "Player-foul native request hook installed: call=%08X "
+                    "target=%08X.\n",
+                    static_cast<unsigned int>(game.statsRequestCall),
+                    static_cast<unsigned int>(requestDestination));
+            }
+            else {
+                g_playerFoulLayoutAvailable = false;
+                AppendDiagnostic(
+                    "Player-foul fallback to native: invalid request call "
+                    "%08X.\n",
+                    static_cast<unsigned int>(game.statsRequestCall));
+            }
+        }
+        const unsigned int statsCalls = RedirectDirectCalls(
+            game.statsDataStore,
+            reinterpret_cast<void*>(&HookStatsDataStore));
+        AppendDiagnostic(
+            "Redirected FEOverlayStats completed-store calls: %u "
+            "target=%08X.\n",
+            statsCalls, static_cast<unsigned int>(game.statsDataStore));
+        AppendDiagnostic("Player-foul custom layout: %s.\n",
+            g_playerFoulLayoutAvailable ? "enabled" :
+                "unavailable; native overlay retained");
     }
 
     // Every supported FEOverlayViolation builder first submits the native

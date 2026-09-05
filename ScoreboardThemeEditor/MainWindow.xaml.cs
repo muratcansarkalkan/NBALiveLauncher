@@ -7,6 +7,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Documents;
 using System.Windows.Threading;
 
 namespace NBALiveScoreboardEditor;
@@ -19,6 +20,17 @@ public sealed class EditorSettings
 
 public partial class MainWindow : Window
 {
+    private sealed class PreviewOverlayDocument
+    {
+        public required string Path { get; init; }
+        public required string Directory { get; init; }
+        public required ScoreboardTheme Theme { get; init; }
+        public required PopupFontTheme Font { get; init; }
+        public string DisplayName =>
+            $"{System.IO.Path.GetFileName(Directory)} / {System.IO.Path.GetFileName(Path)}";
+        public override string ToString() => DisplayName;
+    }
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -40,6 +52,7 @@ public partial class MainWindow : Window
     private ScoreboardTheme _theme = new();
     private PopupFontTheme _font = new();
     private readonly List<TeamDefinition> _teams = [];
+    private readonly List<PreviewOverlayDocument> _previewOverlays = [];
     private string? _themeDirectory;
     private string? _activeDocumentPath;
     private FrameworkElement? _selected;
@@ -85,6 +98,8 @@ public partial class MainWindow : Window
         ElementTypeCombo.ItemsSource = new[] { "rectangle", "image", "text", "indicator" };
         ElementImageFitCombo.ItemsSource = new[] { "contain", "stretch" };
         ElementOverflowCombo.ItemsSource = new[] { "overflow", "fit" };
+        ElementTextTransformCombo.ItemsSource = new[] {
+            "none", "uppercase", "lowercase", "capitalize", "smallCaps" };
         ElementFillTypeCombo.ItemsSource = new[] { "solid", "linearGradient" };
         GradientDirectionCombo.ItemsSource = new[] { "vertical", "horizontal" };
         EnterAnimationCombo.ItemsSource = ExitAnimationCombo.ItemsSource =
@@ -223,8 +238,15 @@ public partial class MainWindow : Window
     {
         _themeDirectory = Path.GetDirectoryName(path)!;
         _activeDocumentPath = path;
+        string layoutJson = File.ReadAllText(path);
         _theme = JsonSerializer.Deserialize<ScoreboardTheme>(
-            File.ReadAllText(path), JsonOptions) ?? new();
+            layoutJson, JsonOptions) ?? new();
+        if (!layoutJson.Contains("\"overlayZ\"",
+                StringComparison.OrdinalIgnoreCase))
+            _theme.OverlayZ = Path.GetFileName(path).Equals("violation.json",
+                StringComparison.OrdinalIgnoreCase) ? 30 :
+                Path.GetFileName(path).Equals("player_foul.json",
+                StringComparison.OrdinalIgnoreCase) ? 20 : 10;
         _theme.Animation ??= new();
         _theme.Animation.Enter ??= new();
         _theme.Animation.Exit ??= new();
@@ -240,7 +262,9 @@ public partial class MainWindow : Window
         string screen = Path.GetFileName(_themeDirectory);
         _loadingControls = true;
         ScreenCombo.SelectedIndex = screen.Equals("violation",
-            StringComparison.OrdinalIgnoreCase) ? 3 : 0;
+            StringComparison.OrdinalIgnoreCase) ? 3 :
+            screen.Equals("stats", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+        SetSubtypeOptions(screen.Equals("stats", StringComparison.OrdinalIgnoreCase));
         _loadingControls = false;
         RebuildPreview();
         UpdateDocumentCaption();
@@ -253,16 +277,18 @@ public partial class MainWindow : Window
         if (!IsLoaded || _loadingControls || _themeDirectory is null) return;
         string? selected = (ScreenCombo.SelectedItem as ComboBoxItem)?.Content
             ?.ToString();
-        if (selected is not ("Scoreboard" or "Violation")) return;
+        if (selected is not ("Scoreboard" or "Violation" or "Stats")) return;
+        SetSubtypeOptions(selected == "Stats");
         string currentScreen = Path.GetFileName(_themeDirectory);
         string packageDirectory = currentScreen.Equals("scoreboard",
                 StringComparison.OrdinalIgnoreCase) ||
-            currentScreen.Equals("violation", StringComparison.OrdinalIgnoreCase)
+            currentScreen.Equals("violation", StringComparison.OrdinalIgnoreCase) ||
+            currentScreen.Equals("stats", StringComparison.OrdinalIgnoreCase)
             ? Directory.GetParent(_themeDirectory)?.FullName ?? _themeDirectory
             : _themeDirectory;
         string directoryName = selected.ToLowerInvariant();
-        string fileName = selected == "Scoreboard"
-            ? "scoreboard.json" : "violation.json";
+        string fileName = selected == "Scoreboard" ? "scoreboard.json" :
+            selected == "Violation" ? "violation.json" : "player_foul.json";
         string path = Path.Combine(packageDirectory, directoryName, fileName);
         if (!File.Exists(path)) {
             StatusText.Text = $"Overlay layout not found: {path}";
@@ -275,13 +301,24 @@ public partial class MainWindow : Window
         }
     }
 
+    private void SetSubtypeOptions(bool playerFoul)
+    {
+        SubtypeCombo.Items.Clear();
+        SubtypeCombo.Items.Add(new ComboBoxItem {
+            Content = playerFoul ? "Player Foul" : "Default"
+        });
+        SubtypeCombo.SelectedIndex = 0;
+    }
+
     private void LoadTeams()
     {
         _teams.Clear();
         string path = Path.Combine(_themeDirectory!, "teams.json");
-        if (!File.Exists(path) && string.Equals(
+        if (!File.Exists(path) && (string.Equals(
                 Path.GetFileName(_themeDirectory), "violation",
-                StringComparison.OrdinalIgnoreCase))
+                StringComparison.OrdinalIgnoreCase) || string.Equals(
+                Path.GetFileName(_themeDirectory), "stats",
+                StringComparison.OrdinalIgnoreCase)))
             path = Path.Combine(Directory.GetParent(_themeDirectory!)?.FullName
                 ?? _themeDirectory!, "scoreboard", "teams.json");
         if (!File.Exists(path)) return;
@@ -440,6 +477,7 @@ public partial class MainWindow : Window
         ScoreboardOffsetYBox.Text = _theme.OffsetY.ToString("0.##");
         ScoreboardWidthBox.Text = _theme.ScoreboardWidth.ToString("0.##");
         ScoreboardHeightBox.Text = _theme.ScoreboardHeight.ToString("0.##");
+        OverlayZBox.Text = _theme.OverlayZ.ToString();
         FontFileBox.Text = _font.FontFile;
         FontFaceBox.Text = _font.FontFace;
         FontWeightBox.Text = _font.FontWeight.ToString();
@@ -634,6 +672,7 @@ public partial class MainWindow : Window
             Double(ScoreboardWidthBox, _theme.ScoreboardWidth));
         _theme.ScoreboardHeight = Math.Max(1,
             Double(ScoreboardHeightBox, _theme.ScoreboardHeight));
+        _theme.OverlayZ = Int(OverlayZBox, _theme.OverlayZ);
     }
 
     private void ApplyBehaviorFromControls()
@@ -762,11 +801,13 @@ public partial class MainWindow : Window
     private void RebuildPreview()
     {
         UpdatePreviewStage();
+        RebuildAdditionalPreviewOverlays();
         PreviewCanvas.Width = Math.Max(1, _theme.ScoreboardWidth);
         PreviewCanvas.Height = Math.Max(1, _theme.ScoreboardHeight);
         PreviewCanvas.Background = _theme.Elements.Count > 0
             ? Brushes.Transparent
             : PackedBrush(_theme.BackgroundColor, _theme.BackgroundAlpha);
+        Panel.SetZIndex(PreviewCanvas, _theme.OverlayZ);
         PreviewCanvas.Children.Clear();
         if (_theme.Elements.Count == 0) AddBackgroundImage();
         TeamDefinition away = AwayTeamCombo.SelectedItem as TeamDefinition ??
@@ -819,6 +860,255 @@ public partial class MainWindow : Window
         RestoreElementSelection();
     }
 
+    private void AddPreviewOverlay_Click(object sender, RoutedEventArgs e)
+    {
+        OpenFileDialog dialog = new()
+        {
+            Title = "Add overlay layouts to preview",
+            Filter = "Overlay layouts (*.json)|*.json|All files (*.*)|*.*",
+            Multiselect = true,
+            InitialDirectory = _themeDirectory
+        };
+        if (dialog.ShowDialog(this) != true) return;
+
+        int added = 0;
+        foreach (string selectedPath in dialog.FileNames)
+        {
+            string path = Path.GetFullPath(selectedPath);
+            if (string.Equals(path, _activeDocumentPath,
+                    StringComparison.OrdinalIgnoreCase) ||
+                _previewOverlays.Any(x => string.Equals(x.Path, path,
+                    StringComparison.OrdinalIgnoreCase)))
+                continue;
+            try
+            {
+                string layoutJson = File.ReadAllText(path);
+                ScoreboardTheme theme = JsonSerializer.Deserialize<ScoreboardTheme>(
+                    layoutJson, JsonOptions) ?? new();
+                if (!layoutJson.Contains("\"overlayZ\"",
+                        StringComparison.OrdinalIgnoreCase))
+                    theme.OverlayZ = Path.GetFileName(path).Equals(
+                        "violation.json", StringComparison.OrdinalIgnoreCase)
+                        ? 30 : Path.GetFileName(path).Equals("player_foul.json",
+                        StringComparison.OrdinalIgnoreCase) ? 20 : 10;
+                string directory = Path.GetDirectoryName(path)!;
+                string popupPath = Path.Combine(directory, "popup.json");
+                PopupFontTheme font = File.Exists(popupPath)
+                    ? JsonSerializer.Deserialize<PopupFontTheme>(
+                        File.ReadAllText(popupPath), JsonOptions) ?? new()
+                    : new();
+                font.Fonts ??= [];
+                theme.Elements ??= [];
+                theme.Animation ??= new();
+                _previewOverlays.Add(new PreviewOverlayDocument
+                {
+                    Path = path,
+                    Directory = directory,
+                    Theme = theme,
+                    Font = font
+                });
+                added++;
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, $"{path}\n\n{exception.Message}",
+                    "Unable to add preview overlay", MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+        RefreshPreviewOverlayList();
+        RebuildPreview();
+        StatusText.Text = added > 0
+            ? $"Added {added} preview overlay(s)."
+            : "No new preview overlays were added.";
+    }
+
+    private void RemovePreviewOverlay_Click(object sender, RoutedEventArgs e)
+    {
+        if (PreviewOverlayCombo.SelectedItem is not PreviewOverlayDocument item)
+            return;
+        _previewOverlays.Remove(item);
+        RefreshPreviewOverlayList();
+        RebuildPreview();
+    }
+
+    private void ClearPreviewOverlays_Click(object sender, RoutedEventArgs e)
+    {
+        _previewOverlays.Clear();
+        RefreshPreviewOverlayList();
+        RebuildPreview();
+    }
+
+    private void RefreshPreviewOverlayList()
+    {
+        PreviewOverlayCombo.ItemsSource = null;
+        PreviewOverlayCombo.ItemsSource = _previewOverlays;
+        if (_previewOverlays.Count > 0)
+            PreviewOverlayCombo.SelectedIndex = _previewOverlays.Count - 1;
+    }
+
+    private void RebuildAdditionalPreviewOverlays()
+    {
+        for (int i = PreviewStage.Children.Count - 1; i >= 0; --i)
+            if (PreviewStage.Children[i] is FrameworkElement element &&
+                Equals(element.Tag, "additionalPreviewOverlay"))
+                PreviewStage.Children.RemoveAt(i);
+        TeamDefinition away = AwayTeamCombo.SelectedItem as TeamDefinition ??
+            _teams.FirstOrDefault() ?? new() { Abbreviation = "AWY",
+                TeamName = "Away", PrimaryColor = 3030876,
+                SecondaryColor = 14013909 };
+        TeamDefinition home = HomeTeamCombo.SelectedItem as TeamDefinition ??
+            _teams.Skip(1).FirstOrDefault() ?? new() { Abbreviation = "HME",
+                TeamName = "Home", PrimaryColor = 9969197,
+                SecondaryColor = 16777215 };
+
+        foreach (PreviewOverlayDocument document in _previewOverlays)
+            AddReferenceOverlay(document, away, home);
+    }
+
+    private void AddReferenceOverlay(PreviewOverlayDocument document,
+        TeamDefinition away, TeamDefinition home)
+    {
+        ScoreboardTheme theme = document.Theme;
+        Canvas canvas = new()
+        {
+            Width = Math.Max(1, theme.ScoreboardWidth),
+            Height = Math.Max(1, theme.ScoreboardHeight),
+            Background = Brushes.Transparent,
+            IsHitTestVisible = false
+        };
+
+        foreach (OverlayElement layer in theme.Elements.OrderBy(x => x.Z))
+        {
+            if (!layer.Visible) continue;
+            Border border = new()
+            {
+                Width = Math.Max(1, layer.Width),
+                Height = Math.Max(1, layer.Height),
+                Opacity = Math.Clamp(layer.Opacity, 0, 255) / 255.0,
+                IsHitTestVisible = false
+            };
+            if (layer.Type == "rectangle")
+            {
+                int Resolve(string binding, int fallback) => binding switch
+                {
+                    "away.primaryColor" => away.PrimaryColor,
+                    "away.secondaryColor" => away.SecondaryColor,
+                    "home.primaryColor" => home.PrimaryColor,
+                    "home.secondaryColor" => home.SecondaryColor,
+                    "violation.teamColor" => Int(ViolationColorBox, 18050),
+                    "stat.teamColor" => away.PrimaryColor,
+                    "stat.primaryColor" => away.PrimaryColor,
+                    "stat.secondaryColor" => away.SecondaryColor,
+                    _ => fallback
+                };
+                int start = Resolve(layer.Fill.StartBinding, layer.Fill.StartColor);
+                int end = Resolve(layer.Fill.EndBinding, layer.Fill.EndColor);
+                border.Background = layer.Fill.Type == "linearGradient"
+                    ? new LinearGradientBrush(PackedBrush(start).Color,
+                        PackedBrush(end).Color,
+                        layer.Fill.Direction == "horizontal" ? 0 : 90)
+                    : PackedBrush(Resolve(layer.Fill.Binding, layer.Fill.Color));
+            }
+            else if (layer.Type == "image")
+            {
+                string? imagePath = ResolveReferenceImagePath(
+                    document.Directory, layer, away, home);
+                if (imagePath is not null && File.Exists(imagePath))
+                {
+                    BitmapImage bitmap = new(new Uri(imagePath, UriKind.Absolute));
+                    ApplyPreviewImage(border, bitmap, layer, away, home);
+                }
+            }
+            else if (layer.Type == "text")
+            {
+                string value = ResolvePreviewBinding(layer.Binding, away, home,
+                    layer.Text);
+                double height = layer.FontHeight > 0 ? layer.FontHeight :
+                    DefaultFontHeight(layer.Binding);
+                TextBlock text = PreviewText(value, height,
+                    PackedBrush(layer.TextColor), layer.Font,
+                    document.Directory, document.Font);
+                text.TextAlignment = layer.Alignment switch
+                {
+                    "left" => TextAlignment.Left,
+                    "right" => TextAlignment.Right,
+                    _ => TextAlignment.Center
+                };
+                text.HorizontalAlignment = HorizontalAlignment.Stretch;
+                border.Child = layer.Overflow == "fit"
+                    ? new Viewbox { Stretch = Stretch.Uniform, Child = text }
+                    : text;
+            }
+            Canvas.SetLeft(border, layer.X);
+            Canvas.SetTop(border, layer.Y);
+            Panel.SetZIndex(border, layer.Z);
+            canvas.Children.Add(border);
+        }
+
+        double stageWidth = PreviewStage.Width;
+        double stageHeight = PreviewStage.Height;
+        double scale = theme.ScaleMode == "uniform"
+            ? Math.Min(stageWidth / Math.Max(1, theme.ReferenceWidth),
+                stageHeight / Math.Max(1, theme.ReferenceHeight))
+            : 1.0;
+        canvas.RenderTransform = new ScaleTransform(scale, scale);
+        double offsetScale = theme.ScaleMode == "uniform" ? scale : 1.0;
+        Canvas.SetLeft(canvas, (stageWidth - theme.ScoreboardWidth * scale) *
+            0.5 + theme.OffsetX * offsetScale);
+        Canvas.SetTop(canvas, theme.OffsetY * offsetScale);
+        canvas.Tag = "additionalPreviewOverlay";
+        Panel.SetZIndex(canvas, theme.OverlayZ);
+        PreviewStage.Children.Add(canvas);
+    }
+
+    private string? ResolveReferenceImagePath(string directory,
+        OverlayElement layer, TeamDefinition away, TeamDefinition home)
+    {
+        string? relative = layer.Binding switch
+        {
+            "away.logo" => away.Logo,
+            "home.logo" => home.Logo,
+            "violation.teamLogo" => Path.Combine("teams",
+                ViolationTeam(away, home).ShortCode + ".png"),
+            "stat.teamLogo" => Path.Combine("teams", away.ShortCode + ".png"),
+            "player.portrait" => Path.Combine("portraits", "LAODOM_.png"),
+            _ => layer.Image
+        };
+        return string.IsNullOrWhiteSpace(relative) ? null : Path.GetFullPath(
+            Path.Combine(directory,
+                relative.Replace('/', Path.DirectorySeparatorChar)));
+    }
+
+    private int ResolvePreviewColor(string binding, int fallback,
+        TeamDefinition away, TeamDefinition home) => binding switch
+    {
+        "away.primaryColor" => away.PrimaryColor,
+        "away.secondaryColor" => away.SecondaryColor,
+        "home.primaryColor" => home.PrimaryColor,
+        "home.secondaryColor" => home.SecondaryColor,
+        "violation.teamColor" => Int(ViolationColorBox, 18050),
+        "stat.teamColor" => away.PrimaryColor,
+        "stat.primaryColor" => away.PrimaryColor,
+        "stat.secondaryColor" => away.SecondaryColor,
+        _ => fallback
+    };
+
+    private void ApplyPreviewImage(Border border, BitmapImage bitmap,
+        OverlayElement layer, TeamDefinition away, TeamDefinition home)
+    {
+        Stretch stretch = layer.ImageFit == "stretch"
+            ? Stretch.Fill : Stretch.Uniform;
+        if (layer.TintEnabled)
+        {
+            border.Background = PackedBrush(ResolvePreviewColor(
+                layer.TintBinding, layer.TintColor, away, home));
+            border.OpacityMask = new ImageBrush(bitmap) { Stretch = stretch };
+        }
+        else
+            border.Child = new Image { Source = bitmap, Stretch = stretch };
+    }
+
     private void RebuildLayerPreview(TeamDefinition away, TeamDefinition home)
     {
         foreach (OverlayElement layer in _theme.Elements.OrderBy(x => x.Z))
@@ -835,6 +1125,9 @@ public partial class MainWindow : Window
                     "home.primaryColor" => home.PrimaryColor,
                     "home.secondaryColor" => home.SecondaryColor,
                     "violation.teamColor" => Int(ViolationColorBox, 18050),
+                    "stat.teamColor" => away.PrimaryColor,
+                    "stat.primaryColor" => away.PrimaryColor,
+                    "stat.secondaryColor" => away.SecondaryColor,
                     _ => fallback
                 };
                 int start = Resolve(layer.Fill.StartBinding, layer.Fill.StartColor);
@@ -852,15 +1145,18 @@ public partial class MainWindow : Window
                     "away.logo" => TeamLogoPath(away),
                     "home.logo" => TeamLogoPath(home),
                     "violation.teamLogo" => ViolationLogoPath(away, home),
+                    "stat.teamLogo" => StatsTeamLogoPath(away),
+                    "player.portrait" => StatsPortraitPath(),
                     _ when _themeDirectory is not null && layer.Image.Length > 0 =>
                         Path.GetFullPath(Path.Combine(_themeDirectory,
                             layer.Image.Replace('/', Path.DirectorySeparatorChar))),
                     _ => null
                 };
                 if (path is not null && File.Exists(path))
-                    border.Child = new Image { Source = new BitmapImage(
-                        new Uri(path, UriKind.Absolute)), Stretch =
-                        layer.ImageFit == "stretch" ? Stretch.Fill : Stretch.Uniform };
+                {
+                    BitmapImage bitmap = new(new Uri(path, UriKind.Absolute));
+                    ApplyPreviewImage(border, bitmap, layer, away, home);
+                }
             }
             else
             {
@@ -870,6 +1166,8 @@ public partial class MainWindow : Window
                     DefaultFontHeight(layer.Binding);
                 TextBlock text = PreviewText(value, height,
                     PackedBrush(layer.TextColor), layer.Font);
+                ApplyTextTransform(text, value, layer.TextTransform,
+                    layer.SmallCapsScale);
                 text.TextAlignment = layer.Alignment switch
                 {
                     "left" => TextAlignment.Left,
@@ -906,6 +1204,14 @@ public partial class MainWindow : Window
         "violation.title" => ViolationTitleBox.Text,
         "violation.possession" => ViolationPossessionBox.Text,
         "violation.teamName" => ViolationTeam(away, home).TeamName,
+        "player.firstName" => "Lamar",
+        "player.lastName" => "Odom",
+        "player.fullName" => "Lamar Odom",
+        "stat.label1" => "Personal Fouls",
+        "stat.value1" => "1",
+        "stat.label2" => "Team",
+        "stat.value2" => "1",
+        "stat.teamName" => away.TeamName,
         _ => fallback
     };
 
@@ -919,6 +1225,9 @@ public partial class MainWindow : Window
         "away.bonus" or "home.bonus" => _font.BonusHeight,
         "violation.title" => _font.ScoreHeight,
         "violation.possession" or "violation.teamName" => _font.TeamNameHeight,
+        "player.firstName" or "player.lastName" or "player.fullName" or
+        "stat.label1" or "stat.value1" or "stat.label2" or
+        "stat.value2" or "stat.teamName" => _font.TeamNameHeight,
         _ => _font.TeamNameHeight
     };
 
@@ -938,6 +1247,20 @@ public partial class MainWindow : Window
         TeamDefinition team = ViolationTeam(away, home);
         if (string.IsNullOrWhiteSpace(team.ShortCode)) return null;
         return Path.Combine(_themeDirectory, "teams", team.ShortCode + ".png");
+    }
+
+    private string? StatsTeamLogoPath(TeamDefinition team)
+    {
+        if (_themeDirectory is null || string.IsNullOrWhiteSpace(team.ShortCode))
+            return null;
+        return Path.Combine(_themeDirectory, "teams", team.ShortCode + ".png");
+    }
+
+    private string? StatsPortraitPath()
+    {
+        if (_themeDirectory is null) return null;
+        string path = Path.Combine(_themeDirectory, "portraits", "LAODOM_.png");
+        return File.Exists(path) ? path : null;
     }
 
     private void UpdatePreviewStage()
@@ -1114,16 +1437,25 @@ public partial class MainWindow : Window
             ? preset : null;
 
     private FontFamily GetPreviewFontFamily(string? fontId = null)
+        => GetPreviewFontFamily(fontId, _themeDirectory, _font);
+
+    private static FontDefinition? FontPreset(PopupFontTheme font,
+        string? fontId) => !string.IsNullOrWhiteSpace(fontId) &&
+        font.Fonts.TryGetValue(fontId, out FontDefinition? preset)
+            ? preset : null;
+
+    private static FontFamily GetPreviewFontFamily(string? fontId,
+        string? themeDirectory, PopupFontTheme font)
     {
         try
         {
-            FontDefinition? preset = FontPreset(fontId);
-            string fontFile = preset?.FontFile ?? _font.FontFile;
-            string fontFace = preset?.FontFace ?? _font.FontFace;
-            if (_themeDirectory is not null &&
+            FontDefinition? preset = FontPreset(font, fontId);
+            string fontFile = preset?.FontFile ?? font.FontFile;
+            string fontFace = preset?.FontFace ?? font.FontFace;
+            if (themeDirectory is not null &&
                 !string.IsNullOrWhiteSpace(fontFile))
             {
-                string fontPath = Path.GetFullPath(Path.Combine(_themeDirectory,
+                string fontPath = Path.GetFullPath(Path.Combine(themeDirectory,
                     fontFile.Replace('/', Path.DirectorySeparatorChar)));
                 if (File.Exists(fontPath))
                 {
@@ -1135,17 +1467,21 @@ public partial class MainWindow : Window
             }
         }
         catch { }
-        try { return new FontFamily(FontPreset(fontId)?.FontFace ?? _font.FontFace); }
+        try { return new FontFamily(FontPreset(font, fontId)?.FontFace ?? font.FontFace); }
         catch { return new FontFamily("Arial"); }
     }
 
     private TextBlock PreviewText(string text, double height, Brush brush,
         string? fontId = null)
+        => PreviewText(text, height, brush, fontId, _themeDirectory, _font);
+
+    private static TextBlock PreviewText(string text, double height, Brush brush,
+        string? fontId, string? themeDirectory, PopupFontTheme font)
     {
-        FontDefinition? preset = FontPreset(fontId);
-        FontFamily family = GetPreviewFontFamily(fontId);
+        FontDefinition? preset = FontPreset(font, fontId);
+        FontFamily family = GetPreviewFontFamily(fontId, themeDirectory, font);
         FontWeight weight = FontWeight.FromOpenTypeWeight(
-            Math.Clamp(preset?.FontWeight ?? _font.FontWeight, 1, 999));
+            Math.Clamp(preset?.FontWeight ?? font.FontWeight, 1, 999));
 
         // PopupFont.cpp renders a GDI atlas relative to tmHeight + four
         // padding pixels. WPF FontSize is an em size, so using `height`
@@ -1160,7 +1496,7 @@ public partial class MainWindow : Window
             if (typeface.TryGetGlyphTypeface(out GlyphTypeface glyph))
             {
                 double sourceHeight = Math.Max(1,
-                    preset?.FontSourceHeight ?? _font.FontSourceHeight);
+                    preset?.FontSourceHeight ?? font.FontSourceHeight);
                 double atlasLineRatio = glyph.Height + 4.0 / sourceHeight;
                 if (atlasLineRatio > 0)
                     previewFontSize = height / atlasLineRatio;
@@ -1181,6 +1517,44 @@ public partial class MainWindow : Window
             IsHitTestVisible = false
         };
         return block;
+    }
+
+    private static string TransformText(string value, string transform)
+    {
+        if (transform == "uppercase") return value.ToUpperInvariant();
+        if (transform == "lowercase") return value.ToLowerInvariant();
+        if (transform != "capitalize") return value;
+        bool wordStart = true;
+        char[] result = value.ToCharArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            result[i] = wordStart ? char.ToUpperInvariant(result[i]) :
+                char.ToLowerInvariant(result[i]);
+            wordStart = !char.IsLetterOrDigit(value[i]);
+        }
+        return new string(result);
+    }
+
+    private static void ApplyTextTransform(TextBlock block, string value,
+        string transform, double smallCapsScale)
+    {
+        if (transform != "smallCaps")
+        {
+            block.Text = TransformText(value, transform);
+            return;
+        }
+        block.Text = "";
+        double fullSize = block.FontSize;
+        double reducedSize = fullSize * Math.Clamp(smallCapsScale, 0.1, 1.0);
+        foreach (char c in value)
+        {
+            bool reduced = char.IsLower(c);
+            block.Inlines.Add(new Run(char.ToUpperInvariant(c).ToString())
+            {
+                FontSize = reduced ? reducedSize : fullSize,
+                BaselineAlignment = BaselineAlignment.Baseline
+            });
+        }
     }
 
     private Border CreateBorder(string prefix)
@@ -1332,11 +1706,16 @@ public partial class MainWindow : Window
         ElementFontCombo.Text = layer.Font;
         ElementImageBox.Text = layer.Image;
         ElementImageFitCombo.SelectedItem = layer.ImageFit;
+        ElementTintEnabledCheck.IsChecked = layer.TintEnabled;
+        ElementTintBindingBox.Text = layer.TintBinding;
+        ElementTintColorBox.Text = layer.TintColor.ToString();
         ElementOpacityBox.Text = layer.Opacity.ToString();
         ElementVisibleCheck.IsChecked = layer.Visible;
         ElementLockedCheck.IsChecked = layer.Locked;
         ElementAlignmentCombo.SelectedItem = layer.Alignment;
         ElementOverflowCombo.SelectedItem = layer.Overflow;
+        ElementTextTransformCombo.SelectedItem = layer.TextTransform;
+        ElementSmallCapsScaleBox.Text = layer.SmallCapsScale.ToString("0.##");
         ElementFontHeightBox.Text = layer.FontHeight.ToString("0.##");
         ElementTextColorBox.Text = layer.TextColor.ToString();
         ElementFillTypeCombo.SelectedItem = layer.Fill.Type;
@@ -1366,11 +1745,17 @@ public partial class MainWindow : Window
             layer.Font = ElementFontCombo.Text.Trim();
             layer.Image = ElementImageBox.Text.Trim();
             layer.ImageFit = ElementImageFitCombo.SelectedItem as string ?? "contain";
+            layer.TintEnabled = ElementTintEnabledCheck.IsChecked == true;
+            layer.TintBinding = ElementTintBindingBox.Text.Trim();
+            layer.TintColor = Int(ElementTintColorBox, layer.TintColor);
             layer.Opacity = Math.Clamp(Int(ElementOpacityBox, layer.Opacity), 0, 255);
             layer.Visible = ElementVisibleCheck.IsChecked == true;
             layer.Locked = ElementLockedCheck.IsChecked == true;
             layer.Alignment = ElementAlignmentCombo.SelectedItem as string ?? "center";
             layer.Overflow = ElementOverflowCombo.SelectedItem as string ?? "overflow";
+            layer.TextTransform = ElementTextTransformCombo.SelectedItem as string ?? "none";
+            layer.SmallCapsScale = Math.Clamp(
+                Double(ElementSmallCapsScaleBox, layer.SmallCapsScale), 0.1, 1.0);
             layer.FontHeight = Double(ElementFontHeightBox, layer.FontHeight);
             layer.TextColor = Int(ElementTextColorBox, layer.TextColor);
             layer.Fill.Type = ElementFillTypeCombo.SelectedItem as string ?? "solid";
@@ -1449,6 +1834,7 @@ public partial class MainWindow : Window
         {
             layer.Image = "images/image.png";
             layer.ImageFit = "contain";
+            layer.TintColor = 16777215;
         }
         _theme.Elements.Add(layer); _selectedPrefix = id;
         RefreshLayerLists(); RebuildPreview();

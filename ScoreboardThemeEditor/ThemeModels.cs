@@ -13,6 +13,7 @@ public sealed class ScoreboardTheme
     public double OffsetY { get; set; } = 18;
     public double ScoreboardWidth { get; set; } = 620;
     public double ScoreboardHeight { get; set; } = 68;
+    public int OverlayZ { get; set; } = 10;
     public int BackgroundColor { get; set; } = 987672;
     public int BackgroundAlpha { get; set; } = 232;
     public bool ShowBackgroundImage { get; set; }
@@ -122,8 +123,13 @@ public sealed class OverlayElement
     public bool Visible { get; set; } = true;
     public bool Locked { get; set; }
     public string ImageFit { get; set; } = "";
+    public bool TintEnabled { get; set; }
+    public string TintBinding { get; set; } = "";
+    public int TintColor { get; set; } = 16777215;
     public string Alignment { get; set; } = "center";
     public string Overflow { get; set; } = "overflow";
+    public string TextTransform { get; set; } = "none";
+    public double SmallCapsScale { get; set; } = 0.75;
     public double FontHeight { get; set; }
     public int TextColor { get; set; } = 16777215;
     public int Opacity { get; set; } = 255;
