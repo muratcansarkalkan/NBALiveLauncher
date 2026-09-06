@@ -6,7 +6,7 @@ using namespace plugin;
 
 void EnableWindowed();
 void InitializeShotClock();
-
+void InitializeStartupTeams();
 void NBAResolution0508() {
     switch (FM::GetEntryPoint()) {
     case 0xCD8005: // NBA Live 2005 1.0 NOCD
@@ -34,5 +34,6 @@ public:
         NBAResolution0508();
         EnableWindowed();
         InitializeShotClock();
+        InitializeStartupTeams();
     }
 } g_nbaLiveLauncher;

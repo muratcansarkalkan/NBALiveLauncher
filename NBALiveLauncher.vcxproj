@@ -117,6 +117,7 @@ xcopy /y "$(TargetDir)$(TargetName).pdb" "C:\Games\NBA LIVE 08\plugins" </Comman
     <ClCompile Include="ScoreboardRenderer.cpp" />
     <ClCompile Include="ShotClock.cpp" />
     <ClCompile Include="ShotClockGames.cpp" />
+    <ClCompile Include="StartupTeams.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AdjustWSUI.h" />
