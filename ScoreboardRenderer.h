@@ -31,6 +31,11 @@ struct Frame {
     const char* violationTeamName;
     D3DCOLOR violationTeamColor;
     IDirect3DTexture9* violationTeamLogo;
+    const char* playCallTeam;
+    const char* playCallName;
+    D3DCOLOR playCallTeamColor;
+    const char* playCallValues[4];
+    const char* introValues[15];
     const char* playerFirstName;
     const char* playerLastName;
     const char* statLabel1;
@@ -50,6 +55,12 @@ struct Frame {
 void Render(IDirect3DDevice9* device, const Frame& frame,
             const char* overlayName);
 void RenderViolation(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity);
+void RenderPlayCall(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity);
+void RenderIntro(IDirect3DDevice9* device, const Frame& frame,
     const char* overlayName, float animationOffsetX,
     float animationOffsetY, float animationOpacity);
 void RenderPlayerFoul(IDirect3DDevice9* device, const Frame& frame,

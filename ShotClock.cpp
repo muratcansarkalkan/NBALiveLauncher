@@ -140,6 +140,34 @@ ViolationState g_violation = {};
 bool g_violationPresentationSuppressed = false;
 DWORD g_violationTransitionHiddenAt = 0;
 
+struct PlayCallState {
+    char team[96];
+    char call[128];
+    char rawColor[32];
+    char extra[128];
+    D3DCOLOR teamColor;
+    unsigned int payloadHash;
+    DWORD startedAt;
+    bool active;
+};
+
+PlayCallState g_playCall = {};
+bool g_playCallPresentationSuppressed = false;
+DWORD g_playCallTransitionHiddenAt = 0;
+bool g_playCallLayoutAvailable = false;
+
+struct IntroState {
+    char values[15][128];
+    unsigned int payloadHash;
+    DWORD startedAt;
+    bool active;
+};
+
+IntroState g_intro = {};
+bool g_introLayoutAvailable = false;
+bool g_introPresentationSuppressed = false;
+DWORD g_introTransitionHiddenAt = 0;
+
 struct PlayerFoulState {
     char firstName[64];
     char lastName[64];
@@ -218,6 +246,8 @@ char g_customOverlayIniPath[MAX_PATH] = {};
 char g_customOverlayScoreboardPath[MAX_PATH] = {};
 
 StoreOverlayDataFn g_originalViolationDataStore = nullptr;
+StoreOverlayDataFn g_originalPlayCallDataStore = nullptr;
+StoreOverlayDataFn g_originalIntroDataStore = nullptr;
 StoreOverlayDataFn g_originalStatsDataStore = nullptr;
 StatsRequestFn g_originalStatsRequest = nullptr;
 
@@ -225,6 +255,19 @@ bool __stdcall SuppressNativeViolationRequest(void*)
 {
     // Matches sub_55B020's one stack argument and returns AL=1 so
     // sub_597270 continues into its normal payload-storage branch.
+    return true;
+}
+
+bool __stdcall SuppressNativePlayCallRequest(void*)
+{
+    // All four builders use the same one-argument request convention as the
+    // violation builder. Success keeps their normal payload-store path alive.
+    return true;
+}
+
+bool __stdcall SuppressNativeIntroRequest(void*)
+{
+    // Keep the builder's success path alive without creating overlays~intro.big.
     return true;
 }
 
@@ -476,6 +519,92 @@ void __fastcall HookViolationDataStore(
     // instance is being requested. This keeps event bookkeeping intact.
     if (g_originalViolationDataStore)
         g_originalViolationDataStore(thisPtr, vector);
+}
+
+void CapturePlayCallPayload(DWORD* vector)
+{
+    if (!g_customOverlayEnabled || !g_playCallLayoutAvailable || !vector)
+        return;
+    __try {
+        const int count = static_cast<int>(vector[3]);
+        const BBallString* values = reinterpret_cast<const BBallString*>(
+            vector[0]);
+        if (count != 4 || !values || !values[1].sharedstring ||
+            !*values[1].sharedstring) return;
+        const unsigned int hash = HashOverlayPayload(2, values, count);
+        if (g_playCall.active && g_playCall.payloadHash == hash) return;
+        CopyText(g_playCall.team, sizeof(g_playCall.team),
+            values[0].sharedstring);
+        CopyText(g_playCall.call, sizeof(g_playCall.call),
+            values[1].sharedstring);
+        CopyText(g_playCall.rawColor, sizeof(g_playCall.rawColor),
+            values[2].sharedstring);
+        CopyText(g_playCall.extra, sizeof(g_playCall.extra),
+            values[3].sharedstring);
+        g_playCall.teamColor = ParsePackedColor(values[2].sharedstring,
+            D3DCOLOR_XRGB(40, 40, 40));
+        g_playCall.payloadHash = hash;
+        g_playCall.startedAt = GetTickCount();
+        g_playCall.active = true;
+        if (g_playCallPresentationSuppressed)
+            g_playCallTransitionHiddenAt = g_playCall.startedAt;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_playCall.active = false;
+    }
+}
+
+void __fastcall HookPlayCallDataStore(void* thisPtr, void*, DWORD* vector)
+{
+    CapturePlayCallPayload(vector);
+    if (g_originalPlayCallDataStore)
+        g_originalPlayCallDataStore(thisPtr, vector);
+}
+
+void CaptureIntroPayload(DWORD* vector)
+{
+    if (!g_customOverlayEnabled || !g_introLayoutAvailable || !vector)
+        return;
+    __try {
+        const int count = static_cast<int>(vector[3]);
+        const BBallString* values = reinterpret_cast<const BBallString*>(vector[0]);
+        if (count != 15 || !values || !values[0].sharedstring ||
+            !*values[0].sharedstring) return;
+        const unsigned int hash = HashOverlayPayload(3, values, count);
+        // GetOverlayData may expose the same stored intro repeatedly after the
+        // animation has completed. Do not create a new presentation merely
+        // because the previous instance is no longer active.
+        if (g_intro.payloadHash == hash) return;
+        for (int i = 0; i < 15; ++i)
+            CopyText(g_intro.values[i], sizeof(g_intro.values[i]),
+                values[i].sharedstring);
+        g_intro.payloadHash = hash;
+        g_intro.startedAt = GetTickCount();
+        g_intro.active = true;
+        // A new accepted payload is a new presentation instance. Do not let a
+        // stale HideOverlays/pause flag from the preceding game suppress it.
+        g_introPresentationSuppressed = false;
+        g_introTransitionHiddenAt = 0;
+        CaptureBroadcastIdentity(3, values, count);
+        AppendDiagnostic(
+            "Intro accepted: homeHeading=%s away=%s %s record=%s "
+            "home=%s %s record=%s arena=%s location=%s "
+            "awayCode=%s homeCode=%s league=%s.\n",
+            g_intro.values[0], g_intro.values[1], g_intro.values[2],
+            g_intro.values[3], g_intro.values[4], g_intro.values[5],
+            g_intro.values[6], g_intro.values[8], g_intro.values[9],
+            g_intro.values[12], g_intro.values[13], g_intro.values[14]);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_intro.active = false;
+    }
+}
+
+void __fastcall HookIntroDataStore(void* thisPtr, void*, DWORD* vector)
+{
+    CaptureIntroPayload(vector);
+    if (g_originalIntroDataStore)
+        g_originalIntroDataStore(thisPtr, vector);
 }
 
 const char* GetKnownStatSubtypeName(DWORD control18, DWORD control1C)
@@ -1094,23 +1223,35 @@ int __cdecl HookSendEvent(
             g_violation.paused = false;
             g_violation.pausedAt = 0;
             g_violationTransitionHiddenAt = 0;
+            g_playCallPresentationSuppressed = true;
+            g_playCall.active = false;
+            g_playCallTransitionHiddenAt = 0;
             g_playerFoulPresentationSuppressed = true;
             g_playerFoul.active = false;
             g_playerFoulTransitionHiddenAt = 0;
             g_genericStatPresentationSuppressed = true;
             g_genericStat.active = false;
             g_genericStatTransitionHiddenAt = 0;
+            g_introPresentationSuppressed = true;
+            g_intro.active = false;
+            g_introTransitionHiddenAt = 0;
         }
         else if (std::strcmp(name, "HideOverlaysEvent") == 0) {
             if (!g_violationPresentationSuppressed && g_violation.active)
                 g_violationTransitionHiddenAt = GetTickCount();
             g_violationPresentationSuppressed = true;
+            if (!g_playCallPresentationSuppressed && g_playCall.active)
+                g_playCallTransitionHiddenAt = GetTickCount();
+            g_playCallPresentationSuppressed = true;
             if (!g_playerFoulPresentationSuppressed && g_playerFoul.active)
                 g_playerFoulTransitionHiddenAt = GetTickCount();
             g_playerFoulPresentationSuppressed = true;
             if (!g_genericStatPresentationSuppressed && g_genericStat.active)
                 g_genericStatTransitionHiddenAt = GetTickCount();
             g_genericStatPresentationSuppressed = true;
+            if (!g_introPresentationSuppressed && g_intro.active)
+                g_introTransitionHiddenAt = GetTickCount();
+            g_introPresentationSuppressed = true;
         }
         else if (std::strcmp(name, "ShowOverlaysEvent") == 0) {
             if (g_violationPresentationSuppressed && g_violation.active &&
@@ -1120,6 +1261,12 @@ int __cdecl HookSendEvent(
             }
             g_violationPresentationSuppressed = false;
             g_violationTransitionHiddenAt = 0;
+            if (g_playCallPresentationSuppressed && g_playCall.active &&
+                g_playCallTransitionHiddenAt)
+                g_playCall.startedAt +=
+                    GetTickCount() - g_playCallTransitionHiddenAt;
+            g_playCallPresentationSuppressed = false;
+            g_playCallTransitionHiddenAt = 0;
             if (g_playerFoulPresentationSuppressed && g_playerFoul.active &&
                 g_playerFoulTransitionHiddenAt)
                 g_playerFoul.startedAt +=
@@ -1132,16 +1279,25 @@ int __cdecl HookSendEvent(
                     GetTickCount() - g_genericStatTransitionHiddenAt;
             g_genericStatPresentationSuppressed = false;
             g_genericStatTransitionHiddenAt = 0;
+            if (g_introPresentationSuppressed && g_intro.active &&
+                g_introTransitionHiddenAt)
+                g_intro.startedAt += GetTickCount() - g_introTransitionHiddenAt;
+            g_introPresentationSuppressed = false;
+            g_introTransitionHiddenAt = 0;
         }
         else if (resumeEvent) {
             // A pause killed the previous instance; resume merely allows the
             // next native violation request to create a new custom one.
             g_violationPresentationSuppressed = false;
             g_violationTransitionHiddenAt = 0;
+            g_playCallPresentationSuppressed = false;
+            g_playCallTransitionHiddenAt = 0;
             g_playerFoulPresentationSuppressed = false;
             g_playerFoulTransitionHiddenAt = 0;
             g_genericStatPresentationSuppressed = false;
             g_genericStatTransitionHiddenAt = 0;
+            g_introPresentationSuppressed = false;
+            g_introTransitionHiddenAt = 0;
         }
 
         const bool freezeViolation =
@@ -1265,6 +1421,8 @@ DWORD __fastcall HookGetOverlayData(
     const DWORD result = original(thisPtr, outputVector, type);
     if (type == 1)
         CaptureViolationPayload(reinterpret_cast<DWORD*>(outputVector));
+    else if (type == 3)
+        CaptureIntroPayload(reinterpret_cast<DWORD*>(outputVector));
     LogOverlayPayload(type, reinterpret_cast<DWORD*>(outputVector));
     // Fouls, timeouts, substitutions and other presentation state can change
     // between whole-second score-clock events.
@@ -1282,6 +1440,7 @@ bool RefreshRealtimeScoreboardState()
         GdInfoCentral* info = GetGdInfoCentral();
         GdAI* gdAI = GetGdAI();
         if (!info || !gdAI || !IsGameClockValid(gdAI)) {
+            const bool previousGameHadStarted = g_gameplayStarted;
             g_gameplayStarted = false;
             g_seenIntroOverlayHide = false;
             g_scoreboardVisible = false;
@@ -1297,6 +1456,16 @@ bool RefreshRealtimeScoreboardState()
             g_visibilityPreviousHomeScore = INT_MIN;
             g_visibilityLastTick = 0;
             g_scoreboardShowRemaining = 0;
+            // Clear payload identity only when a running game has genuinely
+            // ended. During the pregame intro the clock is also invalid, so
+            // clearing it unconditionally would allow GetOverlayData to replay
+            // the same intro several times.
+            if (previousGameHadStarted) {
+                g_intro.payloadHash = 0;
+                g_intro.active = false;
+                g_introPresentationSuppressed = false;
+                g_introTransitionHiddenAt = 0;
+            }
             return false;
         }
 
@@ -1741,12 +1910,120 @@ void RenderGenericStatOverlay(IDirect3DDevice9* device)
         x, y, opacity);
 }
 
+void RenderPlayCallOverlay(IDirect3DDevice9* device)
+{
+    if (!g_customOverlayEnabled || !g_playCallLayoutAvailable ||
+        !g_playCall.active || g_playCallPresentationSuppressed || !device)
+        return;
+    const scoreboardconfig::Config& config = scoreboardconfig::GetPlayCall();
+    const DWORD elapsed = GetTickCount() - g_playCall.startedAt;
+    const DWORD enterEnd = config.enterMilliseconds;
+    const DWORD holdEnd = enterEnd + config.holdMilliseconds;
+    const DWORD total = holdEnd + config.exitMilliseconds;
+    if (elapsed >= total) { g_playCall.active = false; return; }
+
+    float x = 0.0f, y = 0.0f, opacity = 1.0f;
+    if (elapsed < enterEnd && enterEnd > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed) / enterEnd);
+        if (_stricmp(config.enterAnimation, "slide") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0) {
+            x = config.enterFromX * (1.0f - p);
+            y = config.enterFromY * (1.0f - p);
+        }
+        if (_stricmp(config.enterAnimation, "fade") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0)
+            opacity = p;
+    }
+    else if (elapsed >= holdEnd && config.exitMilliseconds > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed - holdEnd) /
+            config.exitMilliseconds);
+        if (_stricmp(config.exitAnimation, "slide") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0) {
+            x = config.exitToX * p;
+            y = config.exitToY * p;
+        }
+        if (_stricmp(config.exitAnimation, "fade") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0)
+            opacity = 1.0f - p;
+    }
+
+    scoreboard::Frame frame = {};
+    frame.playCallTeam = g_playCall.team;
+    frame.playCallName = g_playCall.call;
+    frame.playCallTeamColor = g_playCall.teamColor;
+    frame.playCallValues[0] = g_playCall.team;
+    frame.playCallValues[1] = g_playCall.call;
+    frame.playCallValues[2] = g_playCall.rawColor;
+    frame.playCallValues[3] = g_playCall.extra;
+    scoreboard::RenderPlayCall(device, frame, g_customOverlayName,
+        x, y, opacity);
+}
+
+void RenderIntroOverlay(IDirect3DDevice9* device)
+{
+    if (!g_customOverlayEnabled || !g_intro.active ||
+        g_introPresentationSuppressed || !device) return;
+    scoreboardconfig::LoadIntro(g_customOverlayName);
+    const scoreboardconfig::Config& config = scoreboardconfig::GetIntro();
+    const DWORD elapsed = GetTickCount() - g_intro.startedAt;
+    const DWORD enterEnd = config.enterMilliseconds;
+    const DWORD holdEnd = enterEnd + config.holdMilliseconds;
+    const DWORD total = holdEnd + config.exitMilliseconds;
+    if (elapsed >= total) { g_intro.active = false; return; }
+
+    float x = 0.0f, y = 0.0f, opacity = 1.0f;
+    if (elapsed < enterEnd && enterEnd > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed) / enterEnd);
+        if (_stricmp(config.enterAnimation, "slide") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0) {
+            x = config.enterFromX * (1.0f - p);
+            y = config.enterFromY * (1.0f - p);
+        }
+        if (_stricmp(config.enterAnimation, "fade") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0)
+            opacity = p;
+    }
+    else if (elapsed >= holdEnd && config.exitMilliseconds > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed - holdEnd) /
+            config.exitMilliseconds);
+        if (_stricmp(config.exitAnimation, "slide") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0) {
+            x = config.exitToX * p;
+            y = config.exitToY * p;
+        }
+        if (_stricmp(config.exitAnimation, "fade") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0)
+            opacity = 1.0f - p;
+    }
+
+    scoreboard::Frame frame = {};
+    for (int i = 0; i < 15; ++i)
+        frame.introValues[i] = g_intro.values[i];
+    popup::Load(g_customOverlayName);
+    const popup::TeamVisual* away = popup::FindTeamByShortCode(
+        g_intro.values[12]);
+    const popup::TeamVisual* home = popup::FindTeamByShortCode(
+        g_intro.values[13]);
+    frame.awayColor = away ? away->primaryColor : g_broadcast.awayColor;
+    frame.homeColor = home ? home->primaryColor : g_broadcast.homeColor;
+    frame.awaySecondaryColor = away ? away->secondaryColor : frame.awayColor;
+    frame.homeSecondaryColor = home ? home->secondaryColor : frame.homeColor;
+    frame.awayLogo = away ? popup::GetLogoTexture(device,
+        away->databaseTeamID) : nullptr;
+    frame.homeLogo = home ? popup::GetLogoTexture(device,
+        home->databaseTeamID) : nullptr;
+    scoreboard::RenderIntro(device, frame, g_customOverlayName,
+        x, y, opacity);
+}
+
 using OverlayRenderFn = void (*)(IDirect3DDevice9*);
 
 void RenderConfiguredOverlays(IDirect3DDevice9* device)
 {
     scoreboardconfig::Load(g_customOverlayName);
     scoreboardconfig::LoadViolation(g_customOverlayName);
+    scoreboardconfig::LoadPlayCall(g_customOverlayName);
+    scoreboardconfig::LoadIntro(g_customOverlayName);
     scoreboardconfig::LoadPlayerFoul(g_customOverlayName);
 
     struct RenderEntry {
@@ -1758,9 +2035,13 @@ void RenderConfiguredOverlays(IDirect3DDevice9* device)
         { scoreboardconfig::Get().overlayZ, 0, &RenderNativeScoreboard },
         { scoreboardconfig::GetViolation().overlayZ, 1,
             &RenderViolationOverlay },
-        { scoreboardconfig::GetPlayerFoul().overlayZ, 2,
+        { scoreboardconfig::GetPlayCall().overlayZ, 2,
+            &RenderPlayCallOverlay },
+        { scoreboardconfig::GetIntro().overlayZ, 5,
+            &RenderIntroOverlay },
+        { scoreboardconfig::GetPlayerFoul().overlayZ, 3,
             &RenderPlayerFoulOverlay },
-        { scoreboardconfig::GetStat().overlayZ, 3,
+        { scoreboardconfig::GetStat().overlayZ, 4,
             &RenderGenericStatOverlay }
     };
     const int count = sizeof(entries) / sizeof(entries[0]);
@@ -1798,6 +2079,10 @@ void CheckPopupHotReload(IDirect3DDevice9* device)
         const bool scoreboardLoaded = scoreboardconfig::Reload(g_customOverlayName);
         const bool violationLoaded = scoreboardconfig::ReloadViolation(
             g_customOverlayName);
+        const bool playCallLoaded = scoreboardconfig::ReloadPlayCall(
+            g_customOverlayName);
+        const bool introLoaded = scoreboardconfig::ReloadIntro(
+            g_customOverlayName);
         const bool playerFoulLoaded = scoreboardconfig::ReloadPlayerFoul(
             g_customOverlayName);
         const bool genericStatLoaded = scoreboardconfig::ReloadStat(
@@ -1805,20 +2090,28 @@ void CheckPopupHotReload(IDirect3DDevice9* device)
             g_genericStat.playerPayload, g_genericStat.valueCase);
         g_playerFoulLayoutAvailable = playerFoulLoaded &&
             g_statsRequestHookInstalled;
+        g_playCallLayoutAvailable = playCallLoaded &&
+            g_originalPlayCallDataStore != nullptr;
+        g_introLayoutAvailable = introLoaded &&
+            g_originalIntroDataStore != nullptr;
+        if (!playCallLoaded) g_playCall.active = false;
+        if (!introLoaded) g_intro.active = false;
         if (!playerFoulLoaded) g_playerFoul.active = false;
         if (!genericStatLoaded) g_genericStat.active = false;
         g_loggedAwayLogoTeam = INT_MIN;
         g_loggedHomeLogoTeam = INT_MIN;
         g_loggedStatTeamCode[0] = '\0';
         AppendDiagnostic(
-            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s playerFoul=%s stat=%s error=%s\n",
+            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s playCall=%s intro=%s playerFoul=%s stat=%s error=%s\n",
             themeLoaded ? "OK" : "FAILED",
             fontLoaded ? "OK" : "FAILED",
             scoreboardLoaded ? "OK" : "FAILED",
             violationLoaded ? "OK" : "FAILED",
+            playCallLoaded ? "OK" : "FAILED",
+            introLoaded ? "OK" : "FAILED",
             playerFoulLoaded ? "OK" : "FAILED",
             genericStatLoaded ? "OK" : "FAILED",
-            themeLoaded && scoreboardLoaded && violationLoaded &&
+            themeLoaded && scoreboardLoaded && violationLoaded && playCallLoaded && introLoaded &&
                 playerFoulLoaded && genericStatLoaded ? "<none>" :
                 (!themeLoaded ? popup::GetLastError() :
                     scoreboardconfig::GetLastError()));
@@ -2355,6 +2648,94 @@ void Initialize(const GameAddresses& game)
             reinterpret_cast<void*>(&HookGetOverlayData));
         AppendDiagnostic("Redirected GetOverlayData calls: %u\n",
             overlayCalls);
+    }
+
+    // All three FEOverlayIntro builders (primary, alternate and indexed)
+    // request overlays~intro.big and then store the completed 15-value vector.
+    // Only replace those calls when intro.json exists and every call target is
+    // valid. Otherwise the native intro remains completely untouched.
+    if (g_customOverlayEnabled) {
+        const bool introLoaded = scoreboardconfig::LoadIntro(g_customOverlayName);
+        uintptr_t storeDestination = 0;
+        bool valid = introLoaded;
+        for (int i = 0; i < 3; ++i) {
+            const uintptr_t requestTarget = GetDirectCallDestination(
+                game.introRequestCalls[i]);
+            const uintptr_t currentStoreTarget = GetDirectCallDestination(
+                game.introDataStoreCalls[i]);
+            if (!requestTarget || !currentStoreTarget ||
+                (storeDestination && storeDestination != currentStoreTarget))
+                valid = false;
+            if (!storeDestination) storeDestination = currentStoreTarget;
+        }
+        if (!valid) {
+            AppendDiagnostic(
+                "Intro custom overlay unavailable; native retained: "
+                "layout=%s calls=%s.\n",
+                introLoaded ? "yes" : "no", valid ? "valid" : "invalid");
+        }
+        else {
+            g_originalIntroDataStore =
+                reinterpret_cast<StoreOverlayDataFn>(storeDestination);
+            for (int i = 0; i < 3; ++i) {
+                // The indexed builder also drives the game's native player
+                // introductions. Keep its movie request intact until custom
+                // starting-lineup/player-intro layouts are implemented.
+                if (i < 2) {
+                    patch::RedirectCall(
+                        static_cast<unsigned int>(game.introRequestCalls[i]),
+                        reinterpret_cast<void*>(&SuppressNativeIntroRequest));
+                }
+                patch::RedirectCall(
+                    static_cast<unsigned int>(game.introDataStoreCalls[i]),
+                    reinterpret_cast<void*>(&HookIntroDataStore));
+            }
+            g_introLayoutAvailable = true;
+            AppendDiagnostic(
+                "Native match-intro movie requests disabled: stores=%08X; "
+                "primary/alternate requests suppressed, three stores hooked, "
+                "indexed player-introduction request retained.\n",
+                static_cast<unsigned int>(storeDestination));
+        }
+    }
+
+    // FEOverlayPlayCall builders in every supported game first request
+    // overlays~playcall.big and then store the completed four-value vector.
+    // Suppress the movie only when playcall.json is available; otherwise the
+    // game's original graphic remains untouched.
+    if (g_customOverlayEnabled && game.playCallRequestCall &&
+        game.playCallDataStoreCall) {
+        const bool layoutLoaded =
+            scoreboardconfig::LoadPlayCall(g_customOverlayName);
+        const uintptr_t requestDestination = GetDirectCallDestination(
+            game.playCallRequestCall);
+        const uintptr_t storeDestination = GetDirectCallDestination(
+            game.playCallDataStoreCall);
+        if (!layoutLoaded || !requestDestination || !storeDestination) {
+            AppendDiagnostic(
+                "Play-call custom overlay unavailable; native retained: "
+                "layout=%s request=%08X store=%08X.\n",
+                layoutLoaded ? "yes" : "no",
+                static_cast<unsigned int>(game.playCallRequestCall),
+                static_cast<unsigned int>(game.playCallDataStoreCall));
+        }
+        else {
+            patch::RedirectCall(
+                static_cast<unsigned int>(game.playCallRequestCall),
+                reinterpret_cast<void*>(&SuppressNativePlayCallRequest));
+            g_originalPlayCallDataStore =
+                reinterpret_cast<StoreOverlayDataFn>(storeDestination);
+            patch::RedirectCall(
+                static_cast<unsigned int>(game.playCallDataStoreCall),
+                reinterpret_cast<void*>(&HookPlayCallDataStore));
+            g_playCallLayoutAvailable = true;
+            AppendDiagnostic(
+                "Native play-call movie request disabled: "
+                "request=%08X store=%08X target=%08X.\n",
+                static_cast<unsigned int>(game.playCallRequestCall),
+                static_cast<unsigned int>(game.playCallDataStoreCall),
+                static_cast<unsigned int>(storeDestination));
+        }
     }
 
     // FEOverlayStats builders in every supported game converge here after

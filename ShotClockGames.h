@@ -22,6 +22,10 @@ struct GameAddresses {
     uintptr_t getOverlayData;
     uintptr_t violationRequestCall;
     uintptr_t violationDataStoreCall;
+    uintptr_t playCallRequestCall;
+    uintptr_t playCallDataStoreCall;
+    uintptr_t introRequestCalls[3];
+    uintptr_t introDataStoreCalls[3];
     uintptr_t statsDataStore;
     uintptr_t statsRequestCall;
     unsigned int getQuarterSlot;

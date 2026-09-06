@@ -263,6 +263,8 @@ public partial class MainWindow : Window
         _loadingControls = true;
         ScreenCombo.SelectedIndex = screen.Equals("violation",
             StringComparison.OrdinalIgnoreCase) ? 3 :
+            screen.Equals("playcall", StringComparison.OrdinalIgnoreCase) ? 4 :
+            screen.Equals("intro", StringComparison.OrdinalIgnoreCase) ? 2 :
             screen.Equals("stats", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
         SetSubtypeOptions(screen.Equals("stats", StringComparison.OrdinalIgnoreCase));
         _loadingControls = false;
@@ -277,18 +279,23 @@ public partial class MainWindow : Window
         if (!IsLoaded || _loadingControls || _themeDirectory is null) return;
         string? selected = (ScreenCombo.SelectedItem as ComboBoxItem)?.Content
             ?.ToString();
-        if (selected is not ("Scoreboard" or "Violation" or "Stats")) return;
+        if (selected is not ("Scoreboard" or "Violation" or "Stats" or
+            "Playcall" or "Intro")) return;
         SetSubtypeOptions(selected == "Stats");
         string currentScreen = Path.GetFileName(_themeDirectory);
         string packageDirectory = currentScreen.Equals("scoreboard",
                 StringComparison.OrdinalIgnoreCase) ||
             currentScreen.Equals("violation", StringComparison.OrdinalIgnoreCase) ||
+            currentScreen.Equals("playcall", StringComparison.OrdinalIgnoreCase) ||
+            currentScreen.Equals("intro", StringComparison.OrdinalIgnoreCase) ||
             currentScreen.Equals("stats", StringComparison.OrdinalIgnoreCase)
             ? Directory.GetParent(_themeDirectory)?.FullName ?? _themeDirectory
             : _themeDirectory;
         string directoryName = selected.ToLowerInvariant();
         string fileName = selected == "Scoreboard" ? "scoreboard.json" :
-            selected == "Violation" ? "violation.json" : "player.json";
+            selected == "Violation" ? "violation.json" :
+            selected == "Playcall" ? "playcall.json" : "player.json";
+        if (selected == "Intro") fileName = "intro.json";
         if (selected == "Stats" && !File.Exists(Path.Combine(
                 packageDirectory, directoryName, fileName)))
             fileName = "player_foul.json";
@@ -463,6 +470,8 @@ public partial class MainWindow : Window
                 if (screenDirectory.Equals("scoreboard",
                         StringComparison.OrdinalIgnoreCase) ||
                     screenDirectory.Equals("violation",
+                        StringComparison.OrdinalIgnoreCase) ||
+                    screenDirectory.Equals("playcall",
                         StringComparison.OrdinalIgnoreCase) ||
                     screenDirectory.Equals("stats",
                         StringComparison.OrdinalIgnoreCase))
@@ -1066,6 +1075,7 @@ public partial class MainWindow : Window
                     "home.primaryColor" => home.PrimaryColor,
                     "home.secondaryColor" => home.SecondaryColor,
                     "violation.teamColor" => Int(ViolationColorBox, 18050),
+                    "playcall.teamColor" => Int(PlayCallColorBox, 1976394),
                     "stat.teamColor" => away.PrimaryColor,
                     "stat.primaryColor" => away.PrimaryColor,
                     "stat.secondaryColor" => away.SecondaryColor,
@@ -1142,6 +1152,8 @@ public partial class MainWindow : Window
         {
             "away.logo" => away.Logo,
             "home.logo" => home.Logo,
+            "intro.awayLogo" => away.Logo,
+            "intro.homeLogo" => home.Logo,
             "violation.teamLogo" => Path.Combine("teams",
                 ViolationTeam(away, home).ShortCode + ".png"),
             "stat.teamLogo" => Path.Combine("teams", away.ShortCode + ".png"),
@@ -1160,7 +1172,8 @@ public partial class MainWindow : Window
         "away.secondaryColor" => away.SecondaryColor,
         "home.primaryColor" => home.PrimaryColor,
         "home.secondaryColor" => home.SecondaryColor,
-        "violation.teamColor" => Int(ViolationColorBox, 18050),
+            "violation.teamColor" => Int(ViolationColorBox, 18050),
+            "playcall.teamColor" => Int(PlayCallColorBox, 1976394),
         "stat.teamColor" => away.PrimaryColor,
         "stat.primaryColor" => away.PrimaryColor,
         "stat.secondaryColor" => away.SecondaryColor,
@@ -1198,6 +1211,7 @@ public partial class MainWindow : Window
                     "home.primaryColor" => home.PrimaryColor,
                     "home.secondaryColor" => home.SecondaryColor,
                     "violation.teamColor" => Int(ViolationColorBox, 18050),
+                    "playcall.teamColor" => Int(PlayCallColorBox, 1976394),
                     "stat.teamColor" => away.PrimaryColor,
                     "stat.primaryColor" => away.PrimaryColor,
                     "stat.secondaryColor" => away.SecondaryColor,
@@ -1217,6 +1231,8 @@ public partial class MainWindow : Window
                 {
                     "away.logo" => TeamLogoPath(away),
                     "home.logo" => TeamLogoPath(home),
+                    "intro.awayLogo" => TeamLogoPath(away),
+                    "intro.homeLogo" => TeamLogoPath(home),
                     "violation.teamLogo" => ViolationLogoPath(away, home),
                     "stat.teamLogo" => StatsTeamLogoPath(away),
                     "player.portrait" => StatsPortraitPath(),
@@ -1270,9 +1286,30 @@ public partial class MainWindow : Window
         return index >= 0 && index < values.Length ? values[index] : "";
     }
 
+    private string IntroPreviewValue(int index)
+    {
+        string[] values = IntroValuesBox.Text.Split('|');
+        return index >= 0 && index < values.Length ? values[index] : "";
+    }
+
     private string ResolvePreviewBinding(string binding, TeamDefinition away,
         TeamDefinition home, string fallback)
     {
+        const string playCallRawPrefix = "playcall.raw";
+        if (binding.StartsWith(playCallRawPrefix,
+                StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(binding[playCallRawPrefix.Length..],
+                out int playCallRawIndex))
+        {
+            return playCallRawIndex switch
+            {
+                0 => PlayCallTeamBox.Text,
+                1 => PlayCallNameBox.Text,
+                2 => PlayCallColorBox.Text,
+                3 => "",
+                _ => fallback
+            };
+        }
         const string rawPrefix = "stat.raw";
         if (binding.StartsWith(rawPrefix, StringComparison.OrdinalIgnoreCase) &&
             int.TryParse(binding[rawPrefix.Length..], out int rawIndex) &&
@@ -1280,6 +1317,12 @@ public partial class MainWindow : Window
         {
             return StatPreviewValue(rawIndex);
         }
+        const string introRawPrefix = "intro.raw";
+        if (binding.StartsWith(introRawPrefix,
+                StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(binding[introRawPrefix.Length..], out int introRawIndex) &&
+            introRawIndex >= 0 && introRawIndex < 15)
+            return IntroPreviewValue(introRawIndex);
         return binding switch
         {
         "away.score" => AwayScoreBox.Text, "home.score" => HomeScoreBox.Text,
@@ -1293,6 +1336,23 @@ public partial class MainWindow : Window
         "violation.title" => ViolationTitleBox.Text,
         "violation.possession" => ViolationPossessionBox.Text,
         "violation.teamName" => ViolationTeam(away, home).TeamName,
+        "playcall.team" => PlayCallTeamBox.Text,
+        "playcall.call" => PlayCallNameBox.Text,
+        "intro.homeHeading" => IntroPreviewValue(0),
+        "intro.awayCity" => IntroPreviewValue(1),
+        "intro.awayNickname" => IntroPreviewValue(2),
+        "intro.awayRecord" => IntroPreviewValue(3),
+        "intro.homeCity" => IntroPreviewValue(4),
+        "intro.homeNickname" => IntroPreviewValue(5),
+        "intro.homeRecord" => IntroPreviewValue(6),
+        "intro.liveFromHeading" => IntroPreviewValue(7),
+        "intro.arena" => IntroPreviewValue(8),
+        "intro.location" => IntroPreviewValue(9),
+        "intro.homeNumeric" => IntroPreviewValue(10),
+        "intro.awayNumeric" => IntroPreviewValue(11),
+        "intro.awayTeamCode" => IntroPreviewValue(12),
+        "intro.homeTeamCode" => IntroPreviewValue(13),
+        "intro.leagueCode" => IntroPreviewValue(14),
         "player.firstName" => StatPreviewValue(0),
         "player.lastName" => StatPreviewValue(1),
         "player.fullName" => $"{StatPreviewValue(0)} {StatPreviewValue(1)}".Trim(),
@@ -1315,6 +1375,7 @@ public partial class MainWindow : Window
         "away.bonus" or "home.bonus" => _font.BonusHeight,
         "violation.title" => _font.ScoreHeight,
         "violation.possession" or "violation.teamName" => _font.TeamNameHeight,
+        "playcall.team" or "playcall.call" => _font.TeamNameHeight,
         "player.firstName" or "player.lastName" or "player.fullName" or
         "stat.label1" or "stat.value1" or "stat.label2" or
         "stat.value2" or "stat.teamName" => _font.TeamNameHeight,

@@ -11,16 +11,22 @@ namespace {
 
 Config g_config = {};
 Config g_violationConfig = {};
+Config g_playCallConfig = {};
+Config g_introConfig = {};
 Config g_playerFoulConfig = {};
 Config g_statConfig = {};
 bool g_loaded = false;
 bool g_violationLoaded = false;
+bool g_playCallLoaded = false;
+bool g_introLoaded = false;
 bool g_playerFoulLoaded = false;
 bool g_statLoaded = false;
 bool g_playerFoulAvailable = false;
 bool g_statAvailable = false;
 char g_theme[64] = {};
 char g_violationTheme[64] = {};
+char g_playCallTheme[64] = {};
+char g_introTheme[64] = {};
 char g_playerFoulTheme[64] = {};
 char g_statTheme[64] = {};
 char g_statSubtype[64] = {};
@@ -465,6 +471,8 @@ void Parse(const std::string& json, Config* c)
 
 const Config& Get() { return g_config; }
 const Config& GetViolation() { return g_violationConfig; }
+const Config& GetPlayCall() { return g_playCallConfig; }
+const Config& GetIntro() { return g_introConfig; }
 const Config& GetPlayerFoul() { return g_playerFoulConfig; }
 const Config& GetStat() { return g_statConfig; }
 
@@ -535,6 +543,84 @@ bool ReloadViolation(const char* themeName)
     g_violationLoaded = false;
     g_violationTheme[0] = '\0';
     return LoadViolation(themeName);
+}
+
+bool LoadPlayCall(const char* themeName)
+{
+    if (g_playCallLoaded &&
+        std::strcmp(g_playCallTheme, themeName) == 0) return true;
+    Config next;
+    SetDefaults(&next);
+    next.width = 360.0f;
+    next.height = 64.0f;
+    next.offsetY = 90.0f;
+    next.overlayZ = 25;
+    std::string path = GameDirectory() + "\\popups\\" + themeName +
+        "\\playcall\\playcall.json";
+    std::string json;
+    if (!ReadFile(path.c_str(), &json)) {
+        std::snprintf(g_lastError, sizeof(g_lastError),
+            "Could not read %s", path.c_str());
+        g_playCallConfig = next;
+        g_playCallLoaded = true;
+        std::strncpy(g_playCallTheme, themeName,
+            sizeof(g_playCallTheme) - 1);
+        return false;
+    }
+    Parse(json, &next);
+    g_playCallConfig = next;
+    g_playCallLoaded = true;
+    std::strncpy(g_playCallTheme, themeName,
+        sizeof(g_playCallTheme) - 1);
+    g_playCallTheme[sizeof(g_playCallTheme) - 1] = '\0';
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool ReloadPlayCall(const char* themeName)
+{
+    g_playCallLoaded = false;
+    g_playCallTheme[0] = '\0';
+    return LoadPlayCall(themeName);
+}
+
+bool LoadIntro(const char* themeName)
+{
+    if (g_introLoaded && std::strcmp(g_introTheme, themeName) == 0)
+        return true;
+    Config next;
+    SetDefaults(&next);
+    next.width = 760.0f;
+    next.height = 230.0f;
+    next.offsetY = 120.0f;
+    next.overlayZ = 40;
+    next.holdMilliseconds = 6500;
+    std::string path = GameDirectory() + "\\popups\\" + themeName +
+        "\\intro\\intro.json";
+    std::string json;
+    if (!ReadFile(path.c_str(), &json)) {
+        std::snprintf(g_lastError, sizeof(g_lastError),
+            "Could not read %s", path.c_str());
+        g_introConfig = next;
+        g_introLoaded = true;
+        std::strncpy(g_introTheme, themeName, sizeof(g_introTheme) - 1);
+        g_introTheme[sizeof(g_introTheme) - 1] = '\0';
+        return false;
+    }
+    Parse(json, &next);
+    g_introConfig = next;
+    g_introLoaded = true;
+    std::strncpy(g_introTheme, themeName, sizeof(g_introTheme) - 1);
+    g_introTheme[sizeof(g_introTheme) - 1] = '\0';
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool ReloadIntro(const char* themeName)
+{
+    g_introLoaded = false;
+    g_introTheme[0] = '\0';
+    return LoadIntro(themeName);
 }
 
 bool LoadPlayerFoul(const char* themeName)

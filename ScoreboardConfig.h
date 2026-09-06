@@ -136,12 +136,18 @@ struct Config {
 
 const Config& Get();
 const Config& GetViolation();
+const Config& GetPlayCall();
+const Config& GetIntro();
 const Config& GetPlayerFoul();
 const Config& GetStat();
 bool Load(const char* themeName);
 bool Reload(const char* themeName);
 bool LoadViolation(const char* themeName);
 bool ReloadViolation(const char* themeName);
+bool LoadPlayCall(const char* themeName);
+bool ReloadPlayCall(const char* themeName);
+bool LoadIntro(const char* themeName);
+bool ReloadIntro(const char* themeName);
 bool LoadPlayerFoul(const char* themeName);
 bool ReloadPlayerFoul(const char* themeName);
 bool LoadStat(const char* themeName, const char* subtypeKey,

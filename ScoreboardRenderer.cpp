@@ -413,6 +413,8 @@ D3DCOLOR ResolveLayerColor(const char* binding, D3DCOLOR fallback,
         color = frame.homeSecondaryColor;
     else if (binding && std::strcmp(binding, "violation.teamColor") == 0)
         color = frame.violationTeamColor;
+    else if (binding && std::strcmp(binding, "playcall.teamColor") == 0)
+        color = frame.playCallTeamColor;
     else if (binding && std::strcmp(binding, "stat.teamColor") == 0)
         color = frame.statTeamColor;
     else if (binding && std::strcmp(binding, "stat.primaryColor") == 0)
@@ -455,6 +457,61 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
         std::snprintf(output, capacity, "%s",
             frame.violationTeamName ? frame.violationTeamName : "");
         *defaultHeight = style.teamNameHeight; return true;
+    }
+    if (std::strcmp(b, "playcall.team") == 0) {
+        std::snprintf(output, capacity, "%s",
+            frame.playCallTeam ? frame.playCallTeam : "");
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strcmp(b, "playcall.call") == 0) {
+        std::snprintf(output, capacity, "%s",
+            frame.playCallName ? frame.playCallName : "");
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strncmp(b, "playcall.raw", 12) == 0) {
+        const char* indexText = b + 12;
+        char* end = nullptr;
+        const long index = std::strtol(indexText, &end, 10);
+        if (end != indexText && *end == '\0' && index >= 0 && index < 4) {
+            std::snprintf(output, capacity, "%s",
+                frame.playCallValues[index] ? frame.playCallValues[index] : "");
+        }
+        else output[0] = '\0';
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strncmp(b, "intro.raw", 9) == 0) {
+        const char* indexText = b + 9;
+        char* end = nullptr;
+        const long index = std::strtol(indexText, &end, 10);
+        if (end != indexText && *end == '\0' && index >= 0 && index < 15)
+            std::snprintf(output, capacity, "%s",
+                frame.introValues[index] ? frame.introValues[index] : "");
+        else output[0] = '\0';
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    struct IntroBinding { const char* name; int index; };
+    static const IntroBinding introBindings[] = {
+        { "intro.homeHeading", 0 }, { "intro.awayCity", 1 },
+        { "intro.awayNickname", 2 }, { "intro.awayRecord", 3 },
+        { "intro.homeCity", 4 }, { "intro.homeNickname", 5 },
+        { "intro.homeRecord", 6 }, { "intro.liveFromHeading", 7 },
+        { "intro.arena", 8 }, { "intro.location", 9 },
+        { "intro.homeNumeric", 10 }, { "intro.awayNumeric", 11 },
+        { "intro.awayTeamCode", 12 }, { "intro.homeTeamCode", 13 },
+        { "intro.leagueCode", 14 }
+    };
+    for (unsigned int i = 0;
+         i < sizeof(introBindings) / sizeof(introBindings[0]); ++i) {
+        if (std::strcmp(b, introBindings[i].name) == 0) {
+            const char* value = frame.introValues[introBindings[i].index];
+            std::snprintf(output, capacity, "%s", value ? value : "");
+            *defaultHeight = style.teamNameHeight;
+            return true;
+        }
     }
     if (std::strcmp(b, "player.firstName") == 0 ||
         std::strcmp(b, "player.lastName") == 0 ||
@@ -603,6 +660,10 @@ bool RenderGenericElements(IDirect3DDevice9* device,
                 texture = frame.violationTeamLogo;
             else if (std::strcmp(e.binding, "stat.teamLogo") == 0)
                 texture = frame.statTeamLogo;
+            else if (std::strcmp(e.binding, "intro.awayLogo") == 0)
+                texture = frame.awayLogo;
+            else if (std::strcmp(e.binding, "intro.homeLogo") == 0)
+                texture = frame.homeLogo;
             else if (std::strcmp(e.binding, "player.portrait") == 0)
                 texture = frame.playerPortrait;
             else if (e.image[0]) texture = popup::GetOverlayTexture(device,
@@ -1007,6 +1068,90 @@ void RenderViolation(IDirect3DDevice9* device, const Frame& frame,
     const float top = (config.offsetY + animationOffsetY) * offsetScale;
     RenderGenericElements(device, config, frame, left, top, scale,
         overlayName, "violation", animationOpacity);
+    if (stateBlock) { stateBlock->Apply(); stateBlock->Release(); }
+}
+
+void RenderPlayCall(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity)
+{
+    if (!device || !overlayName || !*overlayName ||
+        !frame.playCallName || !*frame.playCallName ||
+        animationOpacity <= 0.0f) return;
+    D3DVIEWPORT9 viewport = {};
+    if (FAILED(device->GetViewport(&viewport))) return;
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
+        stateBlock->Capture();
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetVertexShader(nullptr); device->SetPixelShader(nullptr);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    const scoreboardconfig::Config& config = scoreboardconfig::GetPlayCall();
+    float scale = 1.0f;
+    if (config.scaleMode == scoreboardconfig::ScaleMode::Uniform) {
+        const float sx = static_cast<float>(viewport.Width) / config.referenceWidth;
+        const float sy = static_cast<float>(viewport.Height) / config.referenceHeight;
+        scale = sx < sy ? sx : sy;
+    }
+    const float offsetScale = config.scaleMode ==
+        scoreboardconfig::ScaleMode::Uniform ? scale : 1.0f;
+    const float left = (static_cast<float>(viewport.Width) -
+        config.width * scale) * 0.5f +
+        (config.offsetX + animationOffsetX) * offsetScale;
+    const float top = (config.offsetY + animationOffsetY) * offsetScale;
+    RenderGenericElements(device, config, frame, left, top, scale,
+        overlayName, "playcall", animationOpacity);
+    if (stateBlock) { stateBlock->Apply(); stateBlock->Release(); }
+}
+
+void RenderIntro(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity)
+{
+    if (!device || !overlayName || !*overlayName ||
+        !frame.introValues[0] || !*frame.introValues[0] ||
+        animationOpacity <= 0.0f) return;
+    D3DVIEWPORT9 viewport = {};
+    if (FAILED(device->GetViewport(&viewport))) return;
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
+        stateBlock->Capture();
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetVertexShader(nullptr); device->SetPixelShader(nullptr);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    const scoreboardconfig::Config& config = scoreboardconfig::GetIntro();
+    float scale = 1.0f;
+    if (config.scaleMode == scoreboardconfig::ScaleMode::Uniform) {
+        const float sx = static_cast<float>(viewport.Width) / config.referenceWidth;
+        const float sy = static_cast<float>(viewport.Height) / config.referenceHeight;
+        scale = sx < sy ? sx : sy;
+    }
+    const float offsetScale = config.scaleMode ==
+        scoreboardconfig::ScaleMode::Uniform ? scale : 1.0f;
+    const float left = (static_cast<float>(viewport.Width) -
+        config.width * scale) * 0.5f +
+        (config.offsetX + animationOffsetX) * offsetScale;
+    const float top = (config.offsetY + animationOffsetY) * offsetScale;
+    RenderGenericElements(device, config, frame, left, top, scale,
+        overlayName, "intro", animationOpacity);
     if (stateBlock) { stateBlock->Apply(); stateBlock->Release(); }
 }
 
