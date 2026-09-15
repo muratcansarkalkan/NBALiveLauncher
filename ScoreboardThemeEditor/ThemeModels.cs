@@ -113,6 +113,7 @@ public sealed class OverlayElement
     public string Type { get; set; } = "rectangle";
     public string Binding { get; set; } = "";
     public string Text { get; set; } = "";
+    public string Template { get; set; } = "";
     public string Image { get; set; } = "";
     public string Font { get; set; } = "";
     public double X { get; set; }
@@ -132,10 +133,28 @@ public sealed class OverlayElement
     public double SmallCapsScale { get; set; } = 0.75;
     public double FontHeight { get; set; }
     public int TextColor { get; set; } = 16777215;
+    public TextStroke Stroke { get; set; } = new();
+    public TextShadow Shadow { get; set; } = new();
     public int Opacity { get; set; } = 255;
     public OverlayFill Fill { get; set; } = new();
 
     [JsonIgnore] public string DisplayName => $"{Z,3}  {Id}";
+}
+
+public sealed class TextStroke
+{
+    public bool Enabled { get; set; }
+    public int Color { get; set; }
+    public double Width { get; set; } = 1;
+}
+
+public sealed class TextShadow
+{
+    public bool Enabled { get; set; }
+    public int Color { get; set; }
+    public int Alpha { get; set; } = 180;
+    public double OffsetX { get; set; } = 2;
+    public double OffsetY { get; set; } = 2;
 }
 
 public sealed class OverlayFill

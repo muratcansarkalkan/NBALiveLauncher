@@ -8,6 +8,7 @@ const unsigned int RES_Y = GetPrivateProfileIntW(L"DISPLAY", L"RES_Y", 480, L".\
 const unsigned int INTRO = GetPrivateProfileIntW(L"BOOTUP", L"INTRO", 1, L".\\main.ini");
 const float ASPECT_RATIO = static_cast<float>(RES_X) / static_cast<float>(RES_Y);
 const float ASPECT_DIFF = ASPECT_RATIO / 1.33333f;
+static float gAspectScale08 = 1.0f;
 
 namespace live08 {
 
@@ -30,6 +31,7 @@ namespace live08 {
         { 3840, 1600, 32, 15 }, // 800x600x32
     };
 
+    // NBA Live 08
     DWORD* METHOD SetPerspectiveProjection08(
         float* _this, DUMMY_ARG,
         DWORD* a2,
@@ -38,79 +40,198 @@ namespace live08 {
         float nearClip,
         float farClip)
     {
-        long double fovR; // st7
-        double w; // st6
-        double dist; // st7
-        int savedregs; // [esp+0h] [ebp+0h] BYREF
-        float h; // [esp+Ch] [ebp+Ch]
+        const float w =
+            static_cast<float>(*reinterpret_cast<unsigned int*>(_this + 2));
+
+        const float h =
+            static_cast<float>(*reinterpret_cast<unsigned int*>(_this + 3));
+
+        if (h > 0.0f)
+        {
+            aspectRatio = w / h;
+
+            gAspectScale08 =
+                aspectRatio / (4.0f / 3.0f);
+
+            if (gAspectScale08 < 1.0f)
+                gAspectScale08 = 1.0f;
+        }
+        else
+        {
+            gAspectScale08 = 1.0f;
+        }
 
         _this[15] = 0.0f;
         _this[6] = fovY;
-        // _this[7] = aspectRatio;
+        _this[7] = aspectRatio;
         _this[8] = nearClip;
-        _this[9] = farClip * 2.0f;
+        _this[9] = farClip;
+
         memcpy(_this + 36, (void*)0xC3EB00, 0x40u);
-        fovR = (double)(1.0f / tan(fovY * 0.0087266462f));
-        w = (double)*((unsigned int*)_this + 2); // mGeometry.mWidth
-        h = (float)*((unsigned int*)_this + 3); // mGeometry.mHeight
-        _this[7] = ((float)w / h); // aspectRatio
-        _this[47] = (float)-1.0f; // mViewMatrix.m44[2][3]
-        _this[36] = (float)(0.5f * w / ((float)w / h) * fovR);  // mViewMatrix.m44[0][0]
-        _this[41] = (float)(-(h * 0.5f * fovR)); // mViewMatrix.m44[1][1]
-        _this[44] = (float)(w * -0.5f - (double)*(int*)_this); // mViewMatrix.m44[2][0]
-        _this[45] = (float)((h * -0.5f - (double)*((int*)_this + 1))); // mViewMatrix.m44[2][1]
-        dist = nearClip - farClip;
-        _this[46] = (float)(nearClip / dist - 1.0f); // mViewMatrix.m44[2][2]
-        _this[50] = (float)(nearClip * farClip / dist); // mViewMatrix.m44[3][2]
+
+        const double fovR =
+            1.0 / tan(static_cast<double>(fovY) * 0.0087266462);
+
+        _this[47] = -1.0f;
+
+        _this[36] = static_cast<float>(
+            0.5 * static_cast<double>(w) /
+            static_cast<double>(aspectRatio) *
+            fovR
+            );
+
+        _this[41] = static_cast<float>(
+            -(static_cast<double>(h) * 0.5 * fovR)
+            );
+
+        _this[44] = static_cast<float>(
+            static_cast<double>(w) * -0.5 -
+            static_cast<double>(*reinterpret_cast<int*>(_this))
+            );
+
+        _this[45] = static_cast<float>(
+            static_cast<double>(h) * -0.5 -
+            static_cast<double>(*reinterpret_cast<int*>(_this + 1))
+            );
+
+        const double dist =
+            static_cast<double>(nearClip) -
+            static_cast<double>(farClip);
+
+        _this[46] = static_cast<float>(
+            static_cast<double>(nearClip) / dist - 1.0
+            );
+
+        _this[50] = static_cast<float>(
+            static_cast<double>(nearClip) *
+            static_cast<double>(farClip) / dist
+            );
+
         CallMethod<0x43C844>(_this, a2);
+
         return a2;
     }
 
-    int SetTestInConicalFrustum(float* a1, DUMMY_ARG, float a2, bool cameraclip)
-    {
-        float v5; // [esp+0h] [ebp-1Ch]
-        float v6; // [esp+Ch] [ebp-10h]
-        float v7; // [esp+10h] [ebp-Ch]
-        float v8; // [esp+14h] [ebp-8h]
-        float v9; // [esp+18h] [ebp-4h]
-        int v10; // [esp+20h] [ebp+4h]
-        float v11; // [esp+28h] [ebp+Ch]
-        float v12; // [esp+28h] [ebp+Ch]
 
-        v7 = *a1 - patch::GetFloat(0xDAC768);
-        v8 = a1[1] - patch::GetFloat(0xDAC76C);
-        v9 = a1[2] - patch::GetFloat(0xDAC770);
-        v6 = v9;
-        if (cameraclip && a2 > 2.0f && a2 < 10.0f)
-            v6 = v9 + a2;
-        *(float*)&v10 = sqrt(v8 * v8 + v7 * v7 + v6 * v6);
-        v11 = -((patch::GetFloat(0xDAC77C) * (1.0f / *(float*)&v10 * v6)
-            + patch::GetFloat(0xDAC778) * (v8 * (1.0f / *(float*)&v10))
-            + patch::GetFloat(0xDAC774) * (v7 * (1.0f / *(float*)&v10)))
-            * *(float*)&v10);
-        if (patch::GetFloat(0xDAC758) - a2 <= v11 && patch::GetFloat(0xDAC75C) + a2 >= v11)
+    // NBA Live 08
+    int SetTestInConicalFrustum08(
+        float* a1,
+        DUMMY_ARG,
+        float radius,
+        bool cameraclip)
+    {
+        const float dx =
+            a1[0] - patch::GetFloat(0xDAC768);
+
+        const float dy =
+            a1[1] - patch::GetFloat(0xDAC76C);
+
+        const float dz =
+            a1[2] - patch::GetFloat(0xDAC770);
+
+        float testZ = dz;
+
+        if (cameraclip && radius > 2.0f && radius < 10.0f)
+            testZ += radius;
+
+        const float distanceSq =
+            dx * dx +
+            dy * dy +
+            testZ * testZ;
+
+        const float distance =
+            sqrtf(distanceSq);
+
+        if (distance <= 0.000001f)
+            return 1;
+
+        const float depth = -(
+            dx * patch::GetFloat(0xDAC774) +
+            dy * patch::GetFloat(0xDAC778) +
+            testZ * patch::GetFloat(0xDAC77C)
+            );
+
+        if (patch::GetFloat(0xDAC758) - radius <= depth &&
+            depth <= patch::GetFloat(0xDAC75C) + radius)
         {
-            v5 = (patch::GetFloat(0xDAC760) * v11 + a2) * patch::GetFloat(0xDAC764);
-            v12 = *(float*)&v10 * *(float*)&v10 - v11 * v11;
-            if (v5 * v5 > v12 * 0.3f)
+            const float originalConeSine =
+                patch::GetFloat(0xDAC760);
+
+            const float originalConeInvCosine =
+                patch::GetFloat(0xDAC764);
+
+            const float originalTan =
+                originalConeSine *
+                originalConeInvCosine;
+
+            /*
+                08 previously used:
+
+                    coneRadius² > radialDistance² * 0.3
+
+                Equivalent cone expansion:
+
+                    1 / sqrt(0.3) = ~1.825742
+
+                Keep that existing 08 baseline, then apply the
+                widescreen aspect expansion on top.
+            */
+            constexpr float BASE_CULL_SCALE_08 =
+                1.825741858f;
+
+            const float widenedTan =
+                originalTan *
+                BASE_CULL_SCALE_08 *
+                gAspectScale08;
+
+            const float widenedConeInvCosine =
+                sqrtf(
+                    1.0f +
+                    widenedTan * widenedTan
+                );
+
+            const float widenedConeSine =
+                widenedTan /
+                widenedConeInvCosine;
+
+            const float coneRadius =
+                (depth * widenedConeSine + radius) *
+                widenedConeInvCosine;
+
+            float radialDistanceSq =
+                distanceSq -
+                depth * depth;
+
+            // Avoid tiny floating-point negatives.
+            if (radialDistanceSq < 0.0f)
+                radialDistanceSq = 0.0f;
+
+            if (coneRadius * coneRadius > radialDistanceSq)
             {
                 if (!cameraclip)
                     return 1;
-                if (a2 >= 10.0f)
+
+                if (radius >= 10.0f)
                 {
-                    a2 = a2 + 5.0f;
+                    radius += 5.0f;
                 }
-                else if (0.5f * 0.5f * v5 > v12)
+                else if (
+                    0.25f *
+                    coneRadius *
+                    coneRadius >
+                    radialDistanceSq)
                 {
                     return 1;
                 }
-                if (*(float*)&v10 >= (double)a2)
+
+                if (distance >= radius)
                     return 1;
             }
         }
+
         return 0;
     }
-    // Loadbar
+
     float loadYPos = ((400.0f / 480.0f) * RES_Y);
     float loadXPos(float xPos) {
         return ((xPos / 640.0f) * (RES_Y * 1.33333f)) + ((RES_X - (RES_Y * 1.33333f)) / 2);
@@ -131,7 +252,7 @@ void Install_LIVE08() {
     using namespace live08;
     // resolutions
     patch::RedirectJump(0x43B341, SetPerspectiveProjection08);
-    patch::RedirectJump(0x69F780, SetTestInConicalFrustum);
+    patch::RedirectJump(0x69F780, SetTestInConicalFrustum08);
     for (const auto& resolution : ids) {
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 8, resolution.height);

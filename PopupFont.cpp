@@ -216,7 +216,7 @@ bool BuildAtlas(IDirect3DDevice9* device, const char* themeName,
                 const char* fontId, const char* overlayDirectory)
 {
     const std::string themeDirectory =
-        GetGameDirectory() + "\\popups\\" + themeName + "\\" +
+        GetGameDirectory() + "\\assets\\popups\\" + themeName + "\\" +
         overlayDirectory;
     std::string configuration;
     ReadFile((themeDirectory + "\\popup.json").c_str(), &configuration);

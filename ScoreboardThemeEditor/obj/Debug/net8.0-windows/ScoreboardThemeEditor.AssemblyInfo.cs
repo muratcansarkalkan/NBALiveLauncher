@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("NBALiveScoreboardEditor")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f6152d1e60f567628965810dd3fd00cb55a765f0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+7415e1bf3263c6fa58df5d791d1c992d89cd14fd")]
 [assembly: System.Reflection.AssemblyProductAttribute("NBALiveScoreboardEditor")]
 [assembly: System.Reflection.AssemblyTitleAttribute("NBALiveScoreboardEditor")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

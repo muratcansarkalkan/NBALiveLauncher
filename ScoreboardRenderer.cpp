@@ -439,6 +439,54 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
                       const popupfont::Style& style,
                       D3DCOLOR* color)
 {
+    if (element.textTemplate[0]) {
+        output[0] = '\0';
+        *color = style.scoreColor;
+        *defaultHeight = style.teamNameHeight;
+        size_t written = 0;
+        const char* source = element.textTemplate;
+        for (size_t i = 0; source[i] && written + 1 < capacity;) {
+            if (source[i] == '{' && source[i + 1] == '{') {
+                output[written++] = '{'; i += 2; continue;
+            }
+            if (source[i] == '}' && source[i + 1] == '}') {
+                output[written++] = '}'; i += 2; continue;
+            }
+            if (source[i] != '{') {
+                output[written++] = source[i++]; continue;
+            }
+            const char* close = std::strchr(source + i + 1, '}');
+            if (!close) {
+                output[written++] = source[i++]; continue;
+            }
+            const size_t keyLength = static_cast<size_t>(close - (source + i + 1));
+            if (!keyLength || keyLength >= sizeof(element.binding)) {
+                i = static_cast<size_t>(close - source) + 1; continue;
+            }
+            scoreboardconfig::Element token = element;
+            std::memset(token.binding, 0, sizeof(token.binding));
+            std::memcpy(token.binding, source + i + 1, keyLength);
+            token.text[0] = '\0';
+            token.textTemplate[0] = '\0';
+            char value[128] = {};
+            float tokenHeight = *defaultHeight;
+            D3DCOLOR tokenColor = *color;
+            if (ResolveLayerText(token, config, frame, value, sizeof(value),
+                    &tokenHeight, style, &tokenColor)) {
+                const size_t available = capacity - written - 1;
+                const size_t valueLength = std::strlen(value);
+                const size_t copyLength = valueLength < available ?
+                    valueLength : available;
+                std::memcpy(output + written, value, copyLength);
+                written += copyLength;
+                *defaultHeight = tokenHeight;
+                *color = tokenColor;
+            }
+            i = static_cast<size_t>(close - source) + 1;
+        }
+        output[written] = '\0';
+        return true;
+    }
     const char* b = element.binding;
     *color = style.scoreColor;
     *defaultHeight = style.teamNameHeight;
@@ -564,6 +612,20 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
         std::snprintf(output, capacity, "%d", frame.homeScore);
         *defaultHeight = style.scoreHeight; return true;
     }
+    if (std::strcmp(b, "away.fouls") == 0 ||
+        std::strcmp(b, "home.fouls") == 0) {
+        std::snprintf(output, capacity, "%d",
+            b[0] == 'a' ? frame.awayFouls : frame.homeFouls);
+        *defaultHeight = style.foulHeight; return true;
+    }
+    if (std::strcmp(b, "away.timeouts") == 0 ||
+        std::strcmp(b, "home.timeouts") == 0) {
+        int value = b[0] == 'a' ? frame.awayTimeouts : frame.homeTimeouts;
+        if (!config.timeoutCountRemaining)
+            value = config.maximumTimeouts - value;
+        std::snprintf(output, capacity, "%d", value);
+        *defaultHeight = style.timeoutHeight; return true;
+    }
     if (std::strcmp(b, "game.clock") == 0) {
         const unsigned int tenths = (frame.gameClockRaw * 10u +
             frame.clockUnitsPerSecond - 1u) / frame.clockUnitsPerSecond;
@@ -682,7 +744,7 @@ bool RenderGenericElements(IDirect3DDevice9* device,
         else if (e.type == scoreboardconfig::ElementType::Text && fontReady) {
             if (!popupfont::SelectFont(device, overlayName, e.font,
                     overlayDirectory)) continue;
-            char text[128]; float height; D3DCOLOR color;
+            char text[512]; float height; D3DCOLOR color;
             if (!ResolveLayerText(e, config, frame, text, sizeof(text),
                     &height, style, &color)) continue;
             if (e.textColor != D3DCOLOR_XRGB(255, 255, 255) || !e.binding[0])
@@ -690,9 +752,38 @@ bool RenderGenericElements(IDirect3DDevice9* device,
             if (e.fontHeight > 0.0f) height = e.fontHeight;
             const int alignment = e.alignment == scoreboardconfig::TextAlignment::Left ?
                 -1 : e.alignment == scoreboardconfig::TextAlignment::Right ? 1 : 0;
+            const bool fit =
+                e.overflow == scoreboardconfig::TextOverflow::Fit;
+            if (e.shadowEnabled && e.shadowAlpha > 0) {
+                scoreboardconfig::Rect shadowRect = r;
+                shadowRect.x += e.shadowOffsetX * scale;
+                shadowRect.y += e.shadowOffsetY * scale;
+                const int shadowOpacity = opacity * e.shadowAlpha / 255;
+                DrawBoundText(device, text, shadowRect, height * scale,
+                    WithOpacity(e.shadowColor, shadowOpacity), alignment, fit,
+                    e.textTransform, e.smallCapsScale);
+            }
+            if (e.strokeEnabled && e.strokeWidth > 0.0f) {
+                const int radius = static_cast<int>(
+                    std::ceil(e.strokeWidth * scale));
+                const float radiusSquared =
+                    e.strokeWidth * scale * e.strokeWidth * scale + 0.25f;
+                for (int y = -radius; y <= radius; ++y) {
+                    for (int x = -radius; x <= radius; ++x) {
+                        if ((!x && !y) ||
+                            static_cast<float>(x * x + y * y) >
+                                radiusSquared) continue;
+                        scoreboardconfig::Rect strokeRect = r;
+                        strokeRect.x += static_cast<float>(x);
+                        strokeRect.y += static_cast<float>(y);
+                        DrawBoundText(device, text, strokeRect, height * scale,
+                            WithOpacity(e.strokeColor, opacity), alignment, fit,
+                            e.textTransform, e.smallCapsScale);
+                    }
+                }
+            }
             DrawBoundText(device, text, r, height * scale,
-                WithOpacity(color, opacity), alignment,
-                e.overflow == scoreboardconfig::TextOverflow::Fit,
+                WithOpacity(color, opacity), alignment, fit,
                 e.textTransform, e.smallCapsScale);
         }
         else if (e.type == scoreboardconfig::ElementType::Indicator && fontReady) {

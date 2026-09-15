@@ -134,12 +134,15 @@
                         <TextBlock Text="Type"/><ComboBox x:Name="ElementTypeCombo"/>
                         <TextBlock Text="Data binding"/><TextBox x:Name="ElementBindingBox"/>
                         <TextBlock Text="Static text"/><TextBox x:Name="ElementTextBox"/>
+                        <TextBlock Text="Text template (example: TIMEOUTS: {home.timeouts})"/>
+                        <TextBox x:Name="ElementTemplateBox"/>
                         <TextBlock Text="Font preset (blank = default)"/><ComboBox x:Name="ElementFontCombo" IsEditable="True"/>
                         <TextBlock Text="Image path"/><TextBox x:Name="ElementImageBox"/>
                         <TextBlock Text="Image fit"/><ComboBox x:Name="ElementImageFitCombo"/>
                         <CheckBox x:Name="ElementTintEnabledCheck" Content="Tint image" Margin="0,8,0,0"/>
                         <TextBlock Text="Image tint binding"/><TextBox x:Name="ElementTintBindingBox"/>
-                        <TextBlock Text="Image tint color (decimal RGB)"/><TextBox x:Name="ElementTintColorBox"/>
+                        <TextBlock Text="Image tint color (decimal RGB)"/>
+                        <DockPanel><Button DockPanel.Dock="Right" Content="Pick..." Tag="ElementTintColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="ElementTintColorBox"/></DockPanel>
                         <TextBlock Text="Opacity (0-255)"/><TextBox x:Name="ElementOpacityBox"/>
                         <UniformGrid Columns="2">
                             <TextBlock Text="X"/><TextBox x:Name="ElementXBox"/>
@@ -155,14 +158,30 @@
                         <TextBlock Text="Text transform" Margin="0,8,0,0"/><ComboBox x:Name="ElementTextTransformCombo"/>
                         <TextBlock Text="Small caps scale (0.1-1.0)"/><TextBox x:Name="ElementSmallCapsScaleBox"/>
                         <TextBlock Text="Font height (0 = theme default)" Margin="0,8,0,0"/><TextBox x:Name="ElementFontHeightBox"/>
-                        <TextBlock Text="Text color (decimal RGB)"/><TextBox x:Name="ElementTextColorBox"/>
+                        <TextBlock Text="Text color (decimal RGB)"/>
+                        <DockPanel><Button DockPanel.Dock="Right" Content="Pick..." Tag="ElementTextColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="ElementTextColorBox"/></DockPanel>
+                        <CheckBox x:Name="ElementStrokeEnabledCheck" Content="Text stroke" Margin="0,8,0,0"/>
+                        <TextBlock Text="Stroke color"/>
+                        <DockPanel><Button DockPanel.Dock="Right" Content="Pick..." Tag="ElementStrokeColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="ElementStrokeColorBox"/></DockPanel>
+                        <TextBlock Text="Stroke width (0-8)"/><TextBox x:Name="ElementStrokeWidthBox"/>
+                        <CheckBox x:Name="ElementShadowEnabledCheck" Content="Text shadow" Margin="0,8,0,0"/>
+                        <TextBlock Text="Shadow color"/>
+                        <DockPanel><Button DockPanel.Dock="Right" Content="Pick..." Tag="ElementShadowColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="ElementShadowColorBox"/></DockPanel>
+                        <TextBlock Text="Shadow alpha (0-255)"/><TextBox x:Name="ElementShadowAlphaBox"/>
+                        <UniformGrid Columns="2">
+                            <TextBlock Text="Shadow X"/><TextBox x:Name="ElementShadowXBox"/>
+                            <TextBlock Text="Shadow Y"/><TextBox x:Name="ElementShadowYBox"/>
+                        </UniformGrid>
                         <TextBlock Text="Fill type" Margin="0,8,0,0"/><ComboBox x:Name="ElementFillTypeCombo"/>
                         <TextBlock Text="Solid color binding"/><TextBox x:Name="ElementFillBindingBox"/>
-                        <TextBlock Text="Solid color (decimal RGB)"/><TextBox x:Name="ElementFillColorBox"/>
+                        <TextBlock Text="Solid color (decimal RGB)"/>
+                        <DockPanel><Button DockPanel.Dock="Right" Content="Pick..." Tag="ElementFillColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="ElementFillColorBox"/></DockPanel>
                         <TextBlock Text="Gradient start binding"/><TextBox x:Name="GradientStartBindingBox"/>
-                        <TextBlock Text="Gradient start color"/><TextBox x:Name="GradientStartColorBox"/>
+                        <TextBlock Text="Gradient start color"/>
+                        <DockPanel><Button DockPanel.Dock="Right" Content="Pick..." Tag="GradientStartColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="GradientStartColorBox"/></DockPanel>
                         <TextBlock Text="Gradient end binding"/><TextBox x:Name="GradientEndBindingBox"/>
-                        <TextBlock Text="Gradient end color"/><TextBox x:Name="GradientEndColorBox"/>
+                        <TextBlock Text="Gradient end color"/>
+                        <DockPanel><Button DockPanel.Dock="Right" Content="Pick..." Tag="GradientEndColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="GradientEndColorBox"/></DockPanel>
                         <TextBlock Text="Gradient direction"/><ComboBox x:Name="GradientDirectionCombo"/>
                         <Button Content="Apply Element Bounds" Click="ApplyElement_Click" Margin="0,12,0,0" Padding="8"/>
                         <TextBlock Text="Drag elements directly on the preview canvas. Use these fields for exact sizing." TextWrapping="Wrap" Foreground="#AAB2C0" Margin="0,14,0,0"/>
@@ -191,7 +210,8 @@
                 <TabItem Header="Behavior">
                     <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12" TextElement.Foreground="#F3F4F6">
                         <TextBlock Text="Scoreboard visibility"/><ComboBox x:Name="VisibilityCombo" Margin="0,3,0,8"/>
-                        <TextBlock Text="Background color (decimal RGB)"/><TextBox x:Name="BackgroundColorBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Background color (decimal RGB)"/>
+                        <DockPanel Margin="0,3,0,8"><Button DockPanel.Dock="Right" Content="Pick..." Tag="BackgroundColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="BackgroundColorBox"/></DockPanel>
                         <TextBlock Text="Background alpha (0-255)"/><TextBox x:Name="BackgroundAlphaBox" Margin="0,3,0,8"/>
                         <CheckBox x:Name="ShowBackgroundImageCheck" Content="Display scoreboard background image" Margin="0,4"/>
                         <TextBlock Text="Background image (relative to theme folder)"/>
@@ -207,8 +227,10 @@
                         <TextBlock Text="Shot-clock visibility"/><ComboBox x:Name="ShotVisibilityCombo" Margin="0,3,0,8"/>
                         <TextBlock Text="Shot-clock display threshold"/><TextBox x:Name="ShotThresholdBox" Margin="0,3,0,8"/>
                         <TextBlock Text="Urgent color threshold"/><TextBox x:Name="UrgentThresholdBox" Margin="0,3,0,8"/>
-                        <TextBlock Text="Normal color (decimal RGB)"/><TextBox x:Name="NormalShotColorBox" Margin="0,3,0,8"/>
-                        <TextBlock Text="Urgent color (decimal RGB)"/><TextBox x:Name="UrgentShotColorBox" Margin="0,3,0,8"/>
+                        <TextBlock Text="Normal color (decimal RGB)"/>
+                        <DockPanel Margin="0,3,0,8"><Button DockPanel.Dock="Right" Content="Pick..." Tag="NormalShotColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="NormalShotColorBox"/></DockPanel>
+                        <TextBlock Text="Urgent color (decimal RGB)"/>
+                        <DockPanel Margin="0,3,0,8"><Button DockPanel.Dock="Right" Content="Pick..." Tag="UrgentShotColorBox" Click="PickColor_Click" Margin="6,0,0,0"/><TextBox x:Name="UrgentShotColorBox"/></DockPanel>
                         <CheckBox x:Name="ShowTeamNamesCheck" Content="Display team names" Margin="0,6"/>
                         <CheckBox x:Name="ShowAwayLogoCheck" Content="Display away logo" Margin="0,3"/>
                         <CheckBox x:Name="ShowHomeLogoCheck" Content="Display home logo" Margin="0,3,0,6"/>

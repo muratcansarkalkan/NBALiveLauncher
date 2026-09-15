@@ -137,33 +137,64 @@ bool ReadFile(const char* path, std::string* output)
 
 size_t ValuePosition(const std::string& json, const char* key)
 {
-    std::string token = std::string("\"") + key + "\"";
-    size_t searchFrom = 0;
-    while (true) {
-        size_t p = json.find(token, searchFrom);
-        if (p == std::string::npos) return p;
+    if (!key || !*key) return std::string::npos;
+    const size_t keyLength = std::strlen(key);
+    int objectDepth = 0;
+    int arrayDepth = 0;
 
-        // A token is a property name only when the next non-whitespace
-        // character is ':'.  Editor-generated elements can contain values
-        // such as "id": "backgroundImage" before the top-level
-        // "backgroundImage" property.  The old search mistook that value for
-        // the property name and read the following field instead.
-        size_t colon = p + token.size();
+    for (size_t i = 0; i < json.size(); ++i) {
+        const char ch = json[i];
+        if (ch == '{') {
+            ++objectDepth;
+            continue;
+        }
+        if (ch == '}') {
+            if (objectDepth > 0) --objectDepth;
+            continue;
+        }
+        if (ch == '[') {
+            ++arrayDepth;
+            continue;
+        }
+        if (ch == ']') {
+            if (arrayDepth > 0) --arrayDepth;
+            continue;
+        }
+        if (ch != '"') continue;
+
+        const size_t stringStart = ++i;
+        bool escaped = false;
+        while (i < json.size()) {
+            const char stringChar = json[i];
+            if (escaped) escaped = false;
+            else if (stringChar == '\\') escaped = true;
+            else if (stringChar == '"') break;
+            ++i;
+        }
+        if (i >= json.size()) return std::string::npos;
+
+        const size_t stringLength = i - stringStart;
+        if (objectDepth != 1 || arrayDepth != 0 ||
+            stringLength != keyLength ||
+            json.compare(stringStart, keyLength, key) != 0)
+            continue;
+
+        size_t colon = i + 1;
         while (colon < json.size() &&
             (json[colon] == ' ' || json[colon] == '\t' ||
              json[colon] == '\r' || json[colon] == '\n'))
             ++colon;
+        if (colon >= json.size() || json[colon] != ':') continue;
 
-        if (colon < json.size() && json[colon] == ':') {
-            p = colon;
-            do { ++p; } while (p < json.size() &&
-                (json[p] == ' ' || json[p] == '\t' ||
-                 json[p] == '\r' || json[p] == '\n'));
-            return p;
-        }
-
-        searchFrom = p + token.size();
+        size_t value = colon + 1;
+        while (value < json.size() &&
+            (json[value] == ' ' || json[value] == '\t' ||
+             json[value] == '\r' || json[value] == '\n'))
+            ++value;
+        return value;
     }
+
+    return std::string::npos;
 }
 
 long Integer(const std::string& json, const char* key, long fallback)
@@ -296,6 +327,8 @@ void ParseElements(const std::string& json, Config* c)
             ElementType::Rectangle;
         String(object, "binding", e.binding, sizeof(e.binding), "");
         String(object, "text", e.text, sizeof(e.text), "");
+        String(object, "template", e.textTemplate,
+            sizeof(e.textTemplate), "");
         String(object, "image", e.image, sizeof(e.image), "");
         String(object, "font", e.font, sizeof(e.font), "");
         e.rect.x = Number(object, "x", 0.0f);
@@ -330,6 +363,20 @@ void ParseElements(const std::string& json, Config* c)
         if (e.smallCapsScale > 1.0f) e.smallCapsScale = 1.0f;
         e.fontHeight = Number(object, "fontHeight", 0.0f);
         e.textColor = Color(object, "textColor", D3DCOLOR_XRGB(255, 255, 255));
+        const std::string stroke = ObjectValue(object, "stroke");
+        e.strokeEnabled = Boolean(stroke, "enabled", false);
+        e.strokeColor = Color(stroke, "color", D3DCOLOR_XRGB(0, 0, 0));
+        e.strokeWidth = Number(stroke, "width", 1.0f);
+        if (e.strokeWidth < 0.0f) e.strokeWidth = 0.0f;
+        if (e.strokeWidth > 8.0f) e.strokeWidth = 8.0f;
+        const std::string shadow = ObjectValue(object, "shadow");
+        e.shadowEnabled = Boolean(shadow, "enabled", false);
+        e.shadowColor = Color(shadow, "color", D3DCOLOR_XRGB(0, 0, 0));
+        e.shadowAlpha = Integer(shadow, "alpha", 180);
+        if (e.shadowAlpha < 0) e.shadowAlpha = 0;
+        if (e.shadowAlpha > 255) e.shadowAlpha = 255;
+        e.shadowOffsetX = Number(shadow, "offsetX", 2.0f);
+        e.shadowOffsetY = Number(shadow, "offsetY", 2.0f);
         e.opacity = Integer(object, "opacity", 255);
 
         const std::string fill = ObjectValue(object, "fill");
@@ -481,7 +528,7 @@ bool Load(const char* themeName)
     if (g_loaded && std::strcmp(g_theme, themeName) == 0) return true;
     Config next;
     SetDefaults(&next);
-    std::string path = GameDirectory() + "\\popups\\" +
+    std::string path = GameDirectory() + "\\assets\\popups\\" +
         themeName + "\\scoreboard\\scoreboard.json";
     std::string json;
     if (!ReadFile(path.c_str(), &json)) {
@@ -517,7 +564,7 @@ bool LoadViolation(const char* themeName)
     next.height = 80.0f;
     next.offsetY = 90.0f;
     next.overlayZ = 30;
-    std::string path = GameDirectory() + "\\popups\\" + themeName +
+    std::string path = GameDirectory() + "\\assets\\popups\\" + themeName +
         "\\violation\\violation.json";
     std::string json;
     if (!ReadFile(path.c_str(), &json)) {
@@ -555,7 +602,7 @@ bool LoadPlayCall(const char* themeName)
     next.height = 64.0f;
     next.offsetY = 90.0f;
     next.overlayZ = 25;
-    std::string path = GameDirectory() + "\\popups\\" + themeName +
+    std::string path = GameDirectory() + "\\assets\\popups\\" + themeName +
         "\\playcall\\playcall.json";
     std::string json;
     if (!ReadFile(path.c_str(), &json)) {
@@ -595,7 +642,7 @@ bool LoadIntro(const char* themeName)
     next.offsetY = 120.0f;
     next.overlayZ = 40;
     next.holdMilliseconds = 6500;
-    std::string path = GameDirectory() + "\\popups\\" + themeName +
+    std::string path = GameDirectory() + "\\assets\\popups\\" + themeName +
         "\\intro\\intro.json";
     std::string json;
     if (!ReadFile(path.c_str(), &json)) {
@@ -634,11 +681,11 @@ bool LoadPlayerFoul(const char* themeName)
     next.height = 100.0f;
     next.offsetY = 90.0f;
     next.overlayZ = 20;
-    std::string path = GameDirectory() + "\\popups\\" + themeName +
+    std::string path = GameDirectory() + "\\assets\\popups\\" + themeName +
         "\\stats\\player_foul.json";
     std::string json;
     if (!ReadFile(path.c_str(), &json)) {
-        path = GameDirectory() + "\\popups\\" + themeName +
+        path = GameDirectory() + "\\assets\\popups\\" + themeName +
             "\\stats\\player.json";
         if (!ReadFile(path.c_str(), &json)) {
             std::snprintf(g_lastError, sizeof(g_lastError),
@@ -687,7 +734,7 @@ bool LoadStat(const char* themeName, const char* subtypeKey,
     next.offsetY = 90.0f;
     next.overlayZ = 20;
 
-    const std::string base = GameDirectory() + "\\popups\\" + themeName +
+    const std::string base = GameDirectory() + "\\assets\\popups\\" + themeName +
         "\\stats\\";
     std::string path = base + subtypeKey + ".json";
     std::string json;

@@ -26,6 +26,11 @@ namespace live06 {
     };
 
     // Function modified to set aspect ratio based on height and width
+// NBA Live 06
+// Correct widescreen projection:
+// - preserves vertical FOV
+// - uses actual viewport aspect ratio
+// - preserves original near/far planes
     DWORD* METHOD SetPerspectiveProjection06(
         float* _this, DUMMY_ARG,
         DWORD* a2,
@@ -34,76 +39,210 @@ namespace live06 {
         float nearClip,
         float farClip)
     {
-        long double fovR; // st7
-        double w; // st6
-        double dist; // st7
-        float h; // [esp+Ch] [ebp+Ch]
+        const float w =
+            static_cast<float>(*reinterpret_cast<unsigned int*>(_this + 2));
 
-        _this[15] = 0.0f;
-        _this[6] = fovY;
-        // _this[7] = aspectRatio;
-        _this[8] = nearClip;
-        _this[9] = farClip * 2.0f;
+        const float h =
+            static_cast<float>(*reinterpret_cast<unsigned int*>(_this + 3));
+
+        if (h > 0.0f)
+            aspectRatio = w / h;
+
+        _this[15] = 0.0f;        // mGuardBandScale
+        _this[6] = fovY;        // mFrustum.mFov
+        _this[7] = aspectRatio; // mFrustum.mAspect
+        _this[8] = nearClip;    // mFrustum.mNearPlane
+        _this[9] = farClip;     // mFrustum.mFarPlane
+
         memcpy(_this + 36, (void*)0xBE9DC0, 0x40u);
-        fovR = (double)(1.0f / tan(fovY * 0.0087266462f));
-        w = (double)*((unsigned int*)_this + 2); // mGeometry.mWidth
-        h = (float)*((unsigned int*)_this + 3); // mGeometry.mHeight
-        _this[7] = ((float)w / h); // aspectRatio
-        _this[47] = (float)-1.0f; // mViewMatrix.m44[2][3]
-        _this[36] = (float)(0.5f * w / ((float)w / h) * fovR);  // mViewMatrix.m44[0][0]
-        _this[41] = (float)(-(h * 0.5f * fovR)); // mViewMatrix.m44[1][1]
-        _this[44] = (float)(w * -0.5f - (double)*(int*)_this); // mViewMatrix.m44[2][0]
-        _this[45] = (float)((h * -0.5f - (double)*((int*)_this + 1))); // mViewMatrix.m44[2][1]
-        dist = nearClip - farClip;
-        _this[46] = (float)(nearClip / dist - 1.0f); // mViewMatrix.m44[2][2]
-        _this[50] = (float)(nearClip * farClip / dist); // mViewMatrix.m44[3][2]
+
+        const double fovR =
+            1.0 / tan(static_cast<double>(fovY) * 0.0087266462);
+
+        _this[47] = -1.0f; // mProjectionMatrix.m44[2][3]
+
+        _this[36] = static_cast<float>(
+            0.5 * static_cast<double>(w) /
+            static_cast<double>(aspectRatio) *
+            fovR
+            );
+
+        _this[41] = static_cast<float>(
+            -(static_cast<double>(h) * 0.5 * fovR)
+            );
+
+        _this[44] = static_cast<float>(
+            static_cast<double>(w) * -0.5 -
+            static_cast<double>(*reinterpret_cast<int*>(_this))
+            );
+
+        _this[45] = static_cast<float>(
+            static_cast<double>(h) * -0.5 -
+            static_cast<double>(*reinterpret_cast<int*>(_this + 1))
+            );
+
+        const double dist =
+            static_cast<double>(nearClip) -
+            static_cast<double>(farClip);
+
+        _this[46] = static_cast<float>(
+            static_cast<double>(nearClip) / dist - 1.0
+            );
+
+        _this[50] = static_cast<float>(
+            static_cast<double>(nearClip) *
+            static_cast<double>(farClip) / dist
+            );
+
         CallMethod<0x702DF1>(_this, a2);
+
         return a2;
     }
 
-    // Function that enables/disables object visibility depending on FOV
-    int METHOD SetTestInConicalFrustum(float* _this, DUMMY_ARG, float* a2, float radius, bool cameraclip)
+
+    // NBA Live 06
+    // Correct widescreen conservative conical-frustum culling.
+    //
+    // Original StaticFastCull is based on a circular cone. Widescreen
+    // exposes a wider horizontal FOV, so widen the cone itself rather
+    // than modifying near/far clipping distances.
+    int METHOD SetTestInConicalFrustum06(
+        float* _this, DUMMY_ARG,
+        float* a2,
+        float radius,
+        bool cameraclip)
     {
-        float v6;
-        float v7;
-        float v8;
-        float v9;
-        float v10;
-        int a2a;
-        float cameraclipa;
-        float cameraclipb;
+        float v8 = a2[0] - _this[4];
+        float v9 = a2[1] - _this[5];
+        float v10 = a2[2] - _this[6];
 
-        float ASPECT_IG = static_cast<float>(patch::GetUInt(0xCBFB30)) / static_cast<float>(patch::GetUInt(0xCBFB34));
-        float ASPECT_DIFF = ASPECT_IG / 1.33333f;
+        float v7 = v10;
 
-        v8 = *a2 - _this[4];
-        v9 = a2[1] - _this[5];
-        v10 = a2[2] - _this[6];
-        v7 = v10;
         if (cameraclip && radius > 2.0f && radius < 10.0f)
-            v7 = v10 + radius;
-        a2a = sqrt(v9 * v9 + v8 * v8 + v7 * v7);
-        cameraclipa = -((1.0f / a2a * v7 * _this[9] + v9 * (1.0f / a2a) * _this[8] + v8 * (1.0f / a2a) * _this[7]) * a2a);
-        if ((*_this - radius) / ASPECT_DIFF <= cameraclipa && (radius + _this[1]) * ASPECT_DIFF >= cameraclipa)
+            v7 += radius;
+
+        const float distanceSq =
+            v8 * v8 +
+            v9 * v9 +
+            v7 * v7;
+
+        const float a2a = sqrtf(distanceSq);
+
+        if (a2a <= 0.000001f)
+            return 1;
+
+        /*
+            Game resolution.
+
+            0xCBFB30 = width
+            0xCBFB34 = height
+        */
+        const float width =
+            static_cast<float>(patch::GetUInt(0xCBFB30));
+
+        const float height =
+            static_cast<float>(patch::GetUInt(0xCBFB34));
+
+        float aspectScale = 1.0f;
+
+        if (height > 0.0f)
         {
-            v6 = (cameraclipa * _this[2] + radius) * _this[3];
-            cameraclipb = a2a * a2a - cameraclipa * cameraclipa;
-            if (v6 * v6 > cameraclipb / ASPECT_DIFF)
+            const float aspect = width / height;
+
+            /*
+                NBA Live was designed around 4:3.
+            */
+            aspectScale = aspect / (4.0f / 3.0f);
+
+            // Never make the original culling cone narrower.
+            if (aspectScale < 1.0f)
+                aspectScale = 1.0f;
+        }
+
+        /*
+            Original expression simplifies to the negative dot product
+            with the cone axis.
+
+            _this[7..9] = mConeAxis.xyz
+        */
+        const float cameraclipa = -(
+            v8 * _this[7] +
+            v9 * _this[8] +
+            v7 * _this[9]
+            );
+
+        /*
+            Keep the original near/far depth test unchanged.
+
+            _this[0] = mNearPlane
+            _this[1] = mFarPlane
+        */
+        if (_this[0] - radius <= cameraclipa &&
+            cameraclipa <= _this[1] + radius)
+        {
+            /*
+                Original values:
+
+                _this[2] = mConeSine
+                _this[3] = mConeInvCosine
+
+                tan(theta) = sin(theta) / cos(theta)
+                           = mConeSine * mConeInvCosine
+            */
+            const float originalTan =
+                _this[2] * _this[3];
+
+            const float widescreenTan =
+                originalTan * aspectScale;
+
+            /*
+                sec(theta) = sqrt(1 + tan²(theta))
+                sin(theta) = tan(theta) / sec(theta)
+            */
+            const float coneInvCosine =
+                sqrtf(1.0f + widescreenTan * widescreenTan);
+
+            const float coneSine =
+                widescreenTan / coneInvCosine;
+
+            /*
+                Same role as original v6:
+                    (depth * mConeSine + radius) * mConeInvCosine
+            */
+            const float v6 =
+                (cameraclipa * coneSine + radius) *
+                coneInvCosine;
+
+            /*
+                Squared distance perpendicular to cone axis.
+            */
+            const float cameraclipb =
+                distanceSq -
+                cameraclipa * cameraclipa;
+
+            if (v6 * v6 > cameraclipb)
             {
                 if (!cameraclip)
                     return 1;
+
                 if (radius >= 10.0f)
                 {
-                    radius = radius + 5.0f;
+                    radius += 5.0f;
                 }
-                else if (0.25f * v6 > cameraclipb)
+                else if (0.25f * v6 * v6 > cameraclipb)
                 {
+                    /*
+                        Original constant = 0.5f:
+                        0.5² = 0.25
+                    */
                     return 1;
                 }
-                if (a2a >= (double)radius)
+
+                if (a2a >= radius)
                     return 1;
             }
         }
+
         return 0;
     }
 
@@ -246,7 +385,7 @@ void Install_LIVE06() {
     using namespace live06;
     // Change aspect ratio in-game
     patch::RedirectJump(0x70221E, SetPerspectiveProjection06);
-    patch::RedirectJump(0x73E3C0, SetTestInConicalFrustum);
+    patch::RedirectJump(0x73E3C0, SetTestInConicalFrustum06);
     // Sets resolutions
     for (const auto& resolution : ids) {
         patch::SetUInt(0xC4CF38 + 20 * resolution.id + 4, resolution.width);

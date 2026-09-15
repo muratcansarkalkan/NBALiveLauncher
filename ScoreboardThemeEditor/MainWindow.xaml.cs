@@ -9,6 +9,22 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Documents;
 using System.Windows.Threading;
+using Brush = System.Windows.Media.Brush;
+using Brushes = System.Windows.Media.Brushes;
+using Button = System.Windows.Controls.Button;
+using Color = System.Windows.Media.Color;
+using Cursors = System.Windows.Input.Cursors;
+using FontFamily = System.Windows.Media.FontFamily;
+using HorizontalAlignment = System.Windows.HorizontalAlignment;
+using Image = System.Windows.Controls.Image;
+using MessageBox = System.Windows.MessageBox;
+using MouseEventArgs = System.Windows.Input.MouseEventArgs;
+using OpenFileDialog = Microsoft.Win32.OpenFileDialog;
+using Panel = System.Windows.Controls.Panel;
+using Point = System.Windows.Point;
+using SaveFileDialog = Microsoft.Win32.SaveFileDialog;
+using TextBox = System.Windows.Controls.TextBox;
+using VerticalAlignment = System.Windows.VerticalAlignment;
 
 namespace NBALiveScoreboardEditor;
 
@@ -1101,27 +1117,13 @@ public partial class MainWindow : Window
             }
             else if (layer.Type == "text")
             {
-                string value = ResolvePreviewBinding(layer.Binding, away, home,
-                    layer.Text);
+                string value = ResolvePreviewText(layer, away, home);
+                string sizingBinding = string.IsNullOrWhiteSpace(layer.Binding)
+                    ? FirstTemplateBinding(layer.Template) : layer.Binding;
                 double height = layer.FontHeight > 0 ? layer.FontHeight :
-                    DefaultFontHeight(layer.Binding);
-                TextBlock text = PreviewText(value, height,
-                    PackedBrush(layer.TextColor), layer.Font,
+                    DefaultFontHeight(sizingBinding);
+                border.Child = StyledPreviewText(value, height, layer,
                     document.Directory, document.Font);
-                text.TextAlignment = layer.Alignment switch
-                {
-                    "left" => TextAlignment.Left,
-                    "right" => TextAlignment.Right,
-                    _ => TextAlignment.Center
-                };
-                // A Viewbox measures its child by content unless the text has
-                // an explicit width. Keep the same text box used by the game
-                // so left/center/right remains visible when overflow is "fit".
-                text.Width = Math.Max(1, layer.Width);
-                text.HorizontalAlignment = HorizontalAlignment.Stretch;
-                border.Child = layer.Overflow == "fit"
-                    ? new Viewbox { Stretch = Stretch.Uniform, Child = text }
-                    : text;
             }
             Canvas.SetLeft(border, layer.X);
             Canvas.SetTop(border, layer.Y);
@@ -1249,27 +1251,12 @@ public partial class MainWindow : Window
             }
             else
             {
-                string value = ResolvePreviewBinding(layer.Binding, away, home,
-                    layer.Text);
+                string value = ResolvePreviewText(layer, away, home);
+                string sizingBinding = string.IsNullOrWhiteSpace(layer.Binding)
+                    ? FirstTemplateBinding(layer.Template) : layer.Binding;
                 double height = layer.FontHeight > 0 ? layer.FontHeight :
-                    DefaultFontHeight(layer.Binding);
-                TextBlock text = PreviewText(value, height,
-                    PackedBrush(layer.TextColor), layer.Font);
-                ApplyTextTransform(text, value, layer.TextTransform,
-                    layer.SmallCapsScale);
-                text.TextAlignment = layer.Alignment switch
-                {
-                    "left" => TextAlignment.Left,
-                    "right" => TextAlignment.Right,
-                    _ => TextAlignment.Center
-                };
-                // Fill the layer's complete width so TextAlignment describes
-                // alignment inside the same box used by the game renderer.
-                text.Width = Math.Max(1, layer.Width);
-                text.HorizontalAlignment = HorizontalAlignment.Stretch;
-                border.Child = layer.Overflow == "fit"
-                    ? new Viewbox { Stretch = Stretch.Uniform, Child = text }
-                    : text;
+                    DefaultFontHeight(sizingBinding);
+                border.Child = StyledPreviewText(value, height, layer);
             }
             Panel.SetZIndex(border, layer.Z);
             AddToCanvas(border, layer.Id);
@@ -1363,6 +1350,48 @@ public partial class MainWindow : Window
         "stat.teamName" => away.TeamName,
             _ => fallback
         };
+    }
+
+    private string ResolvePreviewText(OverlayElement layer,
+        TeamDefinition away, TeamDefinition home)
+    {
+        if (string.IsNullOrEmpty(layer.Template))
+            return ResolvePreviewBinding(layer.Binding, away, home, layer.Text);
+
+        string source = layer.Template;
+        System.Text.StringBuilder result = new();
+        for (int i = 0; i < source.Length;)
+        {
+            if (i + 1 < source.Length && source[i] == '{' && source[i + 1] == '{')
+            {
+                result.Append('{'); i += 2; continue;
+            }
+            if (i + 1 < source.Length && source[i] == '}' && source[i + 1] == '}')
+            {
+                result.Append('}'); i += 2; continue;
+            }
+            if (source[i] != '{')
+            {
+                result.Append(source[i++]); continue;
+            }
+            int close = source.IndexOf('}', i + 1);
+            if (close < 0)
+            {
+                result.Append(source[i++]); continue;
+            }
+            string binding = source[(i + 1)..close].Trim();
+            result.Append(ResolvePreviewBinding(binding, away, home, ""));
+            i = close + 1;
+        }
+        return result.ToString();
+    }
+
+    private static string FirstTemplateBinding(string template)
+    {
+        int open = template.IndexOf('{');
+        int close = open >= 0 ? template.IndexOf('}', open + 1) : -1;
+        return open >= 0 && close > open + 1
+            ? template[(open + 1)..close].Trim() : "";
     }
 
     private double DefaultFontHeight(string binding) => binding switch
@@ -1691,6 +1720,56 @@ public partial class MainWindow : Window
         return block;
     }
 
+    private FrameworkElement StyledPreviewText(string value, double height,
+        OverlayElement layer, string? themeDirectory = null,
+        PopupFontTheme? popupFont = null)
+    {
+        PopupFontTheme font = popupFont ?? _font;
+        string? directory = themeDirectory ?? _themeDirectory;
+        Grid effects = new() { Width = Math.Max(1, layer.Width) };
+        TextAlignment alignment = layer.Alignment switch
+        {
+            "left" => TextAlignment.Left,
+            "right" => TextAlignment.Right,
+            _ => TextAlignment.Center
+        };
+
+        void AddPass(int color, double x, double y, int alpha = 255)
+        {
+            TextBlock pass = PreviewText(value, height,
+                PackedBrush(color, alpha), layer.Font, directory, font);
+            ApplyTextTransform(pass, value, layer.TextTransform,
+                layer.SmallCapsScale);
+            pass.TextAlignment = alignment;
+            pass.Width = Math.Max(1, layer.Width);
+            pass.HorizontalAlignment = HorizontalAlignment.Stretch;
+            pass.RenderTransform = new TranslateTransform(x, y);
+            effects.Children.Add(pass);
+        }
+
+        layer.Stroke ??= new TextStroke();
+        layer.Shadow ??= new TextShadow();
+        if (layer.Shadow.Enabled && layer.Shadow.Alpha > 0)
+            AddPass(layer.Shadow.Color, layer.Shadow.OffsetX,
+                layer.Shadow.OffsetY, Math.Clamp(layer.Shadow.Alpha, 0, 255));
+
+        if (layer.Stroke.Enabled && layer.Stroke.Width > 0)
+        {
+            double width = Math.Clamp(layer.Stroke.Width, 0, 8);
+            int radius = (int)Math.Ceiling(width);
+            double radiusSquared = width * width + 0.25;
+            for (int y = -radius; y <= radius; y++)
+                for (int x = -radius; x <= radius; x++)
+                    if ((x != 0 || y != 0) && x * x + y * y <= radiusSquared)
+                        AddPass(layer.Stroke.Color, x, y);
+        }
+        AddPass(layer.TextColor, 0, 0);
+
+        return layer.Overflow == "fit"
+            ? new Viewbox { Stretch = Stretch.Uniform, Child = effects }
+            : effects;
+    }
+
     private static string TransformText(string value, string transform)
     {
         if (transform == "uppercase") return value.ToUpperInvariant();
@@ -1875,6 +1954,7 @@ public partial class MainWindow : Window
         ElementTypeCombo.SelectedItem = layer.Type;
         ElementBindingBox.Text = layer.Binding;
         ElementTextBox.Text = layer.Text;
+        ElementTemplateBox.Text = layer.Template;
         ElementFontCombo.Text = layer.Font;
         ElementImageBox.Text = layer.Image;
         ElementImageFitCombo.SelectedItem = layer.ImageFit;
@@ -1890,6 +1970,16 @@ public partial class MainWindow : Window
         ElementSmallCapsScaleBox.Text = layer.SmallCapsScale.ToString("0.##");
         ElementFontHeightBox.Text = layer.FontHeight.ToString("0.##");
         ElementTextColorBox.Text = layer.TextColor.ToString();
+        layer.Stroke ??= new TextStroke();
+        ElementStrokeEnabledCheck.IsChecked = layer.Stroke.Enabled;
+        ElementStrokeColorBox.Text = layer.Stroke.Color.ToString();
+        ElementStrokeWidthBox.Text = layer.Stroke.Width.ToString("0.##");
+        layer.Shadow ??= new TextShadow();
+        ElementShadowEnabledCheck.IsChecked = layer.Shadow.Enabled;
+        ElementShadowColorBox.Text = layer.Shadow.Color.ToString();
+        ElementShadowAlphaBox.Text = layer.Shadow.Alpha.ToString();
+        ElementShadowXBox.Text = layer.Shadow.OffsetX.ToString("0.##");
+        ElementShadowYBox.Text = layer.Shadow.OffsetY.ToString("0.##");
         ElementFillTypeCombo.SelectedItem = layer.Fill.Type;
         ElementFillBindingBox.Text = layer.Fill.Binding;
         ElementFillColorBox.Text = layer.Fill.Color.ToString();
@@ -1898,6 +1988,37 @@ public partial class MainWindow : Window
         GradientEndBindingBox.Text = layer.Fill.EndBinding;
         GradientEndColorBox.Text = layer.Fill.EndColor.ToString();
         GradientDirectionCombo.SelectedItem = layer.Fill.Direction;
+    }
+
+    private void PickColor_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button || button.Tag is not string targetName ||
+            FindName(targetName) is not TextBox target) return;
+
+        int current = Int(target, 16777215);
+        using System.Windows.Forms.ColorDialog dialog = new()
+        {
+            FullOpen = true,
+            Color = System.Drawing.Color.FromArgb(
+                (current >> 16) & 0xFF,
+                (current >> 8) & 0xFF,
+                current & 0xFF)
+        };
+        if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
+
+        int packed = (dialog.Color.R << 16) |
+            (dialog.Color.G << 8) | dialog.Color.B;
+        target.Text = packed.ToString();
+        button.Background = PackedBrush(packed);
+        if (_loadingControls) return;
+        if (targetName.StartsWith("Element", StringComparison.Ordinal) ||
+            targetName.StartsWith("Gradient", StringComparison.Ordinal))
+            ApplyElement_Click(sender, e);
+        else
+        {
+            ApplyBehaviorFromControls();
+            RebuildPreview();
+        }
     }
 
     private void ApplyElement_Click(object sender, RoutedEventArgs e)
@@ -1914,6 +2035,7 @@ public partial class MainWindow : Window
             layer.Type = ElementTypeCombo.SelectedItem as string ?? layer.Type;
             layer.Binding = ElementBindingBox.Text.Trim();
             layer.Text = ElementTextBox.Text;
+            layer.Template = ElementTemplateBox.Text;
             layer.Font = ElementFontCombo.Text.Trim();
             layer.Image = ElementImageBox.Text.Trim();
             layer.ImageFit = ElementImageFitCombo.SelectedItem as string ?? "contain";
@@ -1930,6 +2052,18 @@ public partial class MainWindow : Window
                 Double(ElementSmallCapsScaleBox, layer.SmallCapsScale), 0.1, 1.0);
             layer.FontHeight = Double(ElementFontHeightBox, layer.FontHeight);
             layer.TextColor = Int(ElementTextColorBox, layer.TextColor);
+            layer.Stroke ??= new TextStroke();
+            layer.Stroke.Enabled = ElementStrokeEnabledCheck.IsChecked == true;
+            layer.Stroke.Color = Int(ElementStrokeColorBox, layer.Stroke.Color);
+            layer.Stroke.Width = Math.Clamp(
+                Double(ElementStrokeWidthBox, layer.Stroke.Width), 0, 8);
+            layer.Shadow ??= new TextShadow();
+            layer.Shadow.Enabled = ElementShadowEnabledCheck.IsChecked == true;
+            layer.Shadow.Color = Int(ElementShadowColorBox, layer.Shadow.Color);
+            layer.Shadow.Alpha = Math.Clamp(
+                Int(ElementShadowAlphaBox, layer.Shadow.Alpha), 0, 255);
+            layer.Shadow.OffsetX = Double(ElementShadowXBox, layer.Shadow.OffsetX);
+            layer.Shadow.OffsetY = Double(ElementShadowYBox, layer.Shadow.OffsetY);
             layer.Fill.Type = ElementFillTypeCombo.SelectedItem as string ?? "solid";
             layer.Fill.Binding = ElementFillBindingBox.Text.Trim();
             layer.Fill.Color = Int(ElementFillColorBox, layer.Fill.Color);

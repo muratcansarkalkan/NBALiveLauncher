@@ -8,6 +8,7 @@ const unsigned int RES_Y = GetPrivateProfileIntW(L"DISPLAY", L"RES_Y", 480, L".\
 const unsigned int INTRO = GetPrivateProfileIntW(L"BOOTUP", L"INTRO", 1, L".\\main.ini");
 const float ASPECT_RATIO = static_cast<float>(RES_X) / static_cast<float>(RES_Y);
 const float ASPECT_DIFF = ASPECT_RATIO / 1.33333f;
+static float gAspectScale07 = 1.0f;
 
 namespace live07 {
 
@@ -32,78 +33,196 @@ namespace live07 {
         float nearClip,
         float farClip)
     {
-        long double fovR; // st7
-        double w; // st6
-        double dist; // st7
-        float h; // [esp+Ch] [ebp+Ch]
+        const float w =
+            static_cast<float>(*reinterpret_cast<unsigned int*>(_this + 2));
+
+        const float h =
+            static_cast<float>(*reinterpret_cast<unsigned int*>(_this + 3));
+
+        if (h > 0.0f)
+        {
+            aspectRatio = w / h;
+
+            gAspectScale07 =
+                aspectRatio / (4.0f / 3.0f);
+
+            if (gAspectScale07 < 1.0f)
+                gAspectScale07 = 1.0f;
+        }
+        else
+        {
+            gAspectScale07 = 1.0f;
+        }
 
         _this[15] = 0.0f;
         _this[6] = fovY;
-        // _this[7] = aspectRatio;
+        _this[7] = aspectRatio;
         _this[8] = nearClip;
-        _this[9] = farClip * 2.0f;
+        _this[9] = farClip;
+
         memcpy(_this + 36, (void*)0xBBC7B0, 0x40u);
-        fovR = (double)(1.0f / tan(fovY * 0.0087266462f));
-        w = (double)*((unsigned int*)_this + 2); // mGeometry.mWidth
-        h = (float)*((unsigned int*)_this + 3); // mGeometry.mHeight
-        _this[7] = ((float)w / h); // aspectRatio
-        _this[47] = (float)-1.0f; // mViewMatrix.m44[2][3]
-        _this[36] = (float)(0.5f * w / ((float)w / h) * fovR);  // mViewMatrix.m44[0][0]
-        _this[41] = (float)(-(h * 0.5f * fovR)); // mViewMatrix.m44[1][1]
-        _this[44] = (float)(w * -0.5f - (double)*(int*)_this); // mViewMatrix.m44[2][0]
-        _this[45] = (float)((h * -0.5f - (double)*((int*)_this + 1))); // mViewMatrix.m44[2][1]
-        dist = nearClip - farClip;
-        _this[46] = (float)(nearClip / dist - 1.0f); // mViewMatrix.m44[2][2]
-        _this[50] = (float)(nearClip * farClip / dist); // mViewMatrix.m44[3][2]
+
+        const double fovR =
+            1.0 / tan(static_cast<double>(fovY) * 0.0087266462);
+
+        _this[47] = -1.0f;
+
+        _this[36] = static_cast<float>(
+            0.5 * static_cast<double>(w) /
+            static_cast<double>(aspectRatio) *
+            fovR
+            );
+
+        _this[41] = static_cast<float>(
+            -(static_cast<double>(h) * 0.5 * fovR)
+            );
+
+        _this[44] = static_cast<float>(
+            static_cast<double>(w) * -0.5 -
+            static_cast<double>(*reinterpret_cast<int*>(_this))
+            );
+
+        _this[45] = static_cast<float>(
+            static_cast<double>(h) * -0.5 -
+            static_cast<double>(*reinterpret_cast<int*>(_this + 1))
+            );
+
+        const double dist =
+            static_cast<double>(nearClip) -
+            static_cast<double>(farClip);
+
+        _this[46] = static_cast<float>(
+            static_cast<double>(nearClip) / dist - 1.0
+            );
+
+        _this[50] = static_cast<float>(
+            static_cast<double>(nearClip) *
+            static_cast<double>(farClip) / dist
+            );
+
         CallMethod<0x439FEA>(_this, a2);
+
         return a2;
     }
 
-    int SetTestInConicalFrustum(float* a1, DUMMY_ARG, float a2, bool cameraclip)
+    // NBA Live 07
+    int SetTestInConicalFrustum07(
+        float* a1,
+        DUMMY_ARG,
+        float radius,
+        bool cameraclip)
     {
-        float v5; // [esp+0h] [ebp-1Ch]
-        float v6; // [esp+Ch] [ebp-10h]
-        float v7; // [esp+10h] [ebp-Ch]
-        float v8; // [esp+14h] [ebp-8h]
-        float v9; // [esp+18h] [ebp-4h]
-        int v10; // [esp+20h] [ebp+4h]
-        float v11; // [esp+28h] [ebp+Ch]
-        float v12; // [esp+28h] [ebp+Ch]
+        const float dx =
+            a1[0] - patch::GetFloat(0xCF0614);
 
-        v7 = *a1 - patch::GetFloat(0xCF0614);
-        v8 = a1[1] - patch::GetFloat(0xCF0618);
-        v9 = a1[2] - patch::GetFloat(0xCF061C);
-        v6 = v9;
-        if (cameraclip && a2 > 2.0f && a2 < 10.0f)
-            v6 = v9 + a2;
-        *(float*)&v10 = sqrt(v8 * v8 + v7 * v7 + v6 * v6);
-        v11 = -((patch::GetFloat(0xCF0628) * (1.0f / *(float*)&v10 * v6)
-            + patch::GetFloat(0xCF0624) * (v8 * (1.0f / *(float*)&v10))
-            + patch::GetFloat(0xCF0620) * (v7 * (1.0f / *(float*)&v10)))
-            * *(float*)&v10);
-        if (patch::GetFloat(0xCF0604) - a2 <= v11 && patch::GetFloat(0xCF0608) + a2 >= v11)
+        const float dy =
+            a1[1] - patch::GetFloat(0xCF0618);
+
+        const float dz =
+            a1[2] - patch::GetFloat(0xCF061C);
+
+        float testZ = dz;
+
+        if (cameraclip && radius > 2.0f && radius < 10.0f)
+            testZ += radius;
+
+        const float distanceSq =
+            dx * dx +
+            dy * dy +
+            testZ * testZ;
+
+        const float distance =
+            sqrtf(distanceSq);
+
+        if (distance <= 0.000001f)
+            return 1;
+
+        const float depth = -(
+            dx * patch::GetFloat(0xCF0620) +
+            dy * patch::GetFloat(0xCF0624) +
+            testZ * patch::GetFloat(0xCF0628)
+            );
+
+        if (patch::GetFloat(0xCF0604) - radius <= depth &&
+            depth <= patch::GetFloat(0xCF0608) + radius)
         {
-            v5 = (patch::GetFloat(0xCF060C) * v11 + a2) * patch::GetFloat(0xCF0610);
-            v12 = *(float*)&v10 * *(float*)&v10 - v11 * v11;
-            if (v5 * v5 > v12 * 0.33333f)
+            const float originalConeSine =
+                patch::GetFloat(0xCF060C);
+
+            const float originalConeInvCosine =
+                patch::GetFloat(0xCF0610);
+
+            const float originalTan =
+                originalConeSine *
+                originalConeInvCosine;
+
+            /*
+                07's previous culling test used:
+
+                    v5² > v12 * 0.33333
+
+                Equivalent expansion:
+
+                    1 / sqrt(0.33333)
+                    ~= 1.73206
+
+                Preserve that baseline and then add the
+                widescreen aspect expansion.
+            */
+            constexpr float BASE_CULL_SCALE_07 =
+                1.73205948f;
+
+            const float widenedTan =
+                originalTan *
+                BASE_CULL_SCALE_07 *
+                gAspectScale07;
+
+            const float widenedConeInvCosine =
+                sqrtf(
+                    1.0f +
+                    widenedTan * widenedTan
+                );
+
+            const float widenedConeSine =
+                widenedTan /
+                widenedConeInvCosine;
+
+            const float coneRadius =
+                (depth * widenedConeSine + radius) *
+                widenedConeInvCosine;
+
+            float radialDistanceSq =
+                distanceSq -
+                depth * depth;
+
+            if (radialDistanceSq < 0.0f)
+                radialDistanceSq = 0.0f;
+
+            if (coneRadius * coneRadius > radialDistanceSq)
             {
                 if (!cameraclip)
                     return 1;
-                if (a2 >= 10.0f)
+
+                if (radius >= 10.0f)
                 {
-                    a2 = a2 + 5.0f;
+                    radius += 5.0f;
                 }
-                else if (0.5f * 0.5f * v5 > v12)
+                else if (
+                    0.25f *
+                    coneRadius *
+                    coneRadius >
+                    radialDistanceSq)
                 {
                     return 1;
                 }
-                if (*(float*)&v10 >= (double)a2)
+
+                if (distance >= radius)
                     return 1;
             }
         }
+
         return 0;
     }
-
 
     DWORD METHOD FEAptInterface_Render(DWORD* t, DUMMY_ARG, char a1, int a2)
     {
@@ -248,7 +367,7 @@ namespace live07 {
 void Install_LIVE07() {
     using namespace live07;
     patch::RedirectJump(0x438B11, SetPerspectiveProjection07);
-    patch::RedirectJump(0x67BE80, SetTestInConicalFrustum);
+    patch::RedirectJump(0x67BE80, SetTestInConicalFrustum07);
     for (const auto& resolution : ids) {
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 8, resolution.height);

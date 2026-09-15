@@ -26,6 +26,7 @@ struct Element {
     ElementType type;
     char binding[48];
     char text[96];
+    char textTemplate[256];
     char image[MAX_PATH];
     char font[32];
     Rect rect;
@@ -38,6 +39,14 @@ struct Element {
     float smallCapsScale;
     float fontHeight;
     D3DCOLOR textColor;
+    bool strokeEnabled;
+    D3DCOLOR strokeColor;
+    float strokeWidth;
+    bool shadowEnabled;
+    D3DCOLOR shadowColor;
+    int shadowAlpha;
+    float shadowOffsetX;
+    float shadowOffsetY;
     int opacity;
     FillType fillType;
     char fillBinding[48];

@@ -207,6 +207,14 @@ struct GenericStatState {
 GenericStatState g_genericStat = {};
 bool g_genericStatPresentationSuppressed = false;
 DWORD g_genericStatTransitionHiddenAt = 0;
+bool g_fullScreenTransitionActive = false;
+
+bool DeferTransientPresentation()
+{
+    return g_fullScreenTransitionActive && g_game &&
+        (g_game->version == GameVersion::Live2007 ||
+         g_game->version == GameVersion::Live2008);
+}
 
 struct StatCatalogEntry {
     DWORD control14;
@@ -318,7 +326,7 @@ void LoadCustomOverlaySettings()
 
     std::snprintf(slash + 1,
         MAX_PATH - static_cast<size_t>(slash + 1 - iniPath),
-        "popups\\%s\\scoreboard\\scoreboard.json", g_customOverlayName);
+        "assets\\popups\\%s\\scoreboard\\scoreboard.json", g_customOverlayName);
     std::strncpy(g_customOverlayScoreboardPath, iniPath,
         sizeof(g_customOverlayScoreboardPath) - 1);
 }
@@ -331,7 +339,7 @@ ULONGLONG GetPopupReloadFileStamp()
     char* slash = std::strrchr(path, '\\');
     if (!slash) return 0;
     std::snprintf(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - path),
-        "popups\\%s\\.reload", g_customOverlayName);
+        "assets\\popups\\%s\\.reload", g_customOverlayName);
     WIN32_FILE_ATTRIBUTE_DATA data = {};
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &data)) return 0;
     return (static_cast<ULONGLONG>(data.ftLastWriteTime.dwHighDateTime) << 32) |
@@ -497,8 +505,11 @@ void CaptureViolationPayload(DWORD* vector)
         g_violation.pausedAt = 0;
         g_violation.paused = false;
         g_violation.active = true;
-        if (g_violationPresentationSuppressed)
-            g_violationTransitionHiddenAt = g_violation.startedAt;
+        // Live 07/08 build transient payloads while their full-screen
+        // transition is still visible. Defer there; 05/06 display now.
+        g_violationPresentationSuppressed = DeferTransientPresentation();
+        g_violationTransitionHiddenAt =
+            g_violationPresentationSuppressed ? g_violation.startedAt : 0;
         scoreboardconfig::LoadViolation(g_customOverlayName);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -546,8 +557,9 @@ void CapturePlayCallPayload(DWORD* vector)
         g_playCall.payloadHash = hash;
         g_playCall.startedAt = GetTickCount();
         g_playCall.active = true;
-        if (g_playCallPresentationSuppressed)
-            g_playCallTransitionHiddenAt = g_playCall.startedAt;
+        g_playCallPresentationSuppressed = DeferTransientPresentation();
+        g_playCallTransitionHiddenAt =
+            g_playCallPresentationSuppressed ? g_playCall.startedAt : 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         g_playCall.active = false;
@@ -778,8 +790,11 @@ void __fastcall HookStatsDataStore(void* thisPtr, void*, DWORD* payload)
                 g_playerFoul.payloadHash = hash;
                 g_playerFoul.startedAt = GetTickCount();
                 g_playerFoul.active = true;
-                if (g_playerFoulPresentationSuppressed)
-                    g_playerFoulTransitionHiddenAt = g_playerFoul.startedAt;
+                g_playerFoulPresentationSuppressed =
+                    DeferTransientPresentation();
+                g_playerFoulTransitionHiddenAt =
+                    g_playerFoulPresentationSuppressed ?
+                        g_playerFoul.startedAt : 0;
             }
             else if (g_customOverlayEnabled && g_statsRequestHookInstalled &&
                 subtype.supported && values &&
@@ -927,9 +942,11 @@ void __fastcall HookStatsDataStore(void* thisPtr, void*, DWORD* payload)
                     g_genericStat.valueCase = valueCase;
                     g_genericStat.playerPayload = subtype.playerPayload;
                     g_genericStat.active = true;
-                    if (g_genericStatPresentationSuppressed)
-                        g_genericStatTransitionHiddenAt =
-                            g_genericStat.startedAt;
+                    g_genericStatPresentationSuppressed =
+                        DeferTransientPresentation();
+                    g_genericStatTransitionHiddenAt =
+                        g_genericStatPresentationSuppressed ?
+                            g_genericStat.startedAt : 0;
                 }
             }
         }
@@ -1218,6 +1235,7 @@ int __cdecl HookSendEvent(
         // overlays~viol.big. Full-screen transitions temporarily hide/freeze
         // the active custom instance; pauses permanently dismiss it.
         if (pauseEvent) {
+            g_fullScreenTransitionActive = false;
             g_violationPresentationSuppressed = true;
             g_violation.active = false;
             g_violation.paused = false;
@@ -1237,6 +1255,7 @@ int __cdecl HookSendEvent(
             g_introTransitionHiddenAt = 0;
         }
         else if (std::strcmp(name, "HideOverlaysEvent") == 0) {
+            g_fullScreenTransitionActive = true;
             if (!g_violationPresentationSuppressed && g_violation.active)
                 g_violationTransitionHiddenAt = GetTickCount();
             g_violationPresentationSuppressed = true;
@@ -1249,11 +1268,16 @@ int __cdecl HookSendEvent(
             if (!g_genericStatPresentationSuppressed && g_genericStat.active)
                 g_genericStatTransitionHiddenAt = GetTickCount();
             g_genericStatPresentationSuppressed = true;
-            if (!g_introPresentationSuppressed && g_intro.active)
-                g_introTransitionHiddenAt = GetTickCount();
+            // A full-screen transition permanently ends the current match
+            // intro. Keep payloadHash unchanged so GetOverlayData cannot
+            // recreate the same intro at tipoff. The normal end-of-game reset
+            // clears that hash so the following game's intro is accepted.
+            g_intro.active = false;
             g_introPresentationSuppressed = true;
+            g_introTransitionHiddenAt = 0;
         }
         else if (std::strcmp(name, "ShowOverlaysEvent") == 0) {
+            g_fullScreenTransitionActive = false;
             if (g_violationPresentationSuppressed && g_violation.active &&
                 g_violationTransitionHiddenAt) {
                 g_violation.startedAt +=
@@ -1279,13 +1303,13 @@ int __cdecl HookSendEvent(
                     GetTickCount() - g_genericStatTransitionHiddenAt;
             g_genericStatPresentationSuppressed = false;
             g_genericStatTransitionHiddenAt = 0;
-            if (g_introPresentationSuppressed && g_intro.active &&
-                g_introTransitionHiddenAt)
-                g_intro.startedAt += GetTickCount() - g_introTransitionHiddenAt;
+            // The previous intro was ended by HideOverlaysEvent. Re-arm
+            // presentation for a future new payload without reviving it.
             g_introPresentationSuppressed = false;
             g_introTransitionHiddenAt = 0;
         }
         else if (resumeEvent) {
+            g_fullScreenTransitionActive = false;
             // A pause killed the previous instance; resume merely allows the
             // next native violation request to create a new custom one.
             g_violationPresentationSuppressed = false;

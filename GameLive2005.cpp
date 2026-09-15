@@ -33,81 +33,203 @@ namespace live2005 {
         float nearClip,
         float farClip)
     {
-        long double fovR; // st7
-        double w; // st6
-        double dist; // st7
-        int savedregs; // [esp+0h] [ebp+0h] BYREF
-        float h; // [esp+Ch] [ebp+Ch]
+        const float width = static_cast<float>(*((unsigned int*)_this + 2));
+        const float height = static_cast<float>(*((unsigned int*)_this + 3));
 
-        _this[15] = 0.0f;
-        _this[6] = fovY;
-        // _this[7] = aspectRatio;
-        _this[8] = nearClip;
-        _this[9] = farClip * 2.0f;
+        if (height > 0.0f)
+            aspectRatio = width / height;
+
+        _this[15] = 0.0f;        // mGuardBandScale
+        _this[6] = fovY;        // mFrustum.mFov
+        _this[7] = aspectRatio; // mFrustum.mAspect
+        _this[8] = nearClip;    // mFrustum.mNearPlane
+        _this[9] = farClip;     // mFrustum.mFarPlane
+
         memcpy(_this + 36, (void*)0xB837F0, 0x40u);
-        fovR = (double)(1.0f / tan(fovY * 0.0087266462f));
-        w = (double)*((unsigned int*)_this + 2); // mGeometry.mWidth
-        h = (float)*((unsigned int*)_this + 3); // mGeometry.mHeight
-        _this[7] = ((float)w / h); // aspectRatio
-        _this[47] = (float)-1.0f; // mViewMatrix.m44[2][3]
-        _this[36] = (float)(0.5f * w / ((float)w / h) * fovR);  // mViewMatrix.m44[0][0]
-        _this[41] = (float)(-(h * 0.5f * fovR)); // mViewMatrix.m44[1][1]
-        _this[44] = (float)(w * -0.5f - (double)*(int*)_this); // mViewMatrix.m44[2][0]
-        _this[45] = (float)((h * -0.5f - (double)*((int*)_this + 1))); // mViewMatrix.m44[2][1]
-        dist = nearClip - farClip;
-        _this[46] = (float)(nearClip / dist - 1.0f); // mViewMatrix.m44[2][2]
-        _this[50] = (float)(nearClip * farClip / dist); // mViewMatrix.m44[3][2]
+
+        const double fovR =
+            1.0 / tan(static_cast<double>(fovY) * 0.0087266462);
+
+        _this[47] = -1.0f;
+
+        _this[36] = static_cast<float>(
+            0.5 * width / aspectRatio * fovR);
+
+        _this[41] = static_cast<float>(
+            -(height * 0.5 * fovR));
+
+        _this[44] = static_cast<float>(
+            width * -0.5 - static_cast<double>(*(int*)_this));
+
+        _this[45] = static_cast<float>(
+            height * -0.5 - static_cast<double>(*(int*)_this + 1));
+
+        const double dist =
+            static_cast<double>(nearClip) - static_cast<double>(farClip);
+
+        _this[46] = static_cast<float>(
+            static_cast<double>(nearClip) / dist - 1.0);
+
+        _this[50] = static_cast<float>(
+            static_cast<double>(nearClip) * static_cast<double>(farClip) / dist);
+
         CallMethod<0x6ED4F4>(_this, a2);
+
         return a2;
     }
 
-    int METHOD SetTestInConicalFrustum(float* _this, DUMMY_ARG, float* a2, float radius, bool cameraclip)
+    bool METHOD SetTestInConicalFrustum(
+        float* _this, DUMMY_ARG,
+        float* a2,
+        float radius,
+        bool cameraclip)
     {
-        float v6; // [esp+0h] [ebp-1Ch]
-        float v7; // [esp+Ch] [ebp-10h]
-        float v8; // [esp+10h] [ebp-Ch]
-        float v9; // [esp+14h] [ebp-8h]
-        float v10; // [esp+18h] [ebp-4h]
-        float a2a; // [esp+20h] [ebp+4h]
-        float cameraclipa; // [esp+28h] [ebp+Ch]
-        float cameraclipb; // [esp+28h] [ebp+Ch]
+        float dx = a2[0] - _this[4];
+        float dy = a2[1] - _this[5];
+        float dz = a2[2] - _this[6];
 
-        float ASPECT_IG = static_cast<float>(patch::GetUInt(0xC56BC8)) / static_cast<float>(patch::GetUInt(0xC56BCC));
-        float ASPECT_DIFF = ASPECT_IG / 1.33333f;
+        float testZ = dz;
 
-        v8 = *a2 - _this[4];
-        v9 = a2[1] - _this[5];
-        v10 = a2[2] - _this[6];
-        v7 = v10;
         if (cameraclip && radius > 2.0f && radius < 10.0f)
-            v7 = v10 + radius;
-        a2a = sqrt(v9 * v9 + v8 * v8 + v7 * v7);
-        cameraclipa = -((1.0f / a2a * v7 * _this[9] + v9 * (1.0f / a2a) * _this[8] + v8 * (1.0f / a2a) * _this[7]) * a2a);
+            testZ += radius;
 
-        // by default, it returns 0 but there are exceptions
-        // first one is nearplane case, second one is farplane case
-        if ((*_this - radius) / ASPECT_DIFF <= cameraclipa && (radius + _this[1]) * ASPECT_DIFF >= cameraclipa)
+        const float distanceSq =
+            dx * dx +
+            dy * dy +
+            testZ * testZ;
+
+        const float distance = sqrtf(distanceSq);
+
+        if (distance <= 0.000001f)
+            return true;
+
+        /*
+            Projection aspect actually being used by the game.
+        */
+        const float width =
+            static_cast<float>(patch::GetUInt(0xC56BC8));
+
+        const float height =
+            static_cast<float>(patch::GetUInt(0xC56BCC));
+
+        float aspectScale = 1.0f;
+
+        if (height > 0.0f)
         {
-            v6 = (cameraclipa * _this[2] + radius) * _this[3];
-            cameraclipb = a2a * a2a - cameraclipa * cameraclipa;
-            // original one didn't have 0.5 multiplier
-            if (v6 * v6 > (cameraclipb / ASPECT_DIFF))
+            const float aspect = width / height;
+
+            /*
+                Original game's intended aspect = 4:3.
+            */
+            aspectScale = aspect / (4.0f / 3.0f);
+
+            /*
+                Never make the original frustum narrower.
+            */
+            if (aspectScale < 1.0f)
+                aspectScale = 1.0f;
+        }
+
+        /*
+            Projection of object center onto cone axis.
+
+            Original algebra:
+
+            -((dz / distance * axisZ +
+               dy / distance * axisY +
+               dx / distance * axisX) * distance)
+
+            simplifies exactly to:
+
+            -(dx*axisX + dy*axisY + dz*axisZ)
+        */
+        const float depth = -(
+            testZ * _this[9] +
+            dy * _this[8] +
+            dx * _this[7]
+            );
+
+        /*
+            Near/far clipping has nothing to do with aspect ratio.
+        */
+        if (_this[0] - radius <= depth &&
+            depth <= _this[1] + radius)
+        {
+            /*
+                Original cone:
+
+                    sin(theta) = mConeSine
+                    1/cos(theta) = mConeInvCosine
+
+                Therefore:
+
+                    tan(theta) = sin(theta) / cos(theta)
+                               = mConeSine * mConeInvCosine
+
+                Widescreen increases the horizontal tangent.
+            */
+            const float originalTan =
+                _this[2] * _this[3];
+
+            const float widescreenTan =
+                originalTan * aspectScale;
+
+            /*
+                Recover sin(theta) and 1/cos(theta)
+                from the widened tangent.
+
+                    sec(theta) = sqrt(1 + tan²(theta))
+                    sin(theta) = tan(theta) / sec(theta)
+            */
+            const float coneInvCos =
+                sqrtf(1.0f + widescreenTan * widescreenTan);
+
+            const float coneSin =
+                widescreenTan / coneInvCos;
+
+            const float coneRadius =
+                (depth * coneSin + radius) * coneInvCos;
+
+            /*
+                Squared perpendicular distance from the cone axis.
+            */
+            const float radialDistanceSq =
+                distanceSq - depth * depth;
+
+            if (coneRadius * coneRadius > radialDistanceSq)
             {
                 if (!cameraclip)
-                    return 1;
+                    return true;
+
                 if (radius >= 10.0f)
                 {
-                    radius = radius + 5.0f;
+                    radius += 5.0f;
                 }
-                else if (0.25f * v6 > cameraclipb)
+                else
                 {
-                    return 1;
+                    /*
+                        Preserve the game's special camera clipping
+                        path here.
+
+                        See note below concerning flt_BF45DC.
+                    */
+                    const float cameraClipScale =
+                        patch::GetFloat(0xBF45DC);
+
+                    if (cameraClipScale * cameraClipScale *
+                        coneRadius * coneRadius >
+                        radialDistanceSq)
+                    {
+                        return true;
+                    }
                 }
-                if (a2a >= (double)radius)
-                    return 1;
+
+                if (distance >= radius)
+                    return true;
             }
         }
-        return 0;
+
+        return false;
     }
 
     // Changes resolution after exiting game but remains as sample ASM injection

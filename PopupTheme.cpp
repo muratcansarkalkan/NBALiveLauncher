@@ -279,7 +279,7 @@ bool Load(const char* themeName)
         return false;
     }
     const std::string themeDirectory =
-        gameDirectory + "\\popups\\" + themeName + "\\scoreboard";
+        gameDirectory + "\\assets\\popups\\" + themeName + "\\scoreboard";
     std::strncpy(g_themeDirectory, themeDirectory.c_str(), MAX_PATH - 1);
     const std::string jsonPath = themeDirectory + "\\teams.json";
     std::string json;
@@ -441,7 +441,7 @@ IDirect3DTexture9* GetOverlayTexture(IDirect3DDevice9* device,
         ReleaseTextures();
         g_textureDevice = device;
     }
-    const std::string path = GetGameDirectory() + "\\popups\\" + themeName +
+    const std::string path = GetGameDirectory() + "\\assets\\popups\\" + themeName +
         "\\" + overlayDirectory + "\\" + relativePath;
     char fullPath[MAX_PATH] = {};
     std::strncpy(fullPath, path.c_str(), MAX_PATH - 1);
