@@ -69,8 +69,88 @@ namespace
     // NBA Live 2005
     // =====================================================================
 
+    constexpr std::uintptr_t k05PageSizeAddress   = 0x00BCC9EC;
+    constexpr std::uintptr_t k05FixedArenaAddress = 0x00BCC9F0;
+    constexpr std::uintptr_t k05RealMemoryAddress = 0x00BCC9F4;
+
+    constexpr DWORD k05ExpectedPageSize   = 0x00002000; // 8 KiB
+    constexpr DWORD k05OriginalFixedArena = 0x01040000; // 16.25 MiB
+    constexpr DWORD k05ExpandedFixedArena = 0x02080000; // 32.5 MiB
+    constexpr DWORD k05OriginalRealMemory = 0x04600000; // 70 MiB
+    constexpr DWORD k05ExpandedRealMemory = 0x08C00000; // 140 MiB
+
     bool InstallLive2005MemoryUpgrade()
     {
+        DWORD pageSize = 0;
+        DWORD fixedArena = 0;
+        DWORD realMemory = 0;
+
+        __try
+        {
+            pageSize =
+                *reinterpret_cast<const DWORD*>(k05PageSizeAddress);
+
+            fixedArena =
+                *reinterpret_cast<const DWORD*>(k05FixedArenaAddress);
+
+            realMemory =
+                *reinterpret_cast<const DWORD*>(k05RealMemoryAddress);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 2005 memory config read failed.\n");
+            return false;
+        }
+
+        if (pageSize != k05ExpectedPageSize ||
+            fixedArena != k05OriginalFixedArena ||
+            realMemory != k05OriginalRealMemory)
+        {
+            char buf[256];
+            sprintf_s(
+                buf,
+                "[MemoryUpgrader] NBA Live 2005 memory verification failed: "
+                "page=%08X fixedArena=%08X realMemory=%08X\n",
+                pageSize,
+                fixedArena,
+                realMemory);
+            MemoryLog(buf);
+            return false;
+        }
+
+        if (!PatchBytes(
+                k05FixedArenaAddress,
+                &k05ExpandedFixedArena,
+                sizeof(k05ExpandedFixedArena)))
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 2005 fixed-page arena patch failed.\n");
+            return false;
+        }
+
+        if (!PatchBytes(
+                k05RealMemoryAddress,
+                &k05ExpandedRealMemory,
+                sizeof(k05ExpandedRealMemory)))
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 2005 RealMemory arena patch failed.\n");
+            return false;
+        }
+
+        {
+            char buf[256];
+            sprintf_s(
+                buf,
+                "[MemoryUpgrader] NBA Live 2005 pre-construction config: "
+                "fixedArena=%08X page=%08X realMemory=%08X\n",
+                *reinterpret_cast<const DWORD*>(k05FixedArenaAddress),
+                *reinterpret_cast<const DWORD*>(k05PageSizeAddress),
+                *reinterpret_cast<const DWORD*>(k05RealMemoryAddress));
+            MemoryLog(buf);
+        }
+
         constexpr std::uintptr_t kStack       = 0x007C186D;
         constexpr std::uintptr_t kWrite       = 0x007C193E;
         constexpr std::uintptr_t kReadNext    = 0x007C1AC6;
@@ -161,10 +241,19 @@ namespace
             PatchBytes(kReadLastSub, pReadLastSub, sizeof(pReadLastSub)) &&
             PatchBytes(kReadLast,    pReadLast,    sizeof(pReadLast));
 
-        OutputDebugStringA(
-            ok
-                ? "[MemoryUpgrader] NBA Live 2005 capacity: 118 -> 512 entries.\n"
-                : "[MemoryUpgrader] NBA Live 2005 patch failed.\n");
+        if (ok)
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 2005 memory expansion active: "
+                "RealMemory 70 MiB -> 140 MiB; "
+                "MasterFixedPageAllocator 16.25 MiB -> 32.5 MiB; "
+                "temporary resource list 118 -> 512 entries.\n");
+        }
+        else
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 2005 temporary-list patch failed.\n");
+        }
 
         return ok;
     }
@@ -174,12 +263,15 @@ namespace
     // NBA Live 06
     // =====================================================================
 
-    constexpr std::uintptr_t k06PageSizeAddress  = 0x00C3BB6C;
-    constexpr std::uintptr_t k06ArenaSizeAddress = 0x00C3BB70;
+    constexpr std::uintptr_t k06PageSizeAddress   = 0x00C3BB6C;
+    constexpr std::uintptr_t k06ArenaSizeAddress  = 0x00C3BB70;
+    constexpr std::uintptr_t k06RealMemoryAddress = 0x00C3BB74;
 
-    constexpr DWORD k06ExpectedPageSize = 0x00002000; // 8 KiB
-    constexpr DWORD k06OriginalArena    = 0x01040000; // 16.25 MiB
-    constexpr DWORD k06ExpandedArena    = 0x02080000; // 32.5 MiB
+    constexpr DWORD k06ExpectedPageSize   = 0x00002000; // 8 KiB
+    constexpr DWORD k06OriginalArena      = 0x01040000; // 16.25 MiB
+    constexpr DWORD k06ExpandedArena      = 0x02080000; // 32.5 MiB
+    constexpr DWORD k06OriginalRealMemory = 0x04600000; // 70 MiB
+    constexpr DWORD k06ExpandedRealMemory = 0x08C00000; // 140 MiB
 
     constexpr std::uintptr_t k06AcquireAllocatorAddress = 0x004176F0;
     constexpr std::uintptr_t k06MasterAllocatorCall     = 0x00417B1A;
@@ -259,6 +351,7 @@ namespace
     {
         DWORD pageSize = 0;
         DWORD arenaSize = 0;
+        DWORD realMemorySize = 0;
 
         __try
         {
@@ -267,6 +360,9 @@ namespace
 
             arenaSize =
                 *reinterpret_cast<const DWORD*>(k06ArenaSizeAddress);
+
+            realMemorySize =
+                *reinterpret_cast<const DWORD*>(k06RealMemoryAddress);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -277,10 +373,18 @@ namespace
         }
 
         if (pageSize != k06ExpectedPageSize ||
-            arenaSize != k06OriginalArena)
+            arenaSize != k06OriginalArena ||
+            realMemorySize != k06OriginalRealMemory)
         {
-            MemoryLog(
-                "[MemoryUpgrader] NBA Live 06 allocator verification failed.\n");
+            char buf[256];
+            sprintf_s(
+                buf,
+                "[MemoryUpgrader] NBA Live 06 allocator verification failed: "
+                "page=%08X fixedArena=%08X realMemory=%08X\n",
+                pageSize,
+                arenaSize,
+                realMemorySize);
+            MemoryLog(buf);
 
             return false;
         }
@@ -291,19 +395,31 @@ namespace
                 sizeof(k06ExpandedArena)))
         {
             MemoryLog(
-                "[MemoryUpgrader] NBA Live 06 arena patch failed.\n");
+                "[MemoryUpgrader] NBA Live 06 fixed-page arena patch failed.\n");
+
+            return false;
+        }
+
+        if (!PatchBytes(
+                k06RealMemoryAddress,
+                &k06ExpandedRealMemory,
+                sizeof(k06ExpandedRealMemory)))
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 06 RealMemory arena patch failed.\n");
 
             return false;
         }
 
         {
-            char buf[192];
+            char buf[256];
             sprintf_s(
                 buf,
                 "[MemoryUpgrader] 06 pre-construction config: "
-                "arena=%08X page=%08X\n",
+                "fixedArena=%08X page=%08X realMemory=%08X\n",
                 *reinterpret_cast<const DWORD*>(k06ArenaSizeAddress),
-                *reinterpret_cast<const DWORD*>(k06PageSizeAddress));
+                *reinterpret_cast<const DWORD*>(k06PageSizeAddress),
+                *reinterpret_cast<const DWORD*>(k06RealMemoryAddress));
             MemoryLog(buf);
         }
 
@@ -313,11 +429,220 @@ namespace
             AcquireMasterAllocatorHook);
 
         MemoryLog(
-            "[MemoryUpgrader] NBA Live 06 MasterFixedPageAllocator config: "
-            "16.25 MiB -> 32.5 MiB (2080 -> 4160 pages).\n");
+            "[MemoryUpgrader] NBA Live 06 memory expansion active: "
+            "RealMemory 70 MiB -> 140 MiB; "
+            "MasterFixedPageAllocator 16.25 MiB -> 32.5 MiB.\n");
 
         return true;
     }
+
+    // =====================================================================
+    // NBA Live 07
+    //
+    // Services::Memory::Initialize @ 00415650
+    //
+    //   C52B2C = 00002000  page size = 8 KiB
+    //   C52B30 = 00D20000  fixed-page arena = 13.125 MiB
+    //   C52B34 = 04600000  RealMemory arena = 70 MiB
+    //
+    // The RealMemory init path matches 2005/06:
+    //   mMemOpts.size       <- C52B34
+    //   mMemOpts.backing    <- malloc(size)
+    //   Scf::RealMemory::Init(&mMemOpts)
+    //
+    // Preserve the game's own ratio by doubling both arenas.
+    // =====================================================================
+
+    constexpr std::uintptr_t k07PageSizeAddress   = 0x00C52B2C;
+    constexpr std::uintptr_t k07FixedArenaAddress = 0x00C52B30;
+    constexpr std::uintptr_t k07RealMemoryAddress = 0x00C52B34;
+
+    constexpr DWORD k07ExpectedPageSize   = 0x00002000; // 8 KiB
+    constexpr DWORD k07OriginalFixedArena = 0x00D20000; // 13.125 MiB
+    constexpr DWORD k07ExpandedFixedArena = 0x01A40000; // 26.25 MiB
+    constexpr DWORD k07OriginalRealMemory = 0x04600000; // 70 MiB
+    constexpr DWORD k07ExpandedRealMemory = 0x08C00000; // 140 MiB
+
+    bool InstallLive07MemoryUpgrade()
+    {
+        DWORD pageSize = 0;
+        DWORD fixedArena = 0;
+        DWORD realMemory = 0;
+
+        __try
+        {
+            pageSize =
+                *reinterpret_cast<const DWORD*>(k07PageSizeAddress);
+
+            fixedArena =
+                *reinterpret_cast<const DWORD*>(k07FixedArenaAddress);
+
+            realMemory =
+                *reinterpret_cast<const DWORD*>(k07RealMemoryAddress);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 07 memory config read failed.\n");
+            return false;
+        }
+
+        if (pageSize != k07ExpectedPageSize ||
+            fixedArena != k07OriginalFixedArena ||
+            realMemory != k07OriginalRealMemory)
+        {
+            char buf[256];
+            sprintf_s(
+                buf,
+                "[MemoryUpgrader] NBA Live 07 memory verification failed: "
+                "page=%08X fixedArena=%08X realMemory=%08X\n",
+                pageSize,
+                fixedArena,
+                realMemory);
+            MemoryLog(buf);
+            return false;
+        }
+
+        if (!PatchBytes(
+                k07FixedArenaAddress,
+                &k07ExpandedFixedArena,
+                sizeof(k07ExpandedFixedArena)))
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 07 fixed-page arena patch failed.\n");
+            return false;
+        }
+
+        if (!PatchBytes(
+                k07RealMemoryAddress,
+                &k07ExpandedRealMemory,
+                sizeof(k07ExpandedRealMemory)))
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 07 RealMemory arena patch failed.\n");
+            return false;
+        }
+
+        char buf[320];
+        sprintf_s(
+            buf,
+            "[MemoryUpgrader] NBA Live 07 memory expansion active: "
+            "RealMemory 70 MiB -> 140 MiB; "
+            "MasterFixedPageAllocator 13.125 MiB -> 26.25 MiB; "
+            "page=%08X fixedArena=%08X realMemory=%08X\n",
+            *reinterpret_cast<const DWORD*>(k07PageSizeAddress),
+            *reinterpret_cast<const DWORD*>(k07FixedArenaAddress),
+            *reinterpret_cast<const DWORD*>(k07RealMemoryAddress));
+
+        MemoryLog(buf);
+        return true;
+    }
+
+
+    // =====================================================================
+    // NBA Live 08
+    //
+    // Services::Memory::Initialize @ 00415B40
+    //
+    //   D0FAF4 = 00002000  page size = 8 KiB
+    //   D0FAF8 = 00D20000  fixed-page arena = 13.125 MiB
+    //   D0FAFC = 04600000  RealMemory arena = 70 MiB
+    //
+    // RealMemory thunk:
+    //   004536E0 -> 00E2A936
+    //
+    // RealMemory body confirms:
+    //   [opts+00] = arena size
+    //   [opts+14] = supplied backing buffer
+    //
+    // Preserve the game's original sizing ratio by doubling both arenas.
+    // =====================================================================
+
+    constexpr std::uintptr_t k08PageSizeAddress   = 0x00D0FAF4;
+    constexpr std::uintptr_t k08FixedArenaAddress = 0x00D0FAF8;
+    constexpr std::uintptr_t k08RealMemoryAddress = 0x00D0FAFC;
+
+    constexpr DWORD k08ExpectedPageSize   = 0x00002000; // 8 KiB
+    constexpr DWORD k08OriginalFixedArena = 0x00D20000; // 13.125 MiB
+    constexpr DWORD k08ExpandedFixedArena = 0x01A40000; // 26.25 MiB
+    constexpr DWORD k08OriginalRealMemory = 0x04600000; // 70 MiB
+    constexpr DWORD k08ExpandedRealMemory = 0x08C00000; // 140 MiB
+
+    bool InstallLive08MemoryUpgrade()
+    {
+        DWORD pageSize = 0;
+        DWORD fixedArena = 0;
+        DWORD realMemory = 0;
+
+        __try
+        {
+            pageSize =
+                *reinterpret_cast<const DWORD*>(k08PageSizeAddress);
+
+            fixedArena =
+                *reinterpret_cast<const DWORD*>(k08FixedArenaAddress);
+
+            realMemory =
+                *reinterpret_cast<const DWORD*>(k08RealMemoryAddress);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 08 memory config read failed.\n");
+            return false;
+        }
+
+        if (pageSize != k08ExpectedPageSize ||
+            fixedArena != k08OriginalFixedArena ||
+            realMemory != k08OriginalRealMemory)
+        {
+            char buf[256];
+            sprintf_s(
+                buf,
+                "[MemoryUpgrader] NBA Live 08 memory verification failed: "
+                "page=%08X fixedArena=%08X realMemory=%08X\n",
+                pageSize,
+                fixedArena,
+                realMemory);
+            MemoryLog(buf);
+            return false;
+        }
+
+        if (!PatchBytes(
+                k08FixedArenaAddress,
+                &k08ExpandedFixedArena,
+                sizeof(k08ExpandedFixedArena)))
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 08 fixed-page arena patch failed.\n");
+            return false;
+        }
+
+        if (!PatchBytes(
+                k08RealMemoryAddress,
+                &k08ExpandedRealMemory,
+                sizeof(k08ExpandedRealMemory)))
+        {
+            MemoryLog(
+                "[MemoryUpgrader] NBA Live 08 RealMemory arena patch failed.\n");
+            return false;
+        }
+
+        char buf[320];
+        sprintf_s(
+            buf,
+            "[MemoryUpgrader] NBA Live 08 memory expansion active: "
+            "RealMemory 70 MiB -> 140 MiB; "
+            "MasterFixedPageAllocator 13.125 MiB -> 26.25 MiB; "
+            "page=%08X fixedArena=%08X realMemory=%08X\n",
+            *reinterpret_cast<const DWORD*>(k08PageSizeAddress),
+            *reinterpret_cast<const DWORD*>(k08FixedArenaAddress),
+            *reinterpret_cast<const DWORD*>(k08RealMemoryAddress));
+
+        MemoryLog(buf);
+        return true;
+    }
+
 }
 
 
@@ -338,7 +663,21 @@ void InitializeMemoryUpgrader()
     if (ep == 0x40109F &&
         plugin::patch::GetFloat(0xBD832C) == 1.3333334f)
     {
-        //InstallLive06MemoryUpgrade();
+        InstallLive06MemoryUpgrade();
+        return;
+    }
+
+    if (ep == 0x40109F &&
+        plugin::patch::GetFloat(0xBBBC3C) == 1.3333334f)
+    {
+        InstallLive07MemoryUpgrade();
+        return;
+    }
+
+    if (ep == 0x40109F &&
+        plugin::patch::GetFloat(0xC3DF84) == 1.3333334f)
+    {
+        InstallLive08MemoryUpgrade();
         return;
     }
 }

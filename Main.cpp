@@ -22,7 +22,6 @@ void NBAResolution0508() {
     case 0x40109F:
         if (patch::GetFloat(0xBD832C) == 1.3333334f) { // NBA Live 06 1.0 NOCD
             Install_LIVE06();
-            //InitializeJumbotronRuntime();
 
         }
         else if (patch::GetFloat(0xBBBC3C) == 1.3333334f) { // NBA Live 07 1.1 NOCD  
@@ -49,5 +48,7 @@ public:
         InitializeShotClock();
         InitializeStartupTeams();
         InitializeStadiumDornaConfig();
+		InitializeJumbotronRuntime();
+
     }
 } g_nbaLiveLauncher;

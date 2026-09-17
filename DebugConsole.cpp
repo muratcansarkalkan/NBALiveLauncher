@@ -18,6 +18,8 @@ bool g_failedFiles = true;
 bool g_showCaller = true;
 bool g_crashes = true;
 bool g_assetFiles = true;
+bool g_animBanks = false;
+bool g_live07CleanupFix = true;
 HANDLE g_console = nullptr;
 CRITICAL_SECTION g_consoleLock;
 bool g_lockReady = false;
@@ -87,17 +89,28 @@ bool IsInterestingAssetName(const char* name) {
 AssetRequestKind ClassifyAssetRequest(void* caller) {
     const uintptr_t ret = reinterpret_cast<uintptr_t>(caller);
 
-    // NBA Live 06:
-    // 006DD915 call FileSystem_OpenResolved
-    // 006DD91A ... returned object is reduced to boolean existence state.
+    // NBA Live 06
+    // 006DD915 call FileSystem_OpenResolved -> 006DD91A: boolean probe
+    // 006DD94D call FileSystem_OpenResolved -> 006DD952: retained file object
     if (ret == 0x006DD91A)
         return ASSET_REQUEST_PROBE;
-
-    // NBA Live 06:
-    // 006DD94D call FileSystem_OpenResolved
-    // 006DD952 ...
-    // 006DD955 mov [esi+14h],eax  -- returned file object is retained.
     if (ret == 0x006DD952)
+        return ASSET_REQUEST_ACQUIRE;
+
+    // NBA Live 07
+    // 008004EA call FileSystem_OpenResolved -> 008004EF: boolean probe
+    // 00800522 call FileSystem_OpenResolved -> 00800527: retained file object
+    if (ret == 0x008004EF)
+        return ASSET_REQUEST_PROBE;
+    if (ret == 0x00800527)
+        return ASSET_REQUEST_ACQUIRE;
+
+    // NBA Live 08
+    // 0082F509 call FileSystem_OpenResolved -> 0082F50E: boolean probe
+    // 0082F541 call FileSystem_OpenResolved -> 0082F546: retained file object
+    if (ret == 0x0082F50E)
+        return ASSET_REQUEST_PROBE;
+    if (ret == 0x0082F546)
         return ASSET_REQUEST_ACQUIRE;
 
     return ASSET_REQUEST_OTHER;
@@ -251,27 +264,68 @@ void PrintFileResult(const char* path, HANDLE result, DWORD error, void* caller)
     LeaveCriticalSection(&g_consoleLock);
 }
 
-HANDLE WINAPI HookCreateFileA(LPCSTR fileName, DWORD access, DWORD share,
-    LPSECURITY_ATTRIBUTES sa, DWORD creation, DWORD flags, HANDLE templ) {
+HANDLE WINAPI HookCreateFileA(
+    LPCSTR fileName,
+    DWORD access,
+    DWORD share,
+    LPSECURITY_ATTRIBUTES sa,
+    DWORD creation,
+    DWORD flags,
+    HANDLE templ)
+{
     void* caller = _ReturnAddress();
-    HANDLE h = g_CreateFileA(fileName, access, share, sa, creation, flags, templ);
-    DWORD error = (h == INVALID_HANDLE_VALUE) ? GetLastError() : ERROR_SUCCESS;
+
+    HANDLE h = g_CreateFileA(
+        fileName, access, share, sa, creation, flags, templ);
+
+    // Preserve EXACT Win32 state returned by CreateFileA.
+    const DWORD error = GetLastError();
+
     PrintFileResult(fileName, h, error, caller);
-    if (h != INVALID_HANDLE_VALUE) RememberHandle(h, fileName);
+
+    if (h != INVALID_HANDLE_VALUE)
+        RememberHandle(h, fileName);
+
     SetLastError(error);
     return h;
 }
 
-HANDLE WINAPI HookCreateFileW(LPCWSTR fileName, DWORD access, DWORD share,
-    LPSECURITY_ATTRIBUTES sa, DWORD creation, DWORD flags, HANDLE templ) {
+HANDLE WINAPI HookCreateFileW(
+    LPCWSTR fileName,
+    DWORD access,
+    DWORD share,
+    LPSECURITY_ATTRIBUTES sa,
+    DWORD creation,
+    DWORD flags,
+    HANDLE templ)
+{
     void* caller = _ReturnAddress();
-    HANDLE h = g_CreateFileW(fileName, access, share, sa, creation, flags, templ);
-    DWORD error = (h == INVALID_HANDLE_VALUE) ? GetLastError() : ERROR_SUCCESS;
+
+    HANDLE h = g_CreateFileW(
+        fileName, access, share, sa, creation, flags, templ);
+
+    // Capture it BEFORE WideCharToMultiByte / printf / anything else.
+    const DWORD error = GetLastError();
 
     char path[1024] = "<wide path>";
-    if (fileName) WideCharToMultiByte(CP_ACP, 0, fileName, -1, path, sizeof(path), nullptr, nullptr);
+
+    if (fileName) {
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            fileName,
+            -1,
+            path,
+            sizeof(path),
+            nullptr,
+            nullptr);
+    }
+
     PrintFileResult(path, h, error, caller);
-    if (h != INVALID_HANDLE_VALUE) RememberHandle(h, path);
+
+    if (h != INVALID_HANDLE_VALUE)
+        RememberHandle(h, path);
+
     SetLastError(error);
     return h;
 }
@@ -330,6 +384,718 @@ bool PatchIAT(const char* dllName, const char* procName, void* replacement, void
 }
 
 
+
+#if defined(_M_IX86)
+
+// -------------------------------------------------------------------------
+// NBA Live 07 invalid resource-owner diagnostics
+// -------------------------------------------------------------------------
+//
+// Wrapper @ 0080B32B:
+//   arg1 = result/status pointer
+//   arg2 = resource object
+//   [resource+2C] = owner/manager pointer
+//
+// It forwards that owner pointer as ECX to 0080B103. The observed crash at
+// 0080B10B is the first dereference of owner+1C, meaning the owner pointer was
+// already invalid before entering 0080B103.
+
+struct Live07ResourceOwnerContext {
+    volatile LONG valid;
+    DWORD threadId;
+    uintptr_t caller;
+    uintptr_t resultPtr;
+    uintptr_t objectPtr;
+    uintptr_t ownerPtr;
+
+    DWORD objectWords[16];
+    DWORD ownerWords[16];
+
+    BOOL objectReadable;
+    BOOL ownerReadable;
+
+    uintptr_t objectRegionBase;
+    SIZE_T objectRegionSize;
+    DWORD objectProtect;
+    DWORD objectRegionType;
+    uintptr_t objectAllocationBase;
+    DWORD objectAllocationProtect;
+
+    uintptr_t ownerRegionBase;
+    SIZE_T ownerRegionSize;
+    DWORD ownerProtect;
+    DWORD ownerRegionType;
+    uintptr_t ownerAllocationBase;
+    DWORD ownerAllocationProtect;
+
+    BOOL cleanupArrayMatch;
+    uintptr_t cleanupObject;
+    uintptr_t cleanupSlotAddress;
+    DWORD cleanupSlotIndex;
+    DWORD cleanupSlots[20];
+};
+
+Live07ResourceOwnerContext g_live07ResourceOwner = {};
+
+
+struct Live07CleanupContext {
+    volatile LONG valid;
+    DWORD threadId;
+    uintptr_t caller;
+    uintptr_t cleanupObject;
+};
+
+Live07CleanupContext g_live07Cleanup = {};
+
+void __cdecl CaptureLive07CleanupEntry(
+    uintptr_t cleanupObject,
+    const uintptr_t* entryStack)
+{
+    g_live07Cleanup.threadId = GetCurrentThreadId();
+    g_live07Cleanup.cleanupObject = cleanupObject;
+    g_live07Cleanup.caller =
+        entryStack ? entryStack[0] : 0;
+    InterlockedExchange(&g_live07Cleanup.valid, 1);
+}
+
+__declspec(naked) void HookLive07CleanupEntry()
+{
+    __asm {
+        // Original entry to 00689B70:
+        //   ECX = cleanup object
+        //
+        // Preserve the complete entry state before logging.
+        pushfd
+        pushad
+
+        // Original ECX saved by pushad.
+        mov     eax, [esp+24]
+
+        // Original entry ESP = current ESP + 36.
+        lea     edx, [esp+36]
+
+        push    edx
+        push    eax
+        call    CaptureLive07CleanupEntry
+        add     esp, 8
+
+        popad
+        popfd
+
+        // Reproduce overwritten bytes:
+        //   83 EC 0C    sub esp,0Ch
+        //   53          push ebx
+        //   55          push ebp
+        sub     esp, 0Ch
+        push    ebx
+        push    ebp
+
+        push    0689B75h
+        ret
+    }
+}
+
+
+using Live07ReleaseResource_t = void (__cdecl *)(void* resultPtr, void* resourceObject);
+
+bool IsReadablePointerRange(uintptr_t address, size_t size);
+
+bool IsReadableObject07(uintptr_t p, size_t size)
+{
+    return IsReadablePointerRange(p, size);
+}
+
+bool IsSafeCleanupResource07(uintptr_t objectPtr, uintptr_t& ownerPtr)
+{
+    ownerPtr = 0;
+
+    if (!objectPtr || !IsReadableObject07(objectPtr, 0x30))
+        return false;
+
+    __try {
+        ownerPtr =
+            *reinterpret_cast<const uintptr_t*>(objectPtr + 0x2C);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        ownerPtr = 0;
+        return false;
+    }
+
+    if (!ownerPtr || !IsReadableObject07(ownerPtr, 0x20))
+        return false;
+
+    return true;
+}
+
+void __cdecl SafeReleaseResource07(void* resultPtr, void* resourceObject)
+{
+    const uintptr_t objectPtr =
+        reinterpret_cast<uintptr_t>(resourceObject);
+
+    uintptr_t ownerPtr = 0;
+    if (!IsSafeCleanupResource07(objectPtr, ownerPtr)) {
+        if (g_lockReady) {
+            EnterCriticalSection(&g_consoleLock);
+            PrintPrefix(
+                "FIX07",
+                FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+
+            std::printf(
+                "SKIP stale cleanup resource object=%08lX owner=%08lX\n",
+                static_cast<unsigned long>(objectPtr),
+                static_cast<unsigned long>(ownerPtr));
+
+            LeaveCriticalSection(&g_consoleLock);
+        }
+
+        // The original cleanup loop clears its slot immediately after the
+        // call returns, so returning here safely discards the stale entry.
+        return;
+    }
+
+    reinterpret_cast<Live07ReleaseResource_t>(0x0080B32B)(
+        resultPtr,
+        resourceObject);
+}
+
+bool InstallLive07CleanupGuard()
+{
+    constexpr uintptr_t callAddress = 0x00689BA5;
+    constexpr size_t patchLength = 5;
+
+    // Original:
+    //   E8 81 17 18 00    call 0080B32B
+    const BYTE expected[patchLength] = {
+        0xE8, 0x81, 0x17, 0x18, 0x00
+    };
+
+    BYTE* target = reinterpret_cast<BYTE*>(callAddress);
+
+    __try {
+        if (std::memcmp(target, expected, patchLength) != 0)
+            return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            target,
+            patchLength,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtect))
+        return false;
+
+    target[0] = 0xE8;
+    *reinterpret_cast<int32_t*>(target + 1) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&SafeReleaseResource07) -
+            (callAddress + 5));
+
+    DWORD ignored = 0;
+    VirtualProtect(target, patchLength, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
+    return true;
+}
+
+bool InstallLive07CleanupEntryHook()
+{
+    constexpr uintptr_t targetAddress = 0x00689B70;
+    constexpr size_t patchLength = 5;
+
+    const BYTE expected[patchLength] = {
+        0x83, 0xEC, 0x0C,
+        0x53,
+        0x55
+    };
+
+    BYTE* target = reinterpret_cast<BYTE*>(targetAddress);
+
+    __try {
+        if (std::memcmp(target, expected, patchLength) != 0)
+            return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            target,
+            patchLength,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtect))
+        return false;
+
+    target[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(target + 1) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&HookLive07CleanupEntry) -
+            (targetAddress + 5));
+
+    DWORD ignored = 0;
+    VirtualProtect(target, patchLength, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
+    return true;
+}
+
+bool IsReadablePointerRange(uintptr_t address, size_t size)
+{
+    if (!address || !size)
+        return false;
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)))
+        return false;
+
+    if (mbi.State != MEM_COMMIT)
+        return false;
+
+    const DWORD protect = mbi.Protect & 0xFF;
+    if (protect == PAGE_NOACCESS || protect == PAGE_GUARD)
+        return false;
+
+    const uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    const uintptr_t regionEnd = regionStart + mbi.RegionSize;
+
+    return address >= regionStart &&
+           address + size >= address &&
+           address + size <= regionEnd;
+}
+
+
+void CapturePointerRegion07(
+    uintptr_t p,
+    BOOL& readable,
+    uintptr_t& regionBase,
+    SIZE_T& regionSize,
+    DWORD& protect,
+    DWORD& regionType,
+    uintptr_t& allocationBase,
+    DWORD& allocationProtect)
+{
+    readable = FALSE;
+    regionBase = 0;
+    regionSize = 0;
+    protect = 0;
+    regionType = 0;
+    allocationBase = 0;
+    allocationProtect = 0;
+
+    if (!p)
+        return;
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(reinterpret_cast<const void*>(p), &mbi, sizeof(mbi)))
+        return;
+
+    regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    regionSize = mbi.RegionSize;
+    protect = mbi.Protect;
+    regionType = mbi.Type;
+    allocationBase = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+    allocationProtect = mbi.AllocationProtect;
+
+    if (mbi.State != MEM_COMMIT)
+        return;
+
+    const DWORD pflags = mbi.Protect & 0xFF;
+    if (pflags == PAGE_NOACCESS || (mbi.Protect & PAGE_GUARD))
+        return;
+
+    readable = TRUE;
+}
+
+void SnapshotWords07(uintptr_t p, DWORD* dst, size_t count)
+{
+    if (!dst || !count)
+        return;
+
+    for (size_t i = 0; i < count; ++i)
+        dst[i] = 0;
+
+    if (!p)
+        return;
+
+    __try {
+        for (size_t i = 0; i < count; ++i)
+            dst[i] = *reinterpret_cast<const DWORD*>(p + i * 4);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void __cdecl CaptureLive07ResourceOwner(const uintptr_t* entryStack)
+{
+    if (!entryStack)
+        return;
+
+    Live07ResourceOwnerContext c = {};
+    c.threadId = GetCurrentThreadId();
+    c.caller = entryStack[0];
+    c.resultPtr = entryStack[1];
+    c.objectPtr = entryStack[2];
+
+    __try {
+        if (c.objectPtr)
+            c.ownerPtr =
+                *reinterpret_cast<const uintptr_t*>(c.objectPtr + 0x2C);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        c.ownerPtr = 0;
+    }
+
+    CapturePointerRegion07(
+        c.objectPtr,
+        c.objectReadable,
+        c.objectRegionBase,
+        c.objectRegionSize,
+        c.objectProtect,
+        c.objectRegionType,
+        c.objectAllocationBase,
+        c.objectAllocationProtect);
+
+    CapturePointerRegion07(
+        c.ownerPtr,
+        c.ownerReadable,
+        c.ownerRegionBase,
+        c.ownerRegionSize,
+        c.ownerProtect,
+        c.ownerRegionType,
+        c.ownerAllocationBase,
+        c.ownerAllocationProtect);
+
+    if (c.objectReadable)
+        SnapshotWords07(c.objectPtr, c.objectWords, 16);
+
+    if (c.ownerReadable)
+        SnapshotWords07(c.ownerPtr, c.ownerWords, 16);
+
+    if (g_live07Cleanup.valid &&
+        g_live07Cleanup.threadId == c.threadId)
+    {
+        c.cleanupObject = g_live07Cleanup.cleanupObject;
+
+        __try {
+            const uintptr_t firstSlot = c.cleanupObject + 0x7E0;
+
+            for (DWORD i = 0; i < 20; ++i) {
+                const uintptr_t slotAddress =
+                    firstSlot + static_cast<uintptr_t>(i) * 4;
+
+                const DWORD value =
+                    *reinterpret_cast<const DWORD*>(slotAddress);
+
+                c.cleanupSlots[i] = value;
+
+                if (!c.cleanupArrayMatch &&
+                    static_cast<uintptr_t>(value) == c.objectPtr)
+                {
+                    c.cleanupArrayMatch = TRUE;
+                    c.cleanupSlotAddress = slotAddress;
+                    c.cleanupSlotIndex = i;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+    g_live07ResourceOwner.threadId = c.threadId;
+    g_live07ResourceOwner.caller = c.caller;
+    g_live07ResourceOwner.resultPtr = c.resultPtr;
+    g_live07ResourceOwner.objectPtr = c.objectPtr;
+    g_live07ResourceOwner.ownerPtr = c.ownerPtr;
+
+    std::memcpy(g_live07ResourceOwner.objectWords, c.objectWords, sizeof(c.objectWords));
+    std::memcpy(g_live07ResourceOwner.ownerWords, c.ownerWords, sizeof(c.ownerWords));
+
+    g_live07ResourceOwner.objectReadable = c.objectReadable;
+    g_live07ResourceOwner.ownerReadable = c.ownerReadable;
+    g_live07ResourceOwner.objectRegionBase = c.objectRegionBase;
+    g_live07ResourceOwner.objectRegionSize = c.objectRegionSize;
+    g_live07ResourceOwner.objectProtect = c.objectProtect;
+    g_live07ResourceOwner.objectRegionType = c.objectRegionType;
+    g_live07ResourceOwner.objectAllocationBase = c.objectAllocationBase;
+    g_live07ResourceOwner.objectAllocationProtect = c.objectAllocationProtect;
+
+    g_live07ResourceOwner.ownerRegionBase = c.ownerRegionBase;
+    g_live07ResourceOwner.ownerRegionSize = c.ownerRegionSize;
+    g_live07ResourceOwner.ownerProtect = c.ownerProtect;
+    g_live07ResourceOwner.ownerRegionType = c.ownerRegionType;
+    g_live07ResourceOwner.ownerAllocationBase = c.ownerAllocationBase;
+    g_live07ResourceOwner.ownerAllocationProtect = c.ownerAllocationProtect;
+
+    g_live07ResourceOwner.cleanupArrayMatch = c.cleanupArrayMatch;
+    g_live07ResourceOwner.cleanupObject = c.cleanupObject;
+    g_live07ResourceOwner.cleanupSlotAddress = c.cleanupSlotAddress;
+    g_live07ResourceOwner.cleanupSlotIndex = c.cleanupSlotIndex;
+    std::memcpy(
+        g_live07ResourceOwner.cleanupSlots,
+        c.cleanupSlots,
+        sizeof(c.cleanupSlots));
+
+    InterlockedExchange(&g_live07ResourceOwner.valid, 1);
+
+    if (c.objectPtr && c.ownerPtr &&
+        !IsReadablePointerRange(c.ownerPtr, 0x20))
+    {
+        EnterCriticalSection(&g_consoleLock);
+        PrintPrefix(
+            "EAGL07",
+            FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+
+        std::printf(
+            "INVALID OWNER object=%08lX owner=%08lX caller=%08lX\n",
+            static_cast<unsigned long>(c.objectPtr),
+            static_cast<unsigned long>(c.ownerPtr),
+            static_cast<unsigned long>(c.caller));
+
+        LeaveCriticalSection(&g_consoleLock);
+    }
+}
+
+__declspec(naked) void HookLive07ResourceOwner()
+{
+    __asm {
+        mov     eax, esp
+        pushfd
+        pushad
+        push    eax
+        call    CaptureLive07ResourceOwner
+        add     esp, 4
+        popad
+        popfd
+
+        // Reproduce overwritten bytes at 0080B32B:
+        // push ebp
+        // mov  ebp,esp
+        // mov  eax,[ebp+0Ch]
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp+0Ch]
+
+        mov     edx, 080B331h
+        jmp     edx
+    }
+}
+
+bool InstallLive07ResourceOwnerHook()
+{
+    constexpr uintptr_t targetAddress = 0x0080B32B;
+    constexpr size_t patchLength = 6;
+
+    const BYTE expected[patchLength] = {
+        0x55,
+        0x8B, 0xEC,
+        0x8B, 0x45, 0x0C
+    };
+
+    BYTE* target = reinterpret_cast<BYTE*>(targetAddress);
+
+    __try {
+        if (std::memcmp(target, expected, patchLength) != 0)
+            return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            target,
+            patchLength,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtect))
+        return false;
+
+    target[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(target + 1) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&HookLive07ResourceOwner) -
+            (targetAddress + 5));
+    target[5] = 0x90;
+
+    DWORD ignored = 0;
+    VirtualProtect(target, patchLength, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
+    return true;
+}
+
+
+void PrintLive07RawStackCandidates(const CONTEXT* c)
+{
+#if defined(_M_IX86)
+    if (!c)
+        return;
+
+    std::printf("\nRaw stack executable-address candidates:\n");
+
+    int shown = 0;
+    for (DWORD off = 0; off < 0x180 && shown < 24; off += 4) {
+        DWORD value = 0;
+
+        __try {
+            value = *reinterpret_cast<const DWORD*>(c->Esp + off);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+
+        // NBA Live 07 executable code is principally in this range.
+        if (value >= 0x00400000 && value < 0x00B00000) {
+            std::printf(
+                "  ESP+%03lX = %08lX\n",
+                static_cast<unsigned long>(off),
+                static_cast<unsigned long>(value));
+            ++shown;
+        }
+    }
+
+    if (!shown)
+        std::printf("  <none>\n");
+#endif
+}
+
+void PrintLive07ResourceOwnerCrash(EXCEPTION_POINTERS* ep)
+{
+    if (!ep || !ep->ContextRecord ||
+        ep->ContextRecord->Eip != 0x0080B10B)
+        return;
+
+    std::printf("\n");
+    std::printf("==============================================================\n");
+    std::printf(" NBA LIVE 07 RESOURCE OWNER CORRUPTION\n");
+    std::printf("==============================================================\n");
+    std::printf("Crash address   : 0080B10B\n");
+    std::printf("Faulting read   : mov edx,[esi+1Ch]\n");
+    std::printf("Owner / ESI     : %08lX\n",
+        static_cast<unsigned long>(ep->ContextRecord->Esi));
+
+    if (g_live07ResourceOwner.valid &&
+        g_live07ResourceOwner.threadId == GetCurrentThreadId())
+    {
+        const Live07ResourceOwnerContext c = g_live07ResourceOwner;
+        std::printf("Resource object : %08lX\n",
+            static_cast<unsigned long>(c.objectPtr));
+        std::printf("Object +2C      : %08lX\n",
+            static_cast<unsigned long>(c.ownerPtr));
+        std::printf("Wrapper caller  : %08lX\n",
+            static_cast<unsigned long>(c.caller));
+
+        if (c.ownerPtr == ep->ContextRecord->Esi)
+            std::printf("Pointer match   : EXACT\n");
+
+        std::printf("Object region   : %08lX + %08lX protect=%08lX type=%08lX readable=%s\n",
+            static_cast<unsigned long>(c.objectRegionBase),
+            static_cast<unsigned long>(c.objectRegionSize),
+            static_cast<unsigned long>(c.objectProtect),
+            static_cast<unsigned long>(c.objectRegionType),
+            c.objectReadable ? "YES" : "NO");
+        std::printf("Object alloc    : base=%08lX allocProtect=%08lX\n",
+            static_cast<unsigned long>(c.objectAllocationBase),
+            static_cast<unsigned long>(c.objectAllocationProtect));
+
+        std::printf("Owner region    : %08lX + %08lX protect=%08lX type=%08lX readable=%s\n",
+            static_cast<unsigned long>(c.ownerRegionBase),
+            static_cast<unsigned long>(c.ownerRegionSize),
+            static_cast<unsigned long>(c.ownerProtect),
+            static_cast<unsigned long>(c.ownerRegionType),
+            c.ownerReadable ? "YES" : "NO");
+        std::printf("Owner alloc     : base=%08lX allocProtect=%08lX\n",
+            static_cast<unsigned long>(c.ownerAllocationBase),
+            static_cast<unsigned long>(c.ownerAllocationProtect));
+
+        std::printf("\nResource object snapshot (+00..+3C):\n");
+        for (int i = 0; i < 16; i += 4) {
+            std::printf("  +%02X: %08lX %08lX %08lX %08lX\n",
+                i * 4,
+                static_cast<unsigned long>(c.objectWords[i + 0]),
+                static_cast<unsigned long>(c.objectWords[i + 1]),
+                static_cast<unsigned long>(c.objectWords[i + 2]),
+                static_cast<unsigned long>(c.objectWords[i + 3]));
+        }
+
+        if (c.cleanupObject) {
+            std::printf("\nCleanup array provenance:\n");
+            std::printf("  Cleanup object : %08lX\n",
+                static_cast<unsigned long>(c.cleanupObject));
+
+            if (c.cleanupArrayMatch) {
+                std::printf("  Slot index     : %lu / 19\n",
+                    static_cast<unsigned long>(c.cleanupSlotIndex));
+                std::printf("  Slot address   : %08lX\n",
+                    static_cast<unsigned long>(c.cleanupSlotAddress));
+                std::printf("  Slot offset    : +%08lX\n",
+                    static_cast<unsigned long>(
+                        c.cleanupSlotAddress - c.cleanupObject));
+                std::printf("  Finding        : exact pointer came from the 20-entry cleanup array.\n");
+            }
+            else {
+                std::printf("  Slot match     : NONE\n");
+            }
+
+            std::printf("  Slots 00-19    :\n");
+            for (int i = 0; i < 20; i += 4) {
+                std::printf(
+                    "    [%02d] %08lX  [%02d] %08lX  [%02d] %08lX  [%02d] %08lX\n",
+                    i + 0, static_cast<unsigned long>(c.cleanupSlots[i + 0]),
+                    i + 1, static_cast<unsigned long>(c.cleanupSlots[i + 1]),
+                    i + 2, static_cast<unsigned long>(c.cleanupSlots[i + 2]),
+                    i + 3, static_cast<unsigned long>(c.cleanupSlots[i + 3]));
+            }
+        }
+
+        if (c.ownerReadable) {
+            std::printf("\nOwner snapshot (+00..+3C):\n");
+            for (int i = 0; i < 16; i += 4) {
+                std::printf("  +%02X: %08lX %08lX %08lX %08lX\n",
+                    i * 4,
+                    static_cast<unsigned long>(c.ownerWords[i + 0]),
+                    static_cast<unsigned long>(c.ownerWords[i + 1]),
+                    static_cast<unsigned long>(c.ownerWords[i + 2]),
+                    static_cast<unsigned long>(c.ownerWords[i + 3]));
+            }
+        }
+    }
+
+    PrintLive07RawStackCandidates(ep->ContextRecord);
+
+    std::printf("\nDiagnosis:\n");
+    std::printf("  00689B70 is a cleanup/reset routine. It walks 20 stored resource\n");
+    std::printf("  pointers and releases non-NULL entries. The direct call at\n");
+    std::printf("  00689BA5 passes one of those stored pointers to 0080B32B.\n");
+    std::printf("  The failing object exists, but its +2C owner field is NULL.\n");
+    std::printf("  This is a longstanding Live 07 cleanup edge case and is not\n");
+    std::printf("  evidence of memory-expansion failure or a specific asset file.\n");
+    std::printf("==============================================================\n");
+}
+
+#else
+
+bool InstallLive07ResourceOwnerHook()
+{
+    return false;
+}
+
+bool InstallLive07CleanupEntryHook()
+{
+    return false;
+}
+
+bool InstallLive07CleanupGuard()
+{
+    return false;
+}
+
+void PrintLive07ResourceOwnerCrash(EXCEPTION_POINTERS*)
+{
+}
+
+#endif
+
+
 #if defined(_M_IX86)
 
 // -------------------------------------------------------------------------
@@ -343,15 +1109,18 @@ bool PatchIAT(const char* dllName, const char* procName, void* replacement, void
 //     ESP+04  = filename
 //     ESP+08  = flags
 //
-// NBA Live 06:
-//   FileSystem_OpenResolved @ 0x006DC8F9
-//   cdecl-style stack arguments:
+// NBA Live 06/07/08:
+//   FileSystem_OpenResolved @
+//     06: 0x006DC8F9
+//     07: 0x007FF4CE
+//     08: 0x0082E4ED
+//   Shared cdecl-style stack arguments:
 //     ESP+04  = internal constant/type (observed 0x28)
 //     ESP+08  = filename
 //     ESP+0C  = flags
 //     ESP+10  = search/filesystem context
 //
-// Both functions have a complete 9-byte prologue:
+// All supported resolver functions have a complete 9-byte prologue:
 //   push ebp
 //   mov  ebp, esp
 //   sub  esp, imm32
@@ -421,21 +1190,29 @@ void __cdecl LogFileSystemOpenResolved(
 __declspec(naked) void HookFileSystemOpenResolved()
 {
     __asm {
-        // Snapshot the untouched entry stack in EDX. pushad will preserve the
-        // original EDX and EAX values before the C logger is called.
-        mov     edx, esp
+        // Preserve ALL original registers first.
         pushfd
         pushad
+
+        // Entry ESP was 36 bytes above current ESP:
+        //   pushfd = 4
+        //   pushad = 32
+        lea     edx, [esp + 36]
+
+        // EAX saved by pushad is at [esp + 28].
+        // For Live 2005 this is the original register context.
+        mov     eax, [esp + 28]
 
         push    edx
         push    eax
         call    LogFileSystemOpenResolved
         add     esp, 8
 
+        // Restore the caller's exact original register state.
         popad
         popfd
 
-        jmp     dword ptr [g_FileSystemOpenResolvedTrampoline]
+        jmp     dword ptr[g_FileSystemOpenResolvedTrampoline]
     }
 }
 
@@ -541,16 +1318,291 @@ bool InstallFileSystemOpenResolvedHookForCurrentGame()
             ASSET_LAYOUT_LIVE2005);
     }
 
-    if (ep == 0x40109F &&
-        plugin::patch::GetFloat(0xBD832C) == 1.3333334f)
-    {
-        // NBA Live 06 1.0 NOCD
-        // 006DC8F9: sub esp, 108h
-        return InstallFileSystemOpenResolvedHook(
-            0x006DC8F9,
-            0x108,
-            ASSET_LAYOUT_LIVE06);
+    if (ep == 0x40109F) {
+        if (plugin::patch::GetFloat(0xBD832C) == 1.3333334f) {
+            // NBA Live 06 1.0 NOCD
+            // 006DC8F9: push ebp / mov ebp,esp / sub esp,108h
+            return InstallFileSystemOpenResolvedHook(
+                0x006DC8F9,
+                0x108,
+                ASSET_LAYOUT_LIVE06);
+        }
+
+        if (plugin::patch::GetFloat(0xBBBC3C) == 1.3333334f) {
+            // NBA Live 07 1.1 NOCD
+            // 007FF4CE: push ebp / mov ebp,esp / sub esp,108h
+            // Argument layout is structurally identical to Live 06.
+            return InstallFileSystemOpenResolvedHook(
+                0x007FF4CE,
+                0x108,
+                ASSET_LAYOUT_LIVE06);
+        }
+
+        if (plugin::patch::GetFloat(0xC3DF84) == 1.3333334f) {
+            // NBA Live 08 1.0 NOCD
+            // 0082E4ED: push ebp / mov ebp,esp / sub esp,108h
+            // Argument layout is structurally identical to Live 06.
+            return InstallFileSystemOpenResolvedHook(
+                0x0082E4ED,
+                0x108,
+                ASSET_LAYOUT_LIVE06);
+        }
     }
+
+    return false;
+}
+
+
+
+// -------------------------------------------------------------------------
+// NBA Live 06 animation-bank pair debugger
+// -------------------------------------------------------------------------
+//
+// AnimationBankSystem_LoadPair @ 00645D10
+//   ECX      = animation-bank system
+//   ESP+04   = bank index
+//   ESP+08   = variant
+//   ESP+0C   = ABK stem (normally "%08d")
+//
+// The function resolves the same (index, variant) through the parsed
+// animbank.log table, then loads:
+//   <abkStem>.abk
+//   <variantRecord.objectStem>.o
+//
+// AnimBankEntry layout established from sub_644500 / sub_645D10:
+//   +40 index
+//   +44 first variant
+//   +4C next-by-index
+//
+// AnimVariant:
+//   +00 object stem string
+//   +40 variant
+//   +44 next variant
+
+bool SafeCopyCString(const char* src, char* dst, size_t dstSize)
+{
+    if (!dst || dstSize == 0)
+        return false;
+
+    dst[0] = '\0';
+    if (!src)
+        return false;
+
+    __try {
+        size_t i = 0;
+        for (; i + 1 < dstSize; ++i) {
+            const char c = src[i];
+            dst[i] = c;
+            if (!c)
+                return true;
+        }
+        dst[dstSize - 1] = '\0';
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        dst[0] = '\0';
+        return false;
+    }
+}
+
+const char* ResolveAnimBankObjectStemLive06(
+    void* self,
+    int bankIndex,
+    int variant,
+    char* outStem,
+    size_t outStemSize)
+{
+    if (!self || !outStem || outStemSize == 0)
+        return nullptr;
+
+    outStem[0] = '\0';
+
+    __try {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(self);
+        const uintptr_t table = *reinterpret_cast<const uintptr_t*>(base + 0x04);
+        if (!table)
+            return nullptr;
+
+        const uintptr_t buckets =
+            *reinterpret_cast<const uintptr_t*>(table + 0x04);
+        const int bucketCount =
+            *reinterpret_cast<const int*>(table + 0x08);
+
+        if (!buckets || bucketCount <= 0 || bankIndex < 0)
+            return nullptr;
+
+        const int bucket = bankIndex % bucketCount;
+        uintptr_t entry =
+            *reinterpret_cast<const uintptr_t*>(
+                buckets + static_cast<uintptr_t>(bucket) * 4);
+
+        for (int guard = 0; entry && guard < 512; ++guard) {
+            const int entryIndex =
+                *reinterpret_cast<const int*>(entry + 0x40);
+
+            if (entryIndex == bankIndex) {
+                uintptr_t v =
+                    *reinterpret_cast<const uintptr_t*>(entry + 0x44);
+
+                for (int vguard = 0; v && vguard < 128; ++vguard) {
+                    const int entryVariant =
+                        *reinterpret_cast<const int*>(v + 0x40);
+
+                    if (entryVariant == variant) {
+                        if (SafeCopyCString(
+                                reinterpret_cast<const char*>(v),
+                                outStem,
+                                outStemSize))
+                            return outStem;
+                        return nullptr;
+                    }
+
+                    v = *reinterpret_cast<const uintptr_t*>(v + 0x44);
+                }
+
+                return nullptr;
+            }
+
+            entry = *reinterpret_cast<const uintptr_t*>(entry + 0x4C);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+
+    return nullptr;
+}
+
+void __cdecl LogAnimBankPairLive06(
+    void* self,
+    const uintptr_t* entryStack)
+{
+    if (!g_animBanks || !g_lockReady || !entryStack)
+        return;
+
+    const void* caller =
+        reinterpret_cast<const void*>(entryStack[0]);
+    const int bankIndex =
+        static_cast<int>(entryStack[1]);
+    const int variant =
+        static_cast<int>(entryStack[2]);
+    const char* abkStem =
+        reinterpret_cast<const char*>(entryStack[3]);
+
+    char safeAbkStem[128] = {};
+    char objectStem[128] = {};
+
+    SafeCopyCString(abkStem, safeAbkStem, sizeof(safeAbkStem));
+    ResolveAnimBankObjectStemLive06(
+        self,
+        bankIndex,
+        variant,
+        objectStem,
+        sizeof(objectStem));
+
+    EnterCriticalSection(&g_consoleLock);
+    PrintPrefix(
+        "ANIM",
+        FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+
+    std::printf(
+        "PAIR index=%d variant=%d ABK=%s.abk O=%s.o",
+        bankIndex,
+        variant,
+        safeAbkStem[0] ? safeAbkStem : "<unknown>",
+        objectStem[0] ? objectStem : "<unresolved>");
+
+    if (g_showCaller)
+        std::printf(" caller=%p", caller);
+
+    std::printf("\n");
+    LeaveCriticalSection(&g_consoleLock);
+}
+
+__declspec(naked) void HookAnimBankPairLive06()
+{
+    __asm {
+        // Preserve entry stack and original ECX before touching registers.
+        mov     eax, esp
+        pushfd
+        pushad
+
+        push    eax
+        push    ecx
+        call    LogAnimBankPairLive06
+        add     esp, 8
+
+        popad
+        popfd
+
+        // Reproduce the exact five bytes overwritten at 00645D10:
+        //   53                push ebx
+        //   8B 5C 24 0C      mov ebx,[esp+0Ch]
+        push    ebx
+        mov     ebx, [esp+0Ch]
+
+        mov     eax, 00645D15h
+        jmp     eax
+    }
+}
+
+bool InstallAnimBankPairHookLive06()
+{
+    constexpr uintptr_t targetAddress = 0x00645D10;
+    constexpr size_t patchLength = 5;
+
+    const BYTE expected[patchLength] = {
+        0x53,
+        0x8B, 0x5C, 0x24, 0x0C
+    };
+
+    BYTE* target = reinterpret_cast<BYTE*>(targetAddress);
+
+    __try {
+        if (std::memcmp(target, expected, patchLength) != 0)
+            return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            target,
+            patchLength,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtect))
+        return false;
+
+    target[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(target + 1) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&HookAnimBankPairLive06) -
+            (targetAddress + 5));
+
+    DWORD ignored = 0;
+    VirtualProtect(
+        target,
+        patchLength,
+        oldProtect,
+        &ignored);
+
+    FlushInstructionCache(
+        GetCurrentProcess(),
+        target,
+        patchLength);
+
+    return true;
+}
+
+bool InstallAnimBankPairHookForCurrentGame()
+{
+    if (!g_animBanks)
+        return false;
+
+    if (FM::GetEntryPoint() == 0x40109F &&
+        plugin::patch::GetFloat(0xBD832C) == 1.3333334f)
+        return InstallAnimBankPairHookLive06();
 
     return false;
 }
@@ -691,6 +1743,11 @@ bool InstallFileSystemOpenResolvedHookForCurrentGame()
     return false;
 }
 
+bool InstallAnimBankPairHookForCurrentGame()
+{
+    return false;
+}
+
 bool InstallGeomFileProcessHookForCurrentGame()
 {
     return false;
@@ -777,6 +1834,349 @@ bool SafeReadU16(uintptr_t address, WORD& value) {
         return false;
     }
 }
+
+
+// -------------------------------------------------------------------------
+// NBA Live 06 render/material float4 diagnostics
+// -------------------------------------------------------------------------
+//
+// sub_9F6D30 updates cached renderer state. The slot at materialState+0x5C
+// becomes global dword_C9414C and is later consumed by sub_9FEBFE as a
+// pointer to four floats. Crash 009FEC0D occurs when that pointer is NULL.
+//
+// Hook point 009F6EC0:
+//   EAX = material-state object
+//   [EAX+5C] = raw float4 pointer
+//   [EAX+60] = flags (bit 0 selects per-frame array addressing)
+//   word_CC0A3C = active frame/index
+
+struct RenderFloat4LiveContext {
+    volatile LONG valid;
+    DWORD threadId;
+    uintptr_t materialState;
+    uintptr_t rawPointer;
+    DWORD flags;
+    WORD activeIndex;
+    uintptr_t resolvedPointer;
+};
+
+RenderFloat4LiveContext g_renderFloat4Live = {};
+
+void __cdecl CaptureRenderFloat4Live06(uintptr_t materialState)
+{
+    RenderFloat4LiveContext c = {};
+    c.threadId = GetCurrentThreadId();
+    c.materialState = materialState;
+
+    __try {
+        if (materialState) {
+            c.rawPointer =
+                *reinterpret_cast<const uintptr_t*>(materialState + 0x5C);
+            c.flags =
+                *reinterpret_cast<const DWORD*>(materialState + 0x60);
+        }
+
+        c.activeIndex =
+            *reinterpret_cast<const WORD*>(0x00CC0A3C);
+
+        c.resolvedPointer = c.rawPointer;
+        if (c.flags & 1)
+            c.resolvedPointer +=
+                static_cast<uintptr_t>(c.activeIndex) * 0x10;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    g_renderFloat4Live.threadId = c.threadId;
+    g_renderFloat4Live.materialState = c.materialState;
+    g_renderFloat4Live.rawPointer = c.rawPointer;
+    g_renderFloat4Live.flags = c.flags;
+    g_renderFloat4Live.activeIndex = c.activeIndex;
+    g_renderFloat4Live.resolvedPointer = c.resolvedPointer;
+    InterlockedExchange(&g_renderFloat4Live.valid, 1);
+}
+
+__declspec(naked) void HookRenderFloat4StateLive06()
+{
+    __asm {
+        pushfd
+        pushad
+        push    eax
+        call    CaptureRenderFloat4Live06
+        add     esp, 4
+        popad
+        popfd
+
+        // Reproduce 7 overwritten bytes at 009F6EC0:
+        // test byte ptr [eax+60h],1
+        // mov  esi,[eax+5Ch]
+        test    byte ptr [eax+60h], 1
+        mov     esi, [eax+5Ch]
+
+        mov     edx, 009F6EC7h
+        jmp     edx
+    }
+}
+
+bool InstallRenderFloat4StateHookLive06()
+{
+    constexpr uintptr_t targetAddress = 0x009F6EC0;
+    constexpr size_t patchLength = 7;
+
+    const BYTE expected[patchLength] = {
+        0xF6, 0x40, 0x60, 0x01,
+        0x8B, 0x70, 0x5C
+    };
+
+    BYTE* target = reinterpret_cast<BYTE*>(targetAddress);
+
+    __try {
+        if (std::memcmp(target, expected, patchLength) != 0)
+            return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            target,
+            patchLength,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtect))
+        return false;
+
+    target[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(target + 1) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&HookRenderFloat4StateLive06) -
+            (targetAddress + 5));
+
+    for (size_t i = 5; i < patchLength; ++i)
+        target[i] = 0x90;
+
+    DWORD ignored = 0;
+    VirtualProtect(target, patchLength, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
+    return true;
+}
+
+bool InstallRenderFloat4StateHookForCurrentGame()
+{
+    if (FM::GetEntryPoint() == 0x40109F &&
+        plugin::patch::GetFloat(0xBD832C) == 1.3333334f)
+        return InstallRenderFloat4StateHookLive06();
+
+    return false;
+}
+
+
+struct RenderFloat4UseContext {
+    volatile LONG valid;
+    DWORD threadId;
+    uintptr_t frameEbp;
+    uintptr_t renderObject;
+    DWORD renderFlags;
+    uintptr_t modeValue;
+    uintptr_t c9413c;
+    uintptr_t c94140;
+    uintptr_t c94144;
+    uintptr_t c94148;
+    uintptr_t c9414c;
+    uintptr_t c94150;
+    uintptr_t c94154;
+    uintptr_t c94158;
+};
+
+RenderFloat4UseContext g_renderFloat4Use = {};
+
+void __cdecl CaptureRenderFloat4UseLive06(uintptr_t frameEbp)
+{
+    RenderFloat4UseContext c = {};
+    c.threadId = GetCurrentThreadId();
+    c.frameEbp = frameEbp;
+
+    __try {
+        if (frameEbp) {
+            c.renderObject =
+                *reinterpret_cast<const uintptr_t*>(frameEbp - 0x0C);
+            c.renderFlags =
+                *reinterpret_cast<const DWORD*>(frameEbp - 0x08);
+            c.modeValue =
+                *reinterpret_cast<const uintptr_t*>(frameEbp - 0x1C);
+        }
+
+        c.c9413c = *reinterpret_cast<const uintptr_t*>(0x00C9413C);
+        c.c94140 = *reinterpret_cast<const uintptr_t*>(0x00C94140);
+        c.c94144 = *reinterpret_cast<const uintptr_t*>(0x00C94144);
+        c.c94148 = *reinterpret_cast<const uintptr_t*>(0x00C94148);
+        c.c9414c = *reinterpret_cast<const uintptr_t*>(0x00C9414C);
+        c.c94150 = *reinterpret_cast<const uintptr_t*>(0x00C94150);
+        c.c94154 = *reinterpret_cast<const uintptr_t*>(0x00C94154);
+        c.c94158 = *reinterpret_cast<const uintptr_t*>(0x00C94158);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    g_renderFloat4Use.threadId = c.threadId;
+    g_renderFloat4Use.frameEbp = c.frameEbp;
+    g_renderFloat4Use.renderObject = c.renderObject;
+    g_renderFloat4Use.renderFlags = c.renderFlags;
+    g_renderFloat4Use.modeValue = c.modeValue;
+    g_renderFloat4Use.c9413c = c.c9413c;
+    g_renderFloat4Use.c94140 = c.c94140;
+    g_renderFloat4Use.c94144 = c.c94144;
+    g_renderFloat4Use.c94148 = c.c94148;
+    g_renderFloat4Use.c9414c = c.c9414c;
+    g_renderFloat4Use.c94150 = c.c94150;
+    g_renderFloat4Use.c94154 = c.c94154;
+    g_renderFloat4Use.c94158 = c.c94158;
+    InterlockedExchange(&g_renderFloat4Use.valid, 1);
+}
+
+__declspec(naked) void HookRenderFloat4UseLive06()
+{
+    __asm {
+        pushfd
+        pushad
+        push    ebp
+        call    CaptureRenderFloat4UseLive06
+        add     esp, 4
+        popad
+        popfd
+
+        // Reproduce the 6-byte instruction overwritten at 009F72E0:
+        // mov edx, dword ptr [00C9414C]
+        mov     edx, dword ptr [0C9414Ch]
+
+        mov     eax, 009F72E6h
+        jmp     eax
+    }
+}
+
+bool InstallRenderFloat4UseHookLive06()
+{
+    constexpr uintptr_t targetAddress = 0x009F72E0;
+    constexpr size_t patchLength = 6;
+
+    const BYTE expected[patchLength] = {
+        0x8B, 0x15, 0x4C, 0x41, 0xC9, 0x00
+    };
+
+    BYTE* target = reinterpret_cast<BYTE*>(targetAddress);
+
+    __try {
+        if (std::memcmp(target, expected, patchLength) != 0)
+            return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            target,
+            patchLength,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtect))
+        return false;
+
+    target[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(target + 1) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&HookRenderFloat4UseLive06) -
+            (targetAddress + 5));
+    target[5] = 0x90;
+
+    DWORD ignored = 0;
+    VirtualProtect(target, patchLength, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
+    return true;
+}
+
+
+void PrintRenderFloat4CrashContext(EXCEPTION_POINTERS* ep)
+{
+#if defined(_M_IX86)
+    if (!ep || !ep->ContextRecord)
+        return;
+
+    if (ep->ContextRecord->Eip != 0x009FEC0D)
+        return;
+
+    std::printf("\n");
+    std::printf("==============================================================\n");
+    std::printf(" RENDER / MATERIAL FLOAT4 STATE FAILURE\n");
+    std::printf("==============================================================\n");
+    std::printf("Crash address   : 009FEC0D\n");
+    std::printf("Faulting read   : fld dword ptr [ESI]\n");
+    std::printf("ESI             : %08lX\n",
+        static_cast<unsigned long>(ep->ContextRecord->Esi));
+
+    DWORD cached = 0;
+    SafeReadU32(0x00C9414C, cached);
+    std::printf("Cached pointer  : %08lX  (dword_C9414C)\n",
+        static_cast<unsigned long>(cached));
+
+
+    if (g_renderFloat4Use.valid &&
+        g_renderFloat4Use.threadId == GetCurrentThreadId())
+    {
+        const RenderFloat4UseContext u = g_renderFloat4Use;
+        std::printf("\nLast consumer state:\n");
+        std::printf("  Render object  : %08lX\n",
+            static_cast<unsigned long>(u.renderObject));
+        std::printf("  Render flags   : %08lX\n",
+            static_cast<unsigned long>(u.renderFlags));
+        std::printf("  Mode value     : %08lX\n",
+            static_cast<unsigned long>(u.modeValue));
+        std::printf("  C9413C..58     : %08lX %08lX %08lX %08lX\n",
+            static_cast<unsigned long>(u.c9413c),
+            static_cast<unsigned long>(u.c94140),
+            static_cast<unsigned long>(u.c94144),
+            static_cast<unsigned long>(u.c94148));
+        std::printf("                    %08lX %08lX %08lX %08lX\n",
+            static_cast<unsigned long>(u.c9414c),
+            static_cast<unsigned long>(u.c94150),
+            static_cast<unsigned long>(u.c94154),
+            static_cast<unsigned long>(u.c94158));
+
+        if (u.c9414c == 0) {
+            std::printf("  Consumer check : C9414C was already NULL before sub_9FEBFE\n");
+        }
+    }
+
+    if (g_renderFloat4Live.valid &&
+        g_renderFloat4Live.threadId == GetCurrentThreadId())
+    {
+        const RenderFloat4LiveContext c = g_renderFloat4Live;
+
+        std::printf("\nLast material-state update:\n");
+        std::printf("  Material state : %08lX\n",
+            static_cast<unsigned long>(c.materialState));
+        std::printf("  Raw +5C ptr    : %08lX\n",
+            static_cast<unsigned long>(c.rawPointer));
+        std::printf("  +60 flags      : %08lX\n",
+            static_cast<unsigned long>(c.flags));
+        std::printf("  Active index   : %u\n",
+            static_cast<unsigned>(c.activeIndex));
+        std::printf("  Resolved ptr   : %08lX\n",
+            static_cast<unsigned long>(c.resolvedPointer));
+
+        if (c.resolvedPointer == 0) {
+            std::printf("\nDiagnosis:\n");
+            std::printf("  The material/render-state object supplied a NULL float4\n");
+            std::printf("  source before sub_9FEBFE attempted to read it.\n");
+            std::printf("  This is a state/material initialization failure, not an\n");
+            std::printf("  allocator-exhaustion signature by itself.\n");
+        }
+    }
+    else {
+        std::printf("\nLive material-state capture unavailable.\n");
+    }
+
+    std::printf("==============================================================\n");
+#endif
+}
+
 
 struct EaglFieldLiveContext {
     volatile LONG valid;
@@ -1879,6 +3279,12 @@ void PrintAssetCrashContext(EXCEPTION_POINTERS* ep) {
         return;
     }
 
+    // Known renderer/material float4 null-source signature.
+    if (live06 && eip == 0x009FEC0D) {
+        PrintRenderFloat4CrashContext(ep);
+        return;
+    }
+
     // FSH parsing/decoding functions are not mapped yet. For non-EBO crashes,
     // only emit an FSH diagnostic when an FSH is the newest acquired EBO/FSH
     // resource. This is correlation, not parser-level proof.
@@ -1936,6 +3342,7 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     std::printf("EIP=%08lX EFLAGS=%08lX\n", c->Eip, c->EFlags);
 #endif
     PrintStack32(c);
+    PrintLive07ResourceOwnerCrash(ep);
     PrintAssetCrashContext(ep);
 
     std::printf("\nThe process is about to terminate. Press ENTER to close it.\n");
@@ -1979,6 +3386,8 @@ void InitializeDebugConsole() {
     g_showCaller = GetPrivateProfileIntA("DEBUG", "FILE_CALLERS", 1, ".\\main.ini") != 0;
     g_crashes = GetPrivateProfileIntA("DEBUG", "CRASHES", 1, ".\\main.ini") != 0;
     g_assetFiles = GetPrivateProfileIntA("DEBUG", "ASSET_FILES", 1, ".\\main.ini") != 0;
+    g_animBanks = GetPrivateProfileIntA("DEBUG", "ANIMBANK", 0, ".\\main.ini") != 0;
+    g_live07CleanupFix = GetPrivateProfileIntA("DEBUG", "LIVE07_CLEANUP_FIX", 1, ".\\main.ini") != 0;
 
     InitializeCriticalSection(&g_consoleLock);
     g_lockReady = true;
@@ -1988,9 +3397,25 @@ void InitializeDebugConsole() {
         return;
     }
 
-    // FILES=0 now means no Win32 file IAT hooks at all. Previously the hooks
-    // were installed unconditionally even when file logging was disabled.
-    if (g_files) {
+    // FILES=0 means no Win32 file IAT hooks at all.
+    //
+    // NBA Live 07 is sensitive to the EXE-level CreateFileA/W/CloseHandle IAT
+    // interception: enabling those hooks can prevent main.ini-backed launcher
+    // settings from taking effect. NBA Live 08 uses the same newer filesystem
+    // family, so keep the low-level Win32 hooks disabled there as well.
+    //
+    // 07/08 still get the higher-level FileSystem::OpenResolved asset tracking
+    // through ASSET_FILES, plus the generic crash handler.
+    const uintptr_t ep = FM::GetEntryPoint();
+    const bool live07 =
+        ep == 0x40109F &&
+        plugin::patch::GetFloat(0xBBBC3C) == 1.3333334f;
+    const bool live08 =
+        ep == 0x40109F &&
+        plugin::patch::GetFloat(0xC3DF84) == 1.3333334f;
+    const bool allowWin32FileHooks = !(live07 || live08);
+
+    if (g_files && allowWin32FileHooks) {
         bool a = PatchIAT(
             "KERNEL32.dll",
             "CreateFileA",
@@ -2020,7 +3445,48 @@ void InitializeDebugConsole() {
     else {
         PrintPrefix("DEBUG",
             FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
-        std::printf("Win32 file hooks: disabled (FILES=0)\n");
+
+        if (g_files && !allowWin32FileHooks) {
+            std::printf(
+                "Win32 file hooks: disabled for %s (use ASSET_FILES for logical resource tracking)\n",
+                GameName());
+        }
+        else {
+            std::printf("Win32 file hooks: disabled (FILES=0)\n");
+        }
+    }
+
+    if (FM::GetEntryPoint() == 0x40109F &&
+        plugin::patch::GetFloat(0xBBBC3C) == 1.3333334f)
+    {
+        const bool owner07 = InstallLive07ResourceOwnerHook();
+        PrintPrefix(
+            "DEBUG",
+            owner07 ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
+                    : (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY));
+        std::printf(
+            "NBA Live 07 resource-owner hook: %s\n",
+            owner07 ? "OK" : "MISS");
+
+        const bool cleanup07 = InstallLive07CleanupEntryHook();
+        PrintPrefix(
+            "DEBUG",
+            cleanup07 ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
+                      : (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY));
+        std::printf(
+            "NBA Live 07 cleanup-array hook: %s\n",
+            cleanup07 ? "OK" : "MISS");
+
+        if (g_live07CleanupFix) {
+            const bool cleanupGuard07 = InstallLive07CleanupGuard();
+            PrintPrefix(
+                "DEBUG",
+                cleanupGuard07 ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
+                               : (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY));
+            std::printf(
+                "NBA Live 07 stale-cleanup guard: %s\n",
+                cleanupGuard07 ? "OK" : "MISS");
+        }
     }
 
     if (g_assetFiles) {
@@ -2035,6 +3501,17 @@ void InitializeDebugConsole() {
             fs ? "OK" : "MISS");
     }
 
+    if (g_animBanks) {
+        const bool animBank = InstallAnimBankPairHookForCurrentGame();
+        PrintPrefix(
+            "DEBUG",
+            animBank ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
+                     : (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY));
+        std::printf(
+            "NBA Live 06 animation-bank pair hook: %s\n",
+            animBank ? "OK" : "MISS");
+    }
+
     if (g_assetFiles) {
         if (FM::GetEntryPoint() == 0x40109F &&
             plugin::patch::GetFloat(0xBD832C) == 1.3333334f)
@@ -2042,6 +3519,20 @@ void InitializeDebugConsole() {
             PrintPrefix("DEBUG",
                 FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
             std::printf("NBA Live 06 GeomFile processing: observed via crash stack/live EAGL capture\n");
+
+            const bool renderFloat4 = InstallRenderFloat4StateHookForCurrentGame();
+            PrintPrefix("DEBUG",
+                renderFloat4 ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
+                             : (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY));
+            std::printf("NBA Live 06 render float4 state hook: %s\n",
+                renderFloat4 ? "OK" : "MISS");
+
+            const bool renderFloat4Use = InstallRenderFloat4UseHookLive06();
+            PrintPrefix("DEBUG",
+                renderFloat4Use ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
+                                : (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY));
+            std::printf("NBA Live 06 render float4 consumer hook: %s\n",
+                renderFloat4Use ? "OK" : "MISS");
 
             const bool eaglField = InstallEaglFieldStringHookForCurrentGame();
             PrintPrefix("DEBUG",
