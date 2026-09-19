@@ -36,6 +36,16 @@ struct Frame {
     D3DCOLOR playCallTeamColor;
     const char* playCallValues[4];
     const char* introValues[15];
+    const char* starting5Values[11];
+    const char* starting5TeamName;
+    const char* starting5Side;
+    D3DCOLOR starting5TeamColor;
+    D3DCOLOR starting5PrimaryColor;
+    D3DCOLOR starting5SecondaryColor;
+    IDirect3DTexture9* starting5TeamLogo;
+    IDirect3DTexture9* starting5PlayerPortraits[5];
+    const char* outroValues[15];
+    const char* lineupsValues[14];
     const char* playerFirstName;
     const char* playerLastName;
     const char* statLabel1;
@@ -61,6 +71,15 @@ void RenderPlayCall(IDirect3DDevice9* device, const Frame& frame,
     const char* overlayName, float animationOffsetX,
     float animationOffsetY, float animationOpacity);
 void RenderIntro(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity);
+void RenderStarting5(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity);
+void RenderOutro(IDirect3DDevice9* device, const Frame& frame,
+    const char* overlayName, float animationOffsetX,
+    float animationOffsetY, float animationOpacity);
+void RenderLineups(IDirect3DDevice9* device, const Frame& frame,
     const char* overlayName, float animationOffsetX,
     float animationOffsetY, float animationOpacity);
 void RenderPlayerFoul(IDirect3DDevice9* device, const Frame& frame,

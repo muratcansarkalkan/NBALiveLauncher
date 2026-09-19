@@ -168,6 +168,38 @@ bool g_introLayoutAvailable = false;
 bool g_introPresentationSuppressed = false;
 DWORD g_introTransitionHiddenAt = 0;
 
+struct Starting5State {
+    char values[11][128];
+    unsigned int payloadHash;
+    DWORD startedAt;
+    bool active;
+};
+
+Starting5State g_starting5 = {};
+Starting5State g_starting5Pending = {};
+bool g_starting5LayoutAvailable = false;
+
+struct OutroState {
+    char values[15][128];
+    unsigned int payloadHash;
+    DWORD startedAt;
+    bool active;
+};
+
+OutroState g_outro = {};
+bool g_outroLayoutAvailable = false;
+
+struct LineupsState {
+    char values[14][128];
+    unsigned int payloadHash;
+    DWORD startedAt;
+    bool active;
+};
+
+LineupsState g_lineups = {};
+bool g_lineupsLayoutAvailable = false;
+DWORD g_lineupsTransitionHiddenAt = 0;
+
 struct PlayerFoulState {
     char firstName[64];
     char lastName[64];
@@ -257,6 +289,7 @@ StoreOverlayDataFn g_originalViolationDataStore = nullptr;
 StoreOverlayDataFn g_originalPlayCallDataStore = nullptr;
 StoreOverlayDataFn g_originalIntroDataStore = nullptr;
 StoreOverlayDataFn g_originalStatsDataStore = nullptr;
+StoreOverlayDataFn g_originalPresentationDataStore = nullptr;
 StatsRequestFn g_originalStatsRequest = nullptr;
 
 bool __stdcall SuppressNativeViolationRequest(void*)
@@ -276,6 +309,15 @@ bool __stdcall SuppressNativePlayCallRequest(void*)
 bool __stdcall SuppressNativeIntroRequest(void*)
 {
     // Keep the builder's success path alive without creating overlays~intro.big.
+    return true;
+}
+
+bool __stdcall SuppressNativePresentationRequest(void*)
+{
+    // NBA Live 07/08 Starting5 and Outro use the same one-argument
+    // native-movie request convention. Report success so each builder
+    // continues through its normal payload-store and finished-state paths
+    // without creating the native presentation movie.
     return true;
 }
 
@@ -617,6 +659,198 @@ void __fastcall HookIntroDataStore(void* thisPtr, void*, DWORD* vector)
     CaptureIntroPayload(vector);
     if (g_originalIntroDataStore)
         g_originalIntroDataStore(thisPtr, vector);
+}
+
+void LogPresentationPayload(const char* category, DWORD* vector)
+{
+    if (!g_logReady || !category || !vector)
+        return;
+
+    __try {
+        const int count = static_cast<int>(vector[3]);
+        if (count < 0 || count > 128)
+            return;
+
+        const BBallString* values = reinterpret_cast<const BBallString*>(
+            vector[0]);
+        if (count > 0 && !values)
+            return;
+
+        FILE* file = nullptr;
+        EnterCriticalSection(&g_logLock);
+        __try {
+            file = std::fopen("presentation_payloads.log", "a");
+            if (file) {
+                std::fprintf(file,
+                    "category=%s count=%d vector=[%08X,%08X,%08X,%08X] "
+                    "values=[",
+                    category, count,
+                    static_cast<unsigned int>(vector[0]),
+                    static_cast<unsigned int>(vector[1]),
+                    static_cast<unsigned int>(vector[2]),
+                    static_cast<unsigned int>(vector[3]));
+                for (int i = 0; i < count; ++i) {
+                    if (i) std::fputs(", ", file);
+                    WriteEscaped(file, values[i].sharedstring);
+                }
+                std::fputs("]\n", file);
+            }
+        }
+        __finally {
+            if (file) std::fclose(file);
+            LeaveCriticalSection(&g_logLock);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // A malformed or transient game-owned vector must not affect play.
+    }
+}
+
+void CaptureStarting5Payload(DWORD* vector)
+{
+    if (!g_customOverlayEnabled || !g_starting5LayoutAvailable || !vector)
+        return;
+    __try {
+        const int count = static_cast<int>(vector[3]);
+        const BBallString* values = reinterpret_cast<const BBallString*>(
+            vector[0]);
+        if (count != 11 || !values || !values[5].sharedstring ||
+            !*values[5].sharedstring)
+            return;
+        const unsigned int hash = HashOverlayPayload(10, values, count);
+        if ((g_starting5.active && g_starting5.payloadHash == hash) ||
+            (g_starting5Pending.active &&
+             g_starting5Pending.payloadHash == hash))
+            return;
+        Starting5State* target = g_starting5.active ?
+            &g_starting5Pending : &g_starting5;
+        for (int i = 0; i < 11; ++i)
+            CopyText(target->values[i], sizeof(target->values[i]),
+                values[i].sharedstring);
+        target->payloadHash = hash;
+        target->startedAt = target == &g_starting5 ? GetTickCount() : 0;
+        target->active = true;
+        AppendDiagnostic(
+            "Starting5 accepted: teamCode=%s players=%s,%s,%s,%s,%s "
+            "queued=%s.\n",
+            target->values[10], target->values[5], target->values[6],
+            target->values[7], target->values[8], target->values[9],
+            target == &g_starting5Pending ? "yes" : "no");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_starting5.active = false;
+        g_starting5Pending.active = false;
+    }
+}
+
+void CaptureOutroPayload(DWORD* vector)
+{
+    if (!g_customOverlayEnabled || !g_outroLayoutAvailable || !vector)
+        return;
+    __try {
+        const int count = static_cast<int>(vector[3]);
+        const BBallString* values = reinterpret_cast<const BBallString*>(
+            vector[0]);
+        if (count != 15 || !values || !values[0].sharedstring ||
+            !*values[0].sharedstring)
+            return;
+        for (int i = 0; i < 15; ++i)
+            CopyText(g_outro.values[i], sizeof(g_outro.values[i]),
+                values[i].sharedstring);
+        g_outro.payloadHash = HashOverlayPayload(11, values, count);
+        g_outro.startedAt = GetTickCount();
+        g_outro.active = true;
+        CopyText(g_broadcast.awayName, sizeof(g_broadcast.awayName),
+            values[2].sharedstring);
+        CopyText(g_broadcast.homeName, sizeof(g_broadcast.homeName),
+            values[5].sharedstring);
+        CopyText(g_broadcast.awayLogoId, sizeof(g_broadcast.awayLogoId),
+            values[12].sharedstring);
+        CopyText(g_broadcast.homeLogoId, sizeof(g_broadcast.homeLogoId),
+            values[13].sharedstring);
+        AppendDiagnostic(
+            "Outro accepted: away=%s %s score=%s home=%s %s score=%s "
+            "awayCode=%s homeCode=%s.\n",
+            g_outro.values[1], g_outro.values[2], g_outro.values[10],
+            g_outro.values[4], g_outro.values[5], g_outro.values[11],
+            g_outro.values[12], g_outro.values[13]);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_outro.active = false;
+    }
+}
+
+void __fastcall HookStarting5DataStore(void* thisPtr, void*, DWORD* vector)
+{
+    CaptureStarting5Payload(vector);
+    LogPresentationPayload("starting5", vector);
+    if (g_originalPresentationDataStore)
+        g_originalPresentationDataStore(thisPtr, vector);
+}
+
+void __fastcall HookOutroDataStore(void* thisPtr, void*, DWORD* vector)
+{
+    CaptureOutroPayload(vector);
+    LogPresentationPayload("outro", vector);
+    if (g_originalPresentationDataStore)
+        g_originalPresentationDataStore(thisPtr, vector);
+}
+
+void CaptureLineupsPayload(DWORD* vector)
+{
+    if (!g_customOverlayEnabled || !g_lineupsLayoutAvailable || !vector)
+        return;
+    __try {
+        const int count = static_cast<int>(vector[3]);
+        const BBallString* values = reinterpret_cast<const BBallString*>(
+            vector[0]);
+        if (count != 14 || !values || !values[0].sharedstring ||
+            !*values[0].sharedstring)
+            return;
+        const unsigned int hash = HashOverlayPayload(12, values, count);
+        if (g_lineups.active && g_lineups.payloadHash == hash)
+            return;
+        for (int i = 0; i < 14; ++i)
+            CopyText(g_lineups.values[i], sizeof(g_lineups.values[i]),
+                values[i].sharedstring);
+        g_lineups.payloadHash = hash;
+        g_lineups.startedAt = GetTickCount();
+        g_lineups.active = true;
+        // Live 08 can build this payload while a full-screen transition is
+        // still covering the court. Start its visible lifetime only after
+        // ShowOverlaysEvent returns gameplay to the screen.
+        g_lineupsTransitionHiddenAt = g_fullScreenTransitionActive ?
+            g_lineups.startedAt : 0;
+        CopyText(g_broadcast.awayName, sizeof(g_broadcast.awayName),
+            values[11].sharedstring);
+        CopyText(g_broadcast.homeName, sizeof(g_broadcast.homeName),
+            values[13].sharedstring);
+        CopyText(g_broadcast.awayLogoId, sizeof(g_broadcast.awayLogoId),
+            values[10].sharedstring);
+        CopyText(g_broadcast.homeLogoId, sizeof(g_broadcast.homeLogoId),
+            values[12].sharedstring);
+        AppendDiagnostic(
+            "In-game lineups accepted: away=%s code=%s home=%s code=%s "
+            "players=%s,%s,%s,%s,%s | %s,%s,%s,%s,%s.\n",
+            g_lineups.values[11], g_lineups.values[10],
+            g_lineups.values[13], g_lineups.values[12],
+            g_lineups.values[0], g_lineups.values[1],
+            g_lineups.values[2], g_lineups.values[3],
+            g_lineups.values[4], g_lineups.values[5],
+            g_lineups.values[6], g_lineups.values[7],
+            g_lineups.values[8], g_lineups.values[9]);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_lineups.active = false;
+    }
+}
+
+void __fastcall HookLineupsDataStore(void* thisPtr, void*, DWORD* vector)
+{
+    CaptureLineupsPayload(vector);
+    LogPresentationPayload("lineups", vector);
+    if (g_originalPresentationDataStore)
+        g_originalPresentationDataStore(thisPtr, vector);
 }
 
 const char* GetKnownStatSubtypeName(DWORD control18, DWORD control1C)
@@ -1253,6 +1487,11 @@ int __cdecl HookSendEvent(
             g_introPresentationSuppressed = true;
             g_intro.active = false;
             g_introTransitionHiddenAt = 0;
+            g_starting5.active = false;
+            g_starting5Pending.active = false;
+            g_outro.active = false;
+            g_lineups.active = false;
+            g_lineupsTransitionHiddenAt = 0;
         }
         else if (std::strcmp(name, "HideOverlaysEvent") == 0) {
             g_fullScreenTransitionActive = true;
@@ -1275,6 +1514,26 @@ int __cdecl HookSendEvent(
             g_intro.active = false;
             g_introPresentationSuppressed = true;
             g_introTransitionHiddenAt = 0;
+
+            // Starting5 and Outro are native 07/08 presentation families.
+            // Once a full-screen transition begins, end the current custom
+            // presentation permanently so ShowOverlaysEvent cannot restore it
+            // over the following scene. Clear the queued second Starting5
+            // entry as well because it belongs to the presentation sequence
+            // that the transition just ended.
+            if (g_game &&
+                (g_game->version == GameVersion::Live2007 ||
+                 g_game->version == GameVersion::Live2008)) {
+                g_starting5.active = false;
+                g_starting5Pending.active = false;
+                g_outro.active = false;
+                // FEOverlayLineups is different: Live 08 commonly builds it
+                // during this transition. Keep the captured payload, hide it
+                // behind the transition, and freeze its presentation timer.
+                if (g_game->version == GameVersion::Live2008 &&
+                    g_lineups.active && !g_lineupsTransitionHiddenAt)
+                    g_lineupsTransitionHiddenAt = GetTickCount();
+            }
         }
         else if (std::strcmp(name, "ShowOverlaysEvent") == 0) {
             g_fullScreenTransitionActive = false;
@@ -1307,6 +1566,12 @@ int __cdecl HookSendEvent(
             // presentation for a future new payload without reviving it.
             g_introPresentationSuppressed = false;
             g_introTransitionHiddenAt = 0;
+            if (g_game && g_game->version == GameVersion::Live2008 &&
+                g_lineups.active && g_lineupsTransitionHiddenAt) {
+                g_lineups.startedAt +=
+                    GetTickCount() - g_lineupsTransitionHiddenAt;
+                g_lineupsTransitionHiddenAt = 0;
+            }
         }
         else if (resumeEvent) {
             g_fullScreenTransitionActive = false;
@@ -1696,6 +1961,46 @@ float SmoothStep(float value)
     return value * value * (3.0f - 2.0f * value);
 }
 
+bool CalculatePresentationAnimation(const scoreboardconfig::Config& config,
+    DWORD startedAt, bool* active, float* x, float* y, float* opacity)
+{
+    const DWORD elapsed = GetTickCount() - startedAt;
+    const DWORD enterEnd = config.enterMilliseconds;
+    const DWORD holdEnd = enterEnd + config.holdMilliseconds;
+    const DWORD total = holdEnd + config.exitMilliseconds;
+    if (elapsed >= total) {
+        if (active) *active = false;
+        return false;
+    }
+    *x = 0.0f;
+    *y = 0.0f;
+    *opacity = 1.0f;
+    if (elapsed < enterEnd && enterEnd > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed) / enterEnd);
+        if (_stricmp(config.enterAnimation, "slide") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0) {
+            *x = config.enterFromX * (1.0f - p);
+            *y = config.enterFromY * (1.0f - p);
+        }
+        if (_stricmp(config.enterAnimation, "fade") == 0 ||
+            _stricmp(config.enterAnimation, "slideFade") == 0)
+            *opacity = p;
+    }
+    else if (elapsed >= holdEnd && config.exitMilliseconds > 0) {
+        const float p = SmoothStep(static_cast<float>(elapsed - holdEnd) /
+            config.exitMilliseconds);
+        if (_stricmp(config.exitAnimation, "slide") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0) {
+            *x = config.exitToX * p;
+            *y = config.exitToY * p;
+        }
+        if (_stricmp(config.exitAnimation, "fade") == 0 ||
+            _stricmp(config.exitAnimation, "slideFade") == 0)
+            *opacity = 1.0f - p;
+    }
+    return true;
+}
+
 void RenderViolationOverlay(IDirect3DDevice9* device)
 {
     if (!g_customOverlayEnabled || !g_violation.active ||
@@ -2040,6 +2345,120 @@ void RenderIntroOverlay(IDirect3DDevice9* device)
         x, y, opacity);
 }
 
+void RenderStarting5Overlay(IDirect3DDevice9* device)
+{
+    if (!g_customOverlayEnabled || !g_starting5LayoutAvailable ||
+        g_fullScreenTransitionActive || !device)
+        return;
+    if (!g_starting5.active && g_starting5Pending.active) {
+        g_starting5 = g_starting5Pending;
+        g_starting5.startedAt = GetTickCount();
+        std::memset(&g_starting5Pending, 0, sizeof(g_starting5Pending));
+    }
+    if (!g_starting5.active) return;
+    const scoreboardconfig::Config& config =
+        scoreboardconfig::GetStarting5();
+    float x, y, opacity;
+    if (!CalculatePresentationAnimation(config, g_starting5.startedAt,
+            &g_starting5.active, &x, &y, &opacity))
+        return;
+
+    popup::Load(g_customOverlayName);
+    const popup::TeamVisual* team = popup::FindTeamByShortCode(
+        g_starting5.values[10]);
+    const bool awaySide = _stricmp(g_starting5.values[10],
+        g_broadcast.awayLogoId) == 0;
+    const bool homeSide = _stricmp(g_starting5.values[10],
+        g_broadcast.homeLogoId) == 0;
+
+    scoreboard::Frame frame = {};
+    for (int i = 0; i < 11; ++i)
+        frame.starting5Values[i] = g_starting5.values[i];
+    frame.starting5TeamName = team ? team->teamName : "";
+    frame.starting5Side = awaySide ? "away" : homeSide ? "home" : "unknown";
+    const D3DCOLOR fallback = awaySide ? g_broadcast.awayColor :
+        homeSide ? g_broadcast.homeColor : D3DCOLOR_XRGB(48, 48, 48);
+    frame.starting5TeamColor = team ? team->primaryColor : fallback;
+    frame.starting5PrimaryColor = frame.starting5TeamColor;
+    frame.starting5SecondaryColor = team ? team->secondaryColor : fallback;
+    frame.starting5TeamLogo = team ? popup::GetLogoTexture(device,
+        team->databaseTeamID) : nullptr;
+    char portraitPath[MAX_PATH] = {};
+    for (int i = 0; i < 5; ++i) {
+        portraitPath[0] = '\0';
+        if (g_starting5.values[i][0])
+            std::snprintf(portraitPath, sizeof(portraitPath),
+                "portraits\\%s.png", g_starting5.values[i]);
+        frame.starting5PlayerPortraits[i] = portraitPath[0] ?
+            popup::GetOverlayTexture(device, g_customOverlayName,
+                "starting5", portraitPath) : nullptr;
+    }
+    scoreboard::RenderStarting5(device, frame, g_customOverlayName,
+        x, y, opacity);
+}
+
+void RenderOutroOverlay(IDirect3DDevice9* device)
+{
+    if (!g_customOverlayEnabled || !g_outroLayoutAvailable ||
+        g_fullScreenTransitionActive || !g_outro.active || !device)
+        return;
+    const scoreboardconfig::Config& config = scoreboardconfig::GetOutro();
+    float x, y, opacity;
+    if (!CalculatePresentationAnimation(config, g_outro.startedAt,
+            &g_outro.active, &x, &y, &opacity))
+        return;
+
+    popup::Load(g_customOverlayName);
+    const popup::TeamVisual* away = popup::FindTeamByShortCode(
+        g_outro.values[12]);
+    const popup::TeamVisual* home = popup::FindTeamByShortCode(
+        g_outro.values[13]);
+    scoreboard::Frame frame = {};
+    for (int i = 0; i < 15; ++i)
+        frame.outroValues[i] = g_outro.values[i];
+    frame.awayColor = away ? away->primaryColor : g_broadcast.awayColor;
+    frame.homeColor = home ? home->primaryColor : g_broadcast.homeColor;
+    frame.awaySecondaryColor = away ? away->secondaryColor : frame.awayColor;
+    frame.homeSecondaryColor = home ? home->secondaryColor : frame.homeColor;
+    frame.awayLogo = away ? popup::GetLogoTexture(device,
+        away->databaseTeamID) : nullptr;
+    frame.homeLogo = home ? popup::GetLogoTexture(device,
+        home->databaseTeamID) : nullptr;
+    scoreboard::RenderOutro(device, frame, g_customOverlayName,
+        x, y, opacity);
+}
+
+void RenderLineupsOverlay(IDirect3DDevice9* device)
+{
+    if (!g_customOverlayEnabled || !g_lineupsLayoutAvailable ||
+        g_fullScreenTransitionActive || !g_lineups.active || !device)
+        return;
+    const scoreboardconfig::Config& config = scoreboardconfig::GetLineups();
+    float x, y, opacity;
+    if (!CalculatePresentationAnimation(config, g_lineups.startedAt,
+            &g_lineups.active, &x, &y, &opacity))
+        return;
+
+    popup::Load(g_customOverlayName);
+    const popup::TeamVisual* away = popup::FindTeamByShortCode(
+        g_lineups.values[10]);
+    const popup::TeamVisual* home = popup::FindTeamByShortCode(
+        g_lineups.values[12]);
+    scoreboard::Frame frame = {};
+    for (int i = 0; i < 14; ++i)
+        frame.lineupsValues[i] = g_lineups.values[i];
+    frame.awayColor = away ? away->primaryColor : g_broadcast.awayColor;
+    frame.homeColor = home ? home->primaryColor : g_broadcast.homeColor;
+    frame.awaySecondaryColor = away ? away->secondaryColor : frame.awayColor;
+    frame.homeSecondaryColor = home ? home->secondaryColor : frame.homeColor;
+    frame.awayLogo = away ? popup::GetLogoTexture(device,
+        away->databaseTeamID) : nullptr;
+    frame.homeLogo = home ? popup::GetLogoTexture(device,
+        home->databaseTeamID) : nullptr;
+    scoreboard::RenderLineups(device, frame, g_customOverlayName,
+        x, y, opacity);
+}
+
 using OverlayRenderFn = void (*)(IDirect3DDevice9*);
 
 void RenderConfiguredOverlays(IDirect3DDevice9* device)
@@ -2048,6 +2467,9 @@ void RenderConfiguredOverlays(IDirect3DDevice9* device)
     scoreboardconfig::LoadViolation(g_customOverlayName);
     scoreboardconfig::LoadPlayCall(g_customOverlayName);
     scoreboardconfig::LoadIntro(g_customOverlayName);
+    scoreboardconfig::LoadStarting5(g_customOverlayName);
+    scoreboardconfig::LoadOutro(g_customOverlayName);
+    scoreboardconfig::LoadLineups(g_customOverlayName);
     scoreboardconfig::LoadPlayerFoul(g_customOverlayName);
 
     struct RenderEntry {
@@ -2063,6 +2485,12 @@ void RenderConfiguredOverlays(IDirect3DDevice9* device)
             &RenderPlayCallOverlay },
         { scoreboardconfig::GetIntro().overlayZ, 5,
             &RenderIntroOverlay },
+        { scoreboardconfig::GetStarting5().overlayZ, 6,
+            &RenderStarting5Overlay },
+        { scoreboardconfig::GetOutro().overlayZ, 7,
+            &RenderOutroOverlay },
+        { scoreboardconfig::GetLineups().overlayZ, 8,
+            &RenderLineupsOverlay },
         { scoreboardconfig::GetPlayerFoul().overlayZ, 3,
             &RenderPlayerFoulOverlay },
         { scoreboardconfig::GetStat().overlayZ, 4,
@@ -2107,6 +2535,14 @@ void CheckPopupHotReload(IDirect3DDevice9* device)
             g_customOverlayName);
         const bool introLoaded = scoreboardconfig::ReloadIntro(
             g_customOverlayName);
+        const bool starting5Loaded = scoreboardconfig::ReloadStarting5(
+            g_customOverlayName);
+        const bool outroLoaded = scoreboardconfig::ReloadOutro(
+            g_customOverlayName);
+        const bool lineupsRequired = g_game &&
+            g_game->version == GameVersion::Live2008;
+        const bool lineupsLoaded = !lineupsRequired ||
+            scoreboardconfig::ReloadLineups(g_customOverlayName);
         const bool playerFoulLoaded = scoreboardconfig::ReloadPlayerFoul(
             g_customOverlayName);
         const bool genericStatLoaded = scoreboardconfig::ReloadStat(
@@ -2118,24 +2554,44 @@ void CheckPopupHotReload(IDirect3DDevice9* device)
             g_originalPlayCallDataStore != nullptr;
         g_introLayoutAvailable = introLoaded &&
             g_originalIntroDataStore != nullptr;
+        g_starting5LayoutAvailable = starting5Loaded &&
+            g_originalPresentationDataStore != nullptr;
+        g_outroLayoutAvailable = outroLoaded &&
+            g_originalPresentationDataStore != nullptr;
+        g_lineupsLayoutAvailable = lineupsRequired && lineupsLoaded &&
+            g_originalPresentationDataStore != nullptr && g_game &&
+            g_game->version == GameVersion::Live2008;
         if (!playCallLoaded) g_playCall.active = false;
         if (!introLoaded) g_intro.active = false;
+        if (!starting5Loaded) g_starting5.active = false;
+        if (!starting5Loaded) g_starting5Pending.active = false;
+        if (!outroLoaded) g_outro.active = false;
+        if (!lineupsLoaded) {
+            g_lineups.active = false;
+            g_lineupsTransitionHiddenAt = 0;
+        }
         if (!playerFoulLoaded) g_playerFoul.active = false;
         if (!genericStatLoaded) g_genericStat.active = false;
         g_loggedAwayLogoTeam = INT_MIN;
         g_loggedHomeLogoTeam = INT_MIN;
         g_loggedStatTeamCode[0] = '\0';
         AppendDiagnostic(
-            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s playCall=%s intro=%s playerFoul=%s stat=%s error=%s\n",
+            "Popup hot reload: teams=%s font=%s scoreboard=%s violation=%s "
+            "playCall=%s intro=%s starting5=%s outro=%s lineups=%s playerFoul=%s "
+            "stat=%s error=%s\n",
             themeLoaded ? "OK" : "FAILED",
             fontLoaded ? "OK" : "FAILED",
             scoreboardLoaded ? "OK" : "FAILED",
             violationLoaded ? "OK" : "FAILED",
             playCallLoaded ? "OK" : "FAILED",
             introLoaded ? "OK" : "FAILED",
+            starting5Loaded ? "OK" : "FAILED",
+            outroLoaded ? "OK" : "FAILED",
+            lineupsLoaded ? "OK" : "FAILED",
             playerFoulLoaded ? "OK" : "FAILED",
             genericStatLoaded ? "OK" : "FAILED",
-            themeLoaded && scoreboardLoaded && violationLoaded && playCallLoaded && introLoaded &&
+            themeLoaded && scoreboardLoaded && violationLoaded && playCallLoaded &&
+                introLoaded && starting5Loaded && outroLoaded && lineupsLoaded &&
                 playerFoulLoaded && genericStatLoaded ? "<none>" :
                 (!themeLoaded ? popup::GetLastError() :
                     scoreboardconfig::GetLastError()));
@@ -2641,6 +3097,17 @@ void Initialize(const GameAddresses& game)
         std::fclose(file);
     }
 
+    if (game.version == GameVersion::Live2007 ||
+        game.version == GameVersion::Live2008) {
+        file = std::fopen("presentation_payloads.log", "w");
+        if (file) {
+            std::fprintf(file,
+                "%s Starting5/Outro/Lineups completed-payload log\n\n",
+                game.name);
+            std::fclose(file);
+        }
+    }
+
     AppendDiagnostic(
         "Custom overlay: enabled=%s name=%s\n"
         "main.ini=%s exists=%s\n"
@@ -2652,6 +3119,148 @@ void Initialize(const GameAddresses& game)
         g_customOverlayScoreboardPath,
         GetFileAttributesA(g_customOverlayScoreboardPath) !=
             INVALID_FILE_ATTRIBUTES ? "yes" : "no");
+
+    // NBA Live 07/08: suppress the native Starting5 and Outro presentation
+    // movies at their exact per-game builder request calls. All four call
+    // targets are validated before any redirect is installed. Payload stores
+    // and event-state transitions remain native and continue normally.
+    if (game.version == GameVersion::Live2007 ||
+        game.version == GameVersion::Live2008) {
+        uintptr_t nativePresentationRequest = 0;
+        uintptr_t presentationDataStore = 0;
+        uintptr_t starting5RequestCall = 0;
+        uintptr_t starting5StoreCall = 0;
+        uintptr_t outroRequestCall = 0;
+        uintptr_t outroStoreCall = 0;
+
+        if (game.version == GameVersion::Live2007) {
+            nativePresentationRequest = 0x0054D7C0;
+            presentationDataStore = 0x0051E070;
+            starting5RequestCall = 0x00578838;
+            starting5StoreCall = 0x0057884C;
+            outroRequestCall = 0x00578F70;
+            outroStoreCall = 0x00578F81;
+        }
+        else {
+            // Confirmed against nbalive08.exe SHA-256:
+            // 54e5a6b1f41b0e45783e7ffdf97bdf9a43daa4aaef1310efa89f1bae981f3161
+            nativePresentationRequest = 0x0056CF50;
+            presentationDataStore = 0x0053AAE0;
+            starting5RequestCall = 0x00594BC5;
+            starting5StoreCall = 0x00594BD9;
+            outroRequestCall = 0x0059530D;
+            outroStoreCall = 0x0059531F;
+        }
+
+        const uintptr_t starting5Target =
+            GetDirectCallDestination(starting5RequestCall);
+        const uintptr_t starting5StoreTarget =
+            GetDirectCallDestination(starting5StoreCall);
+        const uintptr_t outroTarget =
+            GetDirectCallDestination(outroRequestCall);
+        const uintptr_t outroStoreTarget =
+            GetDirectCallDestination(outroStoreCall);
+
+        if (starting5Target == nativePresentationRequest &&
+            outroTarget == nativePresentationRequest &&
+            starting5StoreTarget == presentationDataStore &&
+            outroStoreTarget == presentationDataStore) {
+            g_originalPresentationDataStore =
+                reinterpret_cast<StoreOverlayDataFn>(presentationDataStore);
+            patch::RedirectCall(
+                static_cast<unsigned int>(starting5RequestCall),
+                reinterpret_cast<void*>(&SuppressNativePresentationRequest));
+            patch::RedirectCall(
+                static_cast<unsigned int>(outroRequestCall),
+                reinterpret_cast<void*>(&SuppressNativePresentationRequest));
+            patch::RedirectCall(
+                static_cast<unsigned int>(starting5StoreCall),
+                reinterpret_cast<void*>(&HookStarting5DataStore));
+            patch::RedirectCall(
+                static_cast<unsigned int>(outroStoreCall),
+                reinterpret_cast<void*>(&HookOutroDataStore));
+            g_starting5LayoutAvailable =
+                scoreboardconfig::LoadStarting5(g_customOverlayName);
+            g_outroLayoutAvailable =
+                scoreboardconfig::LoadOutro(g_customOverlayName);
+            AppendDiagnostic(
+                "%s native Starting5 and Outro disabled: "
+                "requests=%08X,%08X target=%08X; payload stores="
+                "%08X,%08X hooked for capture, original store=%08X and "
+                "event lifecycle retained; layouts Starting5=%s Outro=%s.\n",
+                game.name,
+                static_cast<unsigned int>(starting5RequestCall),
+                static_cast<unsigned int>(outroRequestCall),
+                static_cast<unsigned int>(nativePresentationRequest),
+                static_cast<unsigned int>(starting5StoreCall),
+                static_cast<unsigned int>(outroStoreCall),
+                static_cast<unsigned int>(presentationDataStore),
+                g_starting5LayoutAvailable ? "yes" : "no",
+                g_outroLayoutAvailable ? "yes" : "no");
+        }
+        else {
+            AppendDiagnostic(
+                "%s Starting5/Outro suppression/capture skipped: "
+                "call-target validation failed (Starting5 request=%08X "
+                "store=%08X; Outro request=%08X store=%08X; expected request="
+                "%08X store=%08X).\n",
+                game.name,
+                static_cast<unsigned int>(starting5Target),
+                static_cast<unsigned int>(starting5StoreTarget),
+                static_cast<unsigned int>(outroTarget),
+                static_cast<unsigned int>(outroStoreTarget),
+                static_cast<unsigned int>(nativePresentationRequest),
+                static_cast<unsigned int>(presentationDataStore));
+        }
+    }
+
+    // NBA Live 08-only FEOverlayLineups. Suppress its native movie only when
+    // lineups.json exists and both exact call targets still match the
+    // confirmed executable. The native key-12 event lifecycle remains intact.
+    if (g_customOverlayEnabled && game.version == GameVersion::Live2008) {
+        constexpr uintptr_t kLineupsRequestCall = 0x0059589D;
+        constexpr uintptr_t kLineupsStoreCall = 0x005958B1;
+        constexpr uintptr_t kNativePresentationRequest = 0x0056CF50;
+        constexpr uintptr_t kPresentationDataStore = 0x0053AAE0;
+        const bool layoutLoaded =
+            scoreboardconfig::ReloadLineups(g_customOverlayName);
+        const uintptr_t requestTarget =
+            GetDirectCallDestination(kLineupsRequestCall);
+        const uintptr_t storeTarget =
+            GetDirectCallDestination(kLineupsStoreCall);
+        if (layoutLoaded && requestTarget == kNativePresentationRequest &&
+            storeTarget == kPresentationDataStore) {
+            g_originalPresentationDataStore =
+                reinterpret_cast<StoreOverlayDataFn>(kPresentationDataStore);
+            patch::RedirectCall(
+                static_cast<unsigned int>(kLineupsRequestCall),
+                reinterpret_cast<void*>(&SuppressNativePresentationRequest));
+            patch::RedirectCall(
+                static_cast<unsigned int>(kLineupsStoreCall),
+                reinterpret_cast<void*>(&HookLineupsDataStore));
+            g_lineupsLayoutAvailable = true;
+            AppendDiagnostic(
+                "NBA Live 08 native in-game lineups disabled: request=%08X "
+                "target=%08X; payload store=%08X hooked, original store=%08X; "
+                "key-12 lifecycle retained; layout=yes.\n",
+                static_cast<unsigned int>(kLineupsRequestCall),
+                static_cast<unsigned int>(kNativePresentationRequest),
+                static_cast<unsigned int>(kLineupsStoreCall),
+                static_cast<unsigned int>(kPresentationDataStore));
+        }
+        else {
+            g_lineupsLayoutAvailable = false;
+            AppendDiagnostic(
+                "NBA Live 08 in-game lineups custom overlay unavailable; "
+                "native retained: layout=%s request=%08X store=%08X "
+                "expected request=%08X store=%08X.\n",
+                layoutLoaded ? "yes" : "no",
+                static_cast<unsigned int>(requestTarget),
+                static_cast<unsigned int>(storeTarget),
+                static_cast<unsigned int>(kNativePresentationRequest),
+                static_cast<unsigned int>(kPresentationDataStore));
+        }
+    }
 
     const unsigned int sendEventCalls = RedirectDirectCalls(
         game.sendEvent, reinterpret_cast<void*>(&HookSendEvent));

@@ -13,12 +13,18 @@ Config g_config = {};
 Config g_violationConfig = {};
 Config g_playCallConfig = {};
 Config g_introConfig = {};
+Config g_starting5Config = {};
+Config g_outroConfig = {};
+Config g_lineupsConfig = {};
 Config g_playerFoulConfig = {};
 Config g_statConfig = {};
 bool g_loaded = false;
 bool g_violationLoaded = false;
 bool g_playCallLoaded = false;
 bool g_introLoaded = false;
+bool g_starting5Loaded = false;
+bool g_outroLoaded = false;
+bool g_lineupsLoaded = false;
 bool g_playerFoulLoaded = false;
 bool g_statLoaded = false;
 bool g_playerFoulAvailable = false;
@@ -27,6 +33,9 @@ char g_theme[64] = {};
 char g_violationTheme[64] = {};
 char g_playCallTheme[64] = {};
 char g_introTheme[64] = {};
+char g_starting5Theme[64] = {};
+char g_outroTheme[64] = {};
+char g_lineupsTheme[64] = {};
 char g_playerFoulTheme[64] = {};
 char g_statTheme[64] = {};
 char g_statSubtype[64] = {};
@@ -520,6 +529,9 @@ const Config& Get() { return g_config; }
 const Config& GetViolation() { return g_violationConfig; }
 const Config& GetPlayCall() { return g_playCallConfig; }
 const Config& GetIntro() { return g_introConfig; }
+const Config& GetStarting5() { return g_starting5Config; }
+const Config& GetOutro() { return g_outroConfig; }
+const Config& GetLineups() { return g_lineupsConfig; }
 const Config& GetPlayerFoul() { return g_playerFoulConfig; }
 const Config& GetStat() { return g_statConfig; }
 
@@ -668,6 +680,126 @@ bool ReloadIntro(const char* themeName)
     g_introLoaded = false;
     g_introTheme[0] = '\0';
     return LoadIntro(themeName);
+}
+
+bool LoadStarting5(const char* themeName)
+{
+    if (g_starting5Loaded && std::strcmp(g_starting5Theme, themeName) == 0)
+        return true;
+    Config next;
+    SetDefaults(&next);
+    next.width = 760.0f;
+    next.height = 300.0f;
+    next.offsetY = 110.0f;
+    next.overlayZ = 45;
+    next.holdMilliseconds = 5000;
+    std::string path = GameDirectory() + "\\assets\\popups\\" + themeName +
+        "\\starting5\\starting5.json";
+    std::string json;
+    if (!ReadFile(path.c_str(), &json)) {
+        std::snprintf(g_lastError, sizeof(g_lastError), "Could not read %s",
+            path.c_str());
+        g_starting5Config = next;
+        g_starting5Loaded = true;
+        std::strncpy(g_starting5Theme, themeName,
+            sizeof(g_starting5Theme) - 1);
+        g_starting5Theme[sizeof(g_starting5Theme) - 1] = '\0';
+        return false;
+    }
+    Parse(json, &next);
+    g_starting5Config = next;
+    g_starting5Loaded = true;
+    std::strncpy(g_starting5Theme, themeName,
+        sizeof(g_starting5Theme) - 1);
+    g_starting5Theme[sizeof(g_starting5Theme) - 1] = '\0';
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool ReloadStarting5(const char* themeName)
+{
+    g_starting5Loaded = false;
+    g_starting5Theme[0] = '\0';
+    return LoadStarting5(themeName);
+}
+
+bool LoadOutro(const char* themeName)
+{
+    if (g_outroLoaded && std::strcmp(g_outroTheme, themeName) == 0)
+        return true;
+    Config next;
+    SetDefaults(&next);
+    next.width = 760.0f;
+    next.height = 230.0f;
+    next.offsetY = 120.0f;
+    next.overlayZ = 45;
+    next.holdMilliseconds = 6500;
+    std::string path = GameDirectory() + "\\assets\\popups\\" + themeName +
+        "\\outro\\outro.json";
+    std::string json;
+    if (!ReadFile(path.c_str(), &json)) {
+        std::snprintf(g_lastError, sizeof(g_lastError), "Could not read %s",
+            path.c_str());
+        g_outroConfig = next;
+        g_outroLoaded = true;
+        std::strncpy(g_outroTheme, themeName, sizeof(g_outroTheme) - 1);
+        g_outroTheme[sizeof(g_outroTheme) - 1] = '\0';
+        return false;
+    }
+    Parse(json, &next);
+    g_outroConfig = next;
+    g_outroLoaded = true;
+    std::strncpy(g_outroTheme, themeName, sizeof(g_outroTheme) - 1);
+    g_outroTheme[sizeof(g_outroTheme) - 1] = '\0';
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool ReloadOutro(const char* themeName)
+{
+    g_outroLoaded = false;
+    g_outroTheme[0] = '\0';
+    return LoadOutro(themeName);
+}
+
+bool LoadLineups(const char* themeName)
+{
+    if (g_lineupsLoaded && std::strcmp(g_lineupsTheme, themeName) == 0)
+        return true;
+    Config next;
+    SetDefaults(&next);
+    next.width = 900.0f;
+    next.height = 330.0f;
+    next.offsetY = 105.0f;
+    next.overlayZ = 45;
+    next.holdMilliseconds = 5500;
+    std::string path = GameDirectory() + "\\assets\\popups\\" + themeName +
+        "\\lineups\\lineups.json";
+    std::string json;
+    if (!ReadFile(path.c_str(), &json)) {
+        std::snprintf(g_lastError, sizeof(g_lastError), "Could not read %s",
+            path.c_str());
+        g_lineupsConfig = next;
+        g_lineupsLoaded = true;
+        std::strncpy(g_lineupsTheme, themeName,
+            sizeof(g_lineupsTheme) - 1);
+        g_lineupsTheme[sizeof(g_lineupsTheme) - 1] = '\0';
+        return false;
+    }
+    Parse(json, &next);
+    g_lineupsConfig = next;
+    g_lineupsLoaded = true;
+    std::strncpy(g_lineupsTheme, themeName, sizeof(g_lineupsTheme) - 1);
+    g_lineupsTheme[sizeof(g_lineupsTheme) - 1] = '\0';
+    g_lastError[0] = '\0';
+    return true;
+}
+
+bool ReloadLineups(const char* themeName)
+{
+    g_lineupsLoaded = false;
+    g_lineupsTheme[0] = '\0';
+    return LoadLineups(themeName);
 }
 
 bool LoadPlayerFoul(const char* themeName)

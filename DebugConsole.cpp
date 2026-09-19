@@ -1355,10 +1355,13 @@ bool InstallFileSystemOpenResolvedHookForCurrentGame()
 
 
 // -------------------------------------------------------------------------
-// NBA Live 06 animation-bank pair debugger
+// NBA Live 06/07/08 animation-bank pair debugger
 // -------------------------------------------------------------------------
 //
-// AnimationBankSystem_LoadPair @ 00645D10
+// AnimationBankSystem_LoadPair:
+ //   06: 00645D10
+ //   07: 006A3F00
+ //   08: 006CB0F0
 //   ECX      = animation-bank system
 //   ESP+04   = bank index
 //   ESP+08   = variant
@@ -1369,7 +1372,8 @@ bool InstallFileSystemOpenResolvedHookForCurrentGame()
 //   <abkStem>.abk
 //   <variantRecord.objectStem>.o
 //
-// AnimBankEntry layout established from sub_644500 / sub_645D10:
+// AnimBankEntry layout established in Live 06 and confirmed structurally
+// identical in the Live 07/08 pair loaders:
 //   +40 index
 //   +44 first variant
 //   +4C next-by-index
@@ -1378,6 +1382,8 @@ bool InstallFileSystemOpenResolvedHookForCurrentGame()
 //   +00 object stem string
 //   +40 variant
 //   +44 next variant
+
+uintptr_t g_AnimBankPairContinue = 0;
 
 bool SafeCopyCString(const char* src, char* dst, size_t dstSize)
 {
@@ -1405,7 +1411,7 @@ bool SafeCopyCString(const char* src, char* dst, size_t dstSize)
     }
 }
 
-const char* ResolveAnimBankObjectStemLive06(
+const char* ResolveAnimBankObjectStem(
     void* self,
     int bankIndex,
     int variant,
@@ -1473,7 +1479,7 @@ const char* ResolveAnimBankObjectStemLive06(
     return nullptr;
 }
 
-void __cdecl LogAnimBankPairLive06(
+void __cdecl LogAnimBankPair(
     void* self,
     const uintptr_t* entryStack)
 {
@@ -1493,7 +1499,7 @@ void __cdecl LogAnimBankPairLive06(
     char objectStem[128] = {};
 
     SafeCopyCString(abkStem, safeAbkStem, sizeof(safeAbkStem));
-    ResolveAnimBankObjectStemLive06(
+    ResolveAnimBankObjectStem(
         self,
         bankIndex,
         variant,
@@ -1519,7 +1525,7 @@ void __cdecl LogAnimBankPairLive06(
     LeaveCriticalSection(&g_consoleLock);
 }
 
-__declspec(naked) void HookAnimBankPairLive06()
+__declspec(naked) void HookAnimBankPair()
 {
     __asm {
         // Preserve entry stack and original ECX before touching registers.
@@ -1529,7 +1535,7 @@ __declspec(naked) void HookAnimBankPairLive06()
 
         push    eax
         push    ecx
-        call    LogAnimBankPairLive06
+        call    LogAnimBankPair
         add     esp, 8
 
         popad
@@ -1541,16 +1547,22 @@ __declspec(naked) void HookAnimBankPairLive06()
         push    ebx
         mov     ebx, [esp+0Ch]
 
-        mov     eax, 00645D15h
-        jmp     eax
+        jmp     dword ptr [g_AnimBankPairContinue]
     }
 }
 
-bool InstallAnimBankPairHookLive06()
+bool InstallAnimBankPairHookAt(uintptr_t targetAddress)
 {
-    constexpr uintptr_t targetAddress = 0x00645D10;
     constexpr size_t patchLength = 5;
 
+    // All three games use the same entry sequence:
+    //   53                push ebx
+    //   8B 5C 24 0C      mov ebx,[esp+0Ch]
+    //
+    // Entry stack layout:
+    //   ESP+04 = anim bank index
+    //   ESP+08 = variant
+    //   ESP+0C = ABK stem (normally "%08d")
     const BYTE expected[patchLength] = {
         0x53,
         0x8B, 0x5C, 0x24, 0x0C
@@ -1566,31 +1578,28 @@ bool InstallAnimBankPairHookLive06()
         return false;
     }
 
+    g_AnimBankPairContinue = targetAddress + patchLength;
+
     DWORD oldProtect = 0;
     if (!VirtualProtect(
             target,
             patchLength,
             PAGE_EXECUTE_READWRITE,
             &oldProtect))
+    {
+        g_AnimBankPairContinue = 0;
         return false;
+    }
 
     target[0] = 0xE9;
     *reinterpret_cast<int32_t*>(target + 1) =
         static_cast<int32_t>(
-            reinterpret_cast<uintptr_t>(&HookAnimBankPairLive06) -
+            reinterpret_cast<uintptr_t>(&HookAnimBankPair) -
             (targetAddress + 5));
 
     DWORD ignored = 0;
-    VirtualProtect(
-        target,
-        patchLength,
-        oldProtect,
-        &ignored);
-
-    FlushInstructionCache(
-        GetCurrentProcess(),
-        target,
-        patchLength);
+    VirtualProtect(target, patchLength, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
 
     return true;
 }
@@ -1600,9 +1609,32 @@ bool InstallAnimBankPairHookForCurrentGame()
     if (!g_animBanks)
         return false;
 
-    if (FM::GetEntryPoint() == 0x40109F &&
-        plugin::patch::GetFloat(0xBD832C) == 1.3333334f)
-        return InstallAnimBankPairHookLive06();
+    const uintptr_t ep = FM::GetEntryPoint();
+
+    if (ep == 0xCD8005) {
+        // Live 2005 not mapped yet.
+        return false;
+    }
+
+    if (ep == 0x40109F) {
+        if (plugin::patch::GetFloat(0xBD832C) == 1.3333334f) {
+            // NBA Live 06
+            // Pair loader: 00645D10
+            return InstallAnimBankPairHookAt(0x00645D10);
+        }
+
+        if (plugin::patch::GetFloat(0xBBBC3C) == 1.3333334f) {
+            // NBA Live 07
+            // Pair loader: 006A3F00
+            return InstallAnimBankPairHookAt(0x006A3F00);
+        }
+
+        if (plugin::patch::GetFloat(0xC3DF84) == 1.3333334f) {
+            // NBA Live 08
+            // Pair loader: 006CB0F0
+            return InstallAnimBankPairHookAt(0x006CB0F0);
+        }
+    }
 
     return false;
 }
@@ -3508,7 +3540,8 @@ void InitializeDebugConsole() {
             animBank ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
                      : (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY));
         std::printf(
-            "NBA Live 06 animation-bank pair hook: %s\n",
+            "%s animation-bank pair hook: %s\n",
+            GameName(),
             animBank ? "OK" : "MISS");
     }
 
