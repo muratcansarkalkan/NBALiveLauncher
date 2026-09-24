@@ -1,20 +1,34 @@
 # NBA Live 2005-08 Launcher
 
-NBA Live Launcher is a single ASI plugin for **NBA Live 2005, NBA Live 06, NBA Live 07, and NBA Live 08**. It combines the previous Resolution/Widescreen and Windowed Mode plugins with custom broadcast overlays and additional game improvements.
+NBA Live Launcher is an all-in-one ASI plugin for **NBA Live 2005, NBA Live 06, NBA Live 07, and NBA Live 08**.
+
+It combines modern display support, windowed mode, custom broadcast overlays, screenshots, anti-aliasing, debugging tools, stadium enhancements, memory improvements, game fixes, and other features into a single plugin.
 
 ## Features
 
+- NBA Live 2005, 06, 07 and 08 support
 - Modern resolution and widescreen support
 - Custom frontend/menu resolution
-- Windowed mode and intro video control
-- Custom Direct3D 9 scoreboards and broadcast overlays
-- NBA Live Overlay Theme Editor
-- Custom startup home and away teams
-- Additional `faces\` file-search path for all four games
-- Per-stadium Dorna ad count and timing configuration
-- Increased temporary-list capacity for NBA Live 2005
+- Improved menu font resolution
+- Windowed mode
+- MSAA anti-aliasing
+- PNG/TGA screenshots with configurable output directory
+- Custom scoreboards and broadcast overlays
+- Editable Starting 5, Outro and in-game lineup graphics
+- Player/team statistics and foul popups
+- Player jersey-number support in stat/foul popups
+- Dynamic stadium/jumbotron game data
+- CSV box-score export
+- Debug console and crash diagnostics
+- Custom startup teams
+- Additional `faces\` file-search path
+- Per-stadium Dorna configuration
+- Expanded memory for larger custom assets
+- Several game-specific crash and rendering fixes
 
-## Installation
+---
+
+# Installation
 
 The release package contains three directories:
 
@@ -24,17 +38,17 @@ all
 06
 ```
 
-### 1. Install the NBA Live ASI Loader
+## 1. Install the NBA Live ASI Loader
 
-NBA Live Launcher requires the **NBA Live ASI Loader**.
+**NBA Live Launcher requires the NBA Live ASI Loader.**
 
 Install the ASI Loader into the main directory of the NBA Live game you want to use before installing NBA Live Launcher.
 
-Follow the installation instructions provided with the ASI Loader.
+Follow the installation instructions included with the ASI Loader.
 
-### 2. Remove Previous Plugins
+## 2. Remove Previous Plugins
 
-If you previously used the standalone Windowed Mode or Resolution plugins, remove these files:
+If you previously used the standalone Windowed Mode or Resolution plugins, remove:
 
 ```text
 NBAWindowedMode.asi
@@ -43,59 +57,178 @@ NBALiveResolution.asi
 
 Their functionality is already included in NBA Live Launcher.
 
-### 3. Install the Common Files
+## 3. Install the Common Files
 
-Open the `all` directory and copy **all of its contents** into the main directory of the NBA Live game you want to use.
+Copy **all contents of the `all` directory** into the main directory of the NBA Live game you want to play.
 
-The launcher supports:
+This applies to:
 
 - NBA Live 2005
 - NBA Live 06
 - NBA Live 07
 - NBA Live 08
 
-### 4. Install Game-Specific Files
+## 4. Install Game-Specific Files
 
-If you are playing **NBA Live 2005**, copy the contents of the `2005` directory into your NBA Live 2005 directory and overwrite files when prompted.
+### NBA Live 2005
 
-If you are playing **NBA Live 06**, copy the contents of the `06` directory into your NBA Live 06 directory and overwrite files when prompted.
+After installing `all`, copy the contents of:
 
-NBA Live 07 and NBA Live 08 only require the contents of the `all` directory.
+```text
+2005
+```
 
-A compatible supported executable is required.
+into the NBA Live 2005 directory and **overwrite files when prompted**.
 
-## Display Configuration
+### NBA Live 06
 
-Display settings are configured through `main.ini`.
+After installing `all`, copy the contents of:
 
-Example:
+```text
+06
+```
+
+into the NBA Live 06 directory and **overwrite files when prompted**.
+
+### NBA Live 07 / NBA Live 08
+
+No additional game-specific package is required. Install the contents of `all`.
+
+## Sample Stadium
+
+The package includes the **Boston Celtics stadium from NBA Live 08** as a sample of the launcher's stadium functionality.
+
+---
+
+# Configuration
+
+NBA Live Launcher is configured through `main.ini` in the game directory.
+
+## Display
 
 ```ini
 [DISPLAY]
 RES_X=1920
 RES_Y=1080
 WINDOWED=1
-
-[BOOTUP]
-INTRO=1
+ANTI_ALIASING=1
+MSAA_SAMPLES=4
 ```
 
-`RES_X` and `RES_Y` set the startup/frontend resolution. You can still choose your preferred gameplay resolution from the normal in-game resolution options.
+### Resolution
 
-- `WINDOWED=1` enables windowed mode.
-- `WINDOWED=0` uses fullscreen mode.
-- `INTRO=1` enables intro videos.
-- `INTRO=0` disables intro videos.
+`RES_X` and `RES_Y` control the startup/frontend resolution.
 
-## Custom Scoreboards and Broadcast Overlays
+For example:
 
-Custom popup packages are stored under:
+```ini
+RES_X=1920
+RES_Y=1080
+```
+
+The normal in-game resolution selector remains available, so the gameplay resolution can still be selected from the game's options.
+
+### Windowed Mode
+
+```ini
+WINDOWED=1
+```
+
+enables windowed mode.
+
+Use:
+
+```ini
+WINDOWED=0
+```
+
+for fullscreen.
+
+### Anti-Aliasing
+
+Enable MSAA with:
+
+```ini
+ANTI_ALIASING=1
+```
+
+and select the requested sample count with:
+
+```ini
+MSAA_SAMPLES=4
+```
+
+Supported requested values include:
+
+```text
+2
+4
+8
+16
+```
+
+Actual MSAA availability depends on the graphics hardware and display mode.
+
+---
+
+# Screenshots
+
+NBA Live Launcher replaces the original screenshot system with a Direct3D 9 implementation.
+
+Screenshots can be saved as **PNG** or **TGA**, work with the launcher's anti-aliasing implementation, and can be written to a configurable directory.
+
+Configure the screenshot system in `main.ini`:
+
+```ini
+[SCREENSHOT]
+FORMAT=png
+DIRECTORY=
+```
+
+Supported formats:
+
+```ini
+FORMAT=png
+```
+
+or:
+
+```ini
+FORMAT=tga
+```
+
+If `DIRECTORY` is empty, screenshots are saved to the appropriate game's Screenshots directory under Documents.
+
+For example:
+
+```text
+Documents\NBA LIVE 2005\Screenshots
+Documents\NBA LIVE 06\Screenshots
+Documents\NBA LIVE 07\Screenshots
+Documents\NBA LIVE 08\Screenshots
+```
+
+A custom directory can also be specified:
+
+```ini
+DIRECTORY=C:\NBA Screenshots
+```
+
+Screenshots are automatically numbered to prevent existing screenshots from being overwritten.
+
+---
+
+# Custom Scoreboards and Broadcast Overlays
+
+NBA Live Launcher includes a custom Direct3D 9 broadcast graphics system.
+
+Custom packages are stored under:
 
 ```text
 popups\<package name>\
 ```
 
-Custom overlays are configured in `main.ini`:
+Enable custom overlays in `main.ini`:
 
 ```ini
 [OVERLAY]
@@ -103,11 +236,21 @@ CUSTOM_OVERLAY=1
 CUSTOM_OVERLAY_NAME=TEST
 ```
 
-`CUSTOM_OVERLAY=1` enables custom overlays. Set it to `0` to use the game's original scoreboard and overlays.
+`CUSTOM_OVERLAY` controls whether the custom overlay system is enabled:
 
-`CUSTOM_OVERLAY_NAME` selects the popup package to load.
+```ini
+CUSTOM_OVERLAY=1
+```
 
-For example:
+enables custom overlays.
+
+```ini
+CUSTOM_OVERLAY=0
+```
+
+uses the game's original overlays.
+
+`CUSTOM_OVERLAY_NAME` selects the package:
 
 ```ini
 CUSTOM_OVERLAY_NAME=TNT07
@@ -121,43 +264,75 @@ popups\TNT07\
 
 Restart the game after changing `CUSTOM_OVERLAY` or `CUSTOM_OVERLAY_NAME`.
 
-The custom overlay system supports scoreboards, violations, play calls, player-foul graphics, player and team statistics, and pregame matchup graphics. Unsupported or unconfigured overlays fall back to the game's original graphics.
+Press **F5** while in game to reload the current popup package during development.
 
-Users can create their own scoreboards and popups using the included **NBA Live Overlay Theme Editor**.
+## Supported Graphics
 
-See [CustomScoreboards.md](CustomScoreboards.md) for information about creating custom popup packages, layouts, bindings, fonts, images, animations, supported overlays, and the Theme Editor.
+The custom overlay system supports graphics including:
 
-Press **F5** in game to reload the current popup package while editing.
+- Scoreboard
+- Violations
+- Play calls
+- Player fouls
+- Player statistics
+- Team statistics
+- Starting 5
+- Outro graphics
+- In-game lineups
 
-## Startup Teams
+NBA Live 07 and NBA Live 08 now support full custom editing of the **Starting 5, Outro and in-game lineup** presentation graphics.
 
-The initial matchup can be overridden through `main.ini`:
+Player-stat and player-foul graphics can also display the featured player's **jersey number**.
 
-```ini
-[STARTUP]
-HOME_TEAMNUM=-1
-AWAY_TEAMNUM=-1
-```
+## Creating Your Own Scoreboards and Popups
 
-Set either value to a valid database `TEAMNUM`.
+The **NBA Live Scoreboard Theme Editor** provides the visual editing environment for creating and modifying custom broadcast packages.
 
-A value of `-1` leaves that team's original startup selection unchanged.
+For complete instructions covering the editor, elements, bindings, layouts, images, fonts, animations and custom popup creation, read the:
 
-## Custom Faces Folder
+[Scoreboard Theme Editor User Guide](https://github.com/muratcansarkalkan/ScoreboardThemeEditor/blob/main/USER_GUIDE.md?utm_source=chatgpt.com)
 
-NBA Live Launcher adds:
+---
+
+# Box Score Export
+
+Press:
 
 ```text
-faces\
+F6
 ```
 
-to the game's file-search paths in NBA Live 2005, NBA Live 06, NBA Live 07, and NBA Live 08.
+during a game to export the current box score as a **CSV file**.
 
-This allows supported files to be loaded from a dedicated `faces` directory.
+The exported box score contains live player/game statistics gathered from the current game.
 
-## Stadium Dorna Configuration
+---
 
-Dorna behavior can be customized for individual stadiums using JSON files stored in:
+## Dynamic Stadium Displays
+
+Compatible stadium models can display live game information using dynamic runtime materials.
+
+Supported stadium/jumbotron information includes data such as:
+
+- Home and away scores
+- Game clock
+- Shot clock
+- Period / overtime
+- Timeouts
+- Team fouls
+- Player jersey numbers
+- Player points
+- Player fouls
+
+This allows compatible stadium models to contain functional scoreboards and statistical displays instead of static textures.
+
+For information about creating and editing compatible stadium models, dynamic materials, jumbotron displays, and other stadium features, see [NBA Live EBO Tools](https://github.com/muratcansarkalkan/EBOTools/?utm_source=chatgpt.com).
+
+---
+
+# Stadium Dorna Configuration
+
+Dorna behavior can be configured individually for stadiums using:
 
 ```text
 assets\stadia\<stadium-abbreviation>.json
@@ -176,47 +351,197 @@ Example:
 ```
 
 - `ad_count` controls the number of Dorna advertisements.
-- `period` controls the complete Dorna cycle period.
+- `period` controls the complete cycle.
 - `transition_period` controls transition timing.
 
-If a stadium configuration or individual setting is missing, the game uses its original value.
+Missing settings use the game's original values.
 
-## Sample Stadium
+---
 
-The release package includes the **Boston Celtics stadium from NBA Live 08** as a sample.
+# Debugger
 
-It is included as an example of the stadium-related functionality available with NBA Live Launcher.
+NBA Live Launcher includes an optional external debug console intended primarily for mod development and troubleshooting.
 
-## NBA Live 2005 Memory Improvement
+Enable it through `main.ini`:
 
-NBA Live 2005 includes an additional memory-related patch that increases a known temporary-list capacity from **118 to 512 entries**.
+```ini
+[DEBUG]
+CONSOLE=1
+```
 
-The experimental NBA Live 06 memory allocator expansion is currently disabled.
+Additional debugging options include:
 
-## Supported Games
+```ini
+[DEBUG]
+CONSOLE=1
+FILES=1
+FAILED_FILES=1
+FILE_CALLERS=1
+CRASHES=1
+ASSET_FILES=1
+ANIMBANK=0
+```
+
+These options can provide information about file activity, failed file loads, asset requests and crashes.
+
+Crash diagnostics can include information such as the exception location, operation, CPU state, stack information and relevant resource context.
+
+For normal gameplay, the debugger can be disabled with:
+
+```ini
+CONSOLE=0
+```
+
+---
+
+# Startup Teams
+
+The initial matchup can be overridden through `main.ini`:
+
+```ini
+[STARTUP]
+HOME_TEAMNUM=-1
+AWAY_TEAMNUM=-1
+```
+
+Set either value to a valid database `TEAMNUM`.
+
+`-1` leaves that team's normal startup selection unchanged.
+
+---
+
+# Custom Faces Folder
+
+NBA Live Launcher adds:
+
+```text
+faces\
+```
+
+to the file-search paths of NBA Live 2005, 06, 07 and 08.
+
+This provides a dedicated location for supported custom face files.
+
+---
+
+# Memory Improvements
+
+NBA Live Launcher increases available in-game memory/resources to improve support for substantially larger custom assets, including more detailed stadiums.
+
+NBA Live 2005 also increases a known temporary resource-list capacity from:
+
+```text
+118
+```
+
+to:
+
+```text
+512
+```
+
+entries.
+
+---
+
+# Additional Fixes and Improvements
+
+The launcher also includes several fixes for the original games:
+
+### NBA Live 2005
+
+- Fixed the **Lounge not displaying** correctly.
+- Increased resource capacity for larger custom assets.
+
+### NBA Live 07
+
+- Fixed player clipping issues.
+- Fixed a longstanding crash that could occur when quitting an active game and returning to the main menu.
+
+### NBA Live 08
+
+- Fixed player clipping issues.
+
+### Frontend
+
+- Improved **menu/frontend font resolution** for modern display resolutions.
+- This change applies to frontend fonts and does not replace the in-game font rendering system.
+
+---
+
+# Changelog
+
+## Latest Update
+
+### Added
+
+- MSAA anti-aliasing.
+- New Direct3D 9 screenshot system.
+- PNG screenshot support.
+- Configurable screenshot output directory.
+- Dynamic game data for stadium/jumbotron models.
+- Debug console and crash diagnostics.
+- F6 CSV box-score export.
+- Player jersey-number binding for stat and foul popups.
+- Player-number support in the Scoreboard Theme Editor.
+- Full custom Starting 5 graphics for NBA Live 07 and 08.
+- Full custom Outro graphics for NBA Live 07 and 08.
+- Full custom in-game lineup graphics for NBA Live 07 and 08.
+- Increased game memory for larger custom stadiums and other assets.
+- Higher-resolution frontend/menu font rendering.
+
+### Fixed
+
+- Fixed the Lounge not displaying correctly in NBA Live 2005.
+- Fixed player clipping in NBA Live 07 and NBA Live 08.
+- Fixed an NBA Live 07 crash when quitting an in-progress game and returning to the main menu.
+
+### Improved
+
+- Screenshot capture now works with the launcher's MSAA implementation.
+- Screenshot filenames are automatically numbered.
+- Stat and foul popup data has been expanded.
+- Stadium models can now function as live arena displays instead of relying entirely on static textures.
+- Debugging information for custom assets and game crashes has been expanded.
+
+---
+
+# Supported Games
 
 - NBA Live 2005
 - NBA Live 06
 - NBA Live 07
 - NBA Live 08
 
-## Building
+A compatible game executable and the NBA Live ASI Loader are required.
+
+---
+
+# Building
 
 NBA Live Launcher is a **32-bit ASI plugin**.
 
 The project uses the Visual Studio `v141_xp` toolset and the FIFAM/NBA Live ASI development headers.
 
-Open `NBALiveLauncher.sln`, configure the required local include paths, and build the Win32 configuration.
+Open:
 
-The NBA Live Overlay Theme Editor is a separate .NET application.
+```text
+NBALiveLauncher.sln
+```
 
-## Credits
+configure the required local include paths and build the Win32 configuration.
+
+The **NBA Live Scoreboard Theme Editor** is maintained as a separate application.
+
+---
+
+# Credits
 
 - Dmitri — coding assistance and FIFAM ASI Loader development
 - wiscard_rush — UI components
 - JuicyShaqMeat — UI components
 - iceman — widescreen intro videos for NBA Live 2005 and NBA Live 06
 
-## License
+# License
 
 See `LICENSE`.
