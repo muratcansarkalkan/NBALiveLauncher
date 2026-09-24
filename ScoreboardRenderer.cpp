@@ -330,7 +330,7 @@ float MeasureSmallCaps(const char* text, float height, float smallScale)
 
 void DrawSmallCapsLeft(IDirect3DDevice9* device, const char* text,
                        float x, float y, float height, float smallScale,
-                       D3DCOLOR color)
+                       D3DCOLOR color, float horizontalScale = 1.0f)
 {
     for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
          p && *p; ++p) {
@@ -339,15 +339,16 @@ void DrawSmallCapsLeft(IDirect3DDevice9* device, const char* text,
         char glyph[2] = { static_cast<char>(isSmallCap ?
             std::toupper(*p) : *p), '\0' };
         popupfont::DrawLeft(device, glyph, x, y + height - glyphHeight,
-            glyphHeight, color);
-        x += popupfont::Measure(glyph, glyphHeight);
+            glyphHeight, color, horizontalScale);
+        x += popupfont::Measure(glyph, glyphHeight) * horizontalScale;
     }
 }
 
 void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
                    const scoreboardconfig::Rect& rectangle,
                    float height, D3DCOLOR color, int alignment,
-                   bool fit = false,
+                   scoreboardconfig::TextOverflow overflow =
+                       scoreboardconfig::TextOverflow::Overflow,
                    scoreboardconfig::TextTransform transform =
                        scoreboardconfig::TextTransform::None,
                    float smallCapsScale = 0.75f)
@@ -355,41 +356,56 @@ void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
     char transformed[128] = {};
     TransformText(sourceText, transform, transformed, sizeof(transformed));
     const char* text = transformed;
-    // The rectangle is an alignment box, not a font-size ceiling. Keeping
-    // the requested height allows the editor's score/clock/shot-clock font
-    // controls to grow text beyond the original default element bounds.
+
+    // The rectangle is an alignment box, not normally a font-size ceiling.
+    // Fit preserves the legacy behavior: shrink uniformly in X/Y.
+    // FitWidth keeps the requested height and only compresses horizontally.
     float actualHeight = height > 0.0f ? height : rectangle.height;
-    if (fit && rectangle.height > 0.0f && actualHeight > rectangle.height)
+    if (overflow == scoreboardconfig::TextOverflow::Fit &&
+        rectangle.height > 0.0f && actualHeight > rectangle.height)
         actualHeight = rectangle.height;
-    if (fit && rectangle.width > 0.0f) {
-        const float measured = transform == scoreboardconfig::TextTransform::SmallCaps ?
+
+    float horizontalScale = 1.0f;
+    const float measured =
+        transform == scoreboardconfig::TextTransform::SmallCaps ?
             MeasureSmallCaps(sourceText, actualHeight, smallCapsScale) :
             popupfont::Measure(text, actualHeight);
-        if (measured > rectangle.width && measured > 0.0f)
-            actualHeight *= rectangle.width / measured;
+
+    if (overflow == scoreboardconfig::TextOverflow::Fit &&
+        rectangle.width > 0.0f && measured > rectangle.width && measured > 0.0f) {
+        actualHeight *= rectangle.width / measured;
     }
+    else if (overflow == scoreboardconfig::TextOverflow::FitWidth &&
+             rectangle.width > 0.0f && measured > rectangle.width && measured > 0.0f) {
+        horizontalScale = rectangle.width / measured;
+    }
+
     const float y = rectangle.y +
         (rectangle.height - actualHeight) * 0.5f;
+
     if (transform == scoreboardconfig::TextTransform::SmallCaps) {
-        const float measured = MeasureSmallCaps(sourceText, actualHeight,
-            smallCapsScale);
+        const float fittedWidth =
+            MeasureSmallCaps(sourceText, actualHeight, smallCapsScale) *
+            horizontalScale;
         const float x = alignment < 0 ? rectangle.x : alignment > 0 ?
-            rectangle.x + rectangle.width - measured :
-            rectangle.x + (rectangle.width - measured) * 0.5f;
+            rectangle.x + rectangle.width - fittedWidth :
+            rectangle.x + (rectangle.width - fittedWidth) * 0.5f;
         DrawSmallCapsLeft(device, sourceText, x, y, actualHeight,
-            smallCapsScale, color);
+            smallCapsScale, color, horizontalScale);
         return;
     }
+
     if (alignment < 0)
         popupfont::DrawLeft(device, text, rectangle.x, y,
-            actualHeight, color);
+            actualHeight, color, horizontalScale);
     else if (alignment > 0)
         popupfont::DrawRight(device, text,
-            rectangle.x + rectangle.width, y, actualHeight, color);
+            rectangle.x + rectangle.width, y, actualHeight, color,
+            horizontalScale);
     else
         popupfont::DrawCentered(device, text,
             rectangle.x + rectangle.width * 0.5f,
-            y, actualHeight, color);
+            y, actualHeight, color, horizontalScale);
 }
 
 D3DCOLOR WithOpacity(D3DCOLOR color, int opacity)
@@ -681,6 +697,12 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
             return true;
         }
     }
+    if (std::strcmp(b, "player.jerseyNumber") == 0) {
+        std::snprintf(output, capacity, "%s",
+            frame.playerJerseyNumber ? frame.playerJerseyNumber : "");
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
     if (std::strcmp(b, "player.firstName") == 0 ||
         std::strcmp(b, "player.lastName") == 0 ||
         std::strcmp(b, "player.fullName") == 0) {
@@ -892,15 +914,14 @@ bool RenderGenericElements(IDirect3DDevice9* device,
             if (e.fontHeight > 0.0f) height = e.fontHeight;
             const int alignment = e.alignment == scoreboardconfig::TextAlignment::Left ?
                 -1 : e.alignment == scoreboardconfig::TextAlignment::Right ? 1 : 0;
-            const bool fit =
-                e.overflow == scoreboardconfig::TextOverflow::Fit;
+            const scoreboardconfig::TextOverflow overflow = e.overflow;
             if (e.shadowEnabled && e.shadowAlpha > 0) {
                 scoreboardconfig::Rect shadowRect = r;
                 shadowRect.x += e.shadowOffsetX * scale;
                 shadowRect.y += e.shadowOffsetY * scale;
                 const int shadowOpacity = opacity * e.shadowAlpha / 255;
                 DrawBoundText(device, text, shadowRect, height * scale,
-                    WithOpacity(e.shadowColor, shadowOpacity), alignment, fit,
+                    WithOpacity(e.shadowColor, shadowOpacity), alignment, overflow,
                     e.textTransform, e.smallCapsScale);
             }
             if (e.strokeEnabled && e.strokeWidth > 0.0f) {
@@ -917,13 +938,13 @@ bool RenderGenericElements(IDirect3DDevice9* device,
                         strokeRect.x += static_cast<float>(x);
                         strokeRect.y += static_cast<float>(y);
                         DrawBoundText(device, text, strokeRect, height * scale,
-                            WithOpacity(e.strokeColor, opacity), alignment, fit,
+                            WithOpacity(e.strokeColor, opacity), alignment, overflow,
                             e.textTransform, e.smallCapsScale);
                     }
                 }
             }
             DrawBoundText(device, text, r, height * scale,
-                WithOpacity(color, opacity), alignment, fit,
+                WithOpacity(color, opacity), alignment, overflow,
                 e.textTransform, e.smallCapsScale);
         }
         else if (e.type == scoreboardconfig::ElementType::Indicator && fontReady) {

@@ -2,6 +2,7 @@
 #include "Resolutions.h"
 #include "Games.h"
 #include "DebugConsole.h"
+#include "AntiAliasing.h"
 
 using namespace plugin;
 
@@ -12,6 +13,8 @@ void InitializeMemoryUpgrader();
 void InitializeStadiumDornaConfig();
 void InitializeJumbotronRuntime();
 void InitializeCustomPaths();
+void InitializeAntiAliasing();
+void InitializeDebugLogging();
 
 void NBAResolution0508() {
     switch (FM::GetEntryPoint()) {
@@ -39,8 +42,13 @@ public:
     NBALiveLauncher() {
         // Start diagnostics before the other launcher features.
         InitializeDebugConsole();
+		InitializeDebugLogging();
 		InitializeMemoryUpgrader();
         InitializeCustomPaths();
+
+        // Install the Live 06 D3D9 MSAA hook before the game creates its
+        // rendering device. Disabled unless [DISPLAY] ANTI_ALIASING=1.
+        InitializeAntiAliasing();
 
         // Keep initialization order explicit.
         NBAResolution0508();
@@ -49,6 +57,6 @@ public:
         InitializeStartupTeams();
         InitializeStadiumDornaConfig();
 		InitializeJumbotronRuntime();
-
+        // InitializeAntiAliasing();
     }
 } g_nbaLiveLauncher;

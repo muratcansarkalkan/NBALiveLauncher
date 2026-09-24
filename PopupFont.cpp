@@ -369,9 +369,11 @@ bool BuildAtlas(IDirect3DDevice9* device, const char* themeName,
 }
 
 void DrawGlyph(IDirect3DDevice9* device, const Glyph& glyph,
-               float x, float y, float scale, D3DCOLOR color)
+               float x, float y, float scale, D3DCOLOR color,
+               float horizontalScale = 1.0f)
 {
-    const float width = glyph.width * scale;
+    if (horizontalScale <= 0.0f) return;
+    const float width = glyph.width * scale * horizontalScale;
     const float height = glyph.height * scale;
     const FontVertex vertices[4] = {
         { x,         y,          0.0f, 1.0f, color, glyph.u0, glyph.v0 },
@@ -472,11 +474,13 @@ float Measure(const char* text, float height)
 }
 
 void DrawLeft(IDirect3DDevice9* device, const char* text,
-              float x, float y, float height, D3DCOLOR color)
+              float x, float y, float height, D3DCOLOR color,
+              float horizontalScale)
 {
     if (!device || !text || !g_activeAtlas || !g_atlas ||
         g_sourceHeight <= 0.0f) return;
     const float scale = height / g_sourceHeight;
+    if (horizontalScale <= 0.0f) return;
     device->SetTexture(0, g_atlas);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
     device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
@@ -489,26 +493,30 @@ void DrawLeft(IDirect3DDevice9* device, const char* text,
     for (const unsigned char* p =
              reinterpret_cast<const unsigned char*>(text); *p; ++p) {
         if (*p < FIRST_CHARACTER || *p > LAST_CHARACTER) continue;
-        if (!first) x += g_spacing * scale;
+        if (!first) x += g_spacing * scale * horizontalScale;
         const Glyph& glyph = g_glyphs[*p - FIRST_CHARACTER];
-        DrawGlyph(device, glyph, x, y, scale, color);
-        x += glyph.advance * scale;
+        DrawGlyph(device, glyph, x, y, scale, color, horizontalScale);
+        x += glyph.advance * scale * horizontalScale;
         first = false;
     }
 }
 
 void DrawCentered(IDirect3DDevice9* device, const char* text,
-                  float centerX, float y, float height, D3DCOLOR color)
+                  float centerX, float y, float height, D3DCOLOR color,
+                  float horizontalScale)
 {
-    DrawLeft(device, text, centerX - Measure(text, height) * 0.5f,
-        y, height, color);
+    DrawLeft(device, text,
+        centerX - Measure(text, height) * horizontalScale * 0.5f,
+        y, height, color, horizontalScale);
 }
 
 void DrawRight(IDirect3DDevice9* device, const char* text,
-               float right, float y, float height, D3DCOLOR color)
+               float right, float y, float height, D3DCOLOR color,
+               float horizontalScale)
 {
-    DrawLeft(device, text, right - Measure(text, height),
-        y, height, color);
+    DrawLeft(device, text,
+        right - Measure(text, height) * horizontalScale,
+        y, height, color, horizontalScale);
 }
 
 void Shutdown()

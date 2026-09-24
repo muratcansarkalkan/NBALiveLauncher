@@ -232,6 +232,80 @@ namespace live08 {
         return 0;
     }
 
+    static float gRealFontRasterScale08 = 1.0f;
+    static DWORD gRealFontBoundsReturn08 = 0x008CCA81;
+
+    __declspec(naked) void RealFontLogicalAptBounds08()
+    {
+        __asm
+        {
+            fild dword ptr[esp + 0x1C]
+            fdiv dword ptr[gRealFontRasterScale08]
+                fadd dword ptr[edi + 4]
+                    fstp dword ptr[edi + 0x0C]
+
+                    fild dword ptr[esp + 0x34]
+                    fld st(0)
+                    fdiv dword ptr[gRealFontRasterScale08]
+                    fadd dword ptr[edi + 8]
+                        fstp dword ptr[edi + 0x10]
+
+                        jmp dword ptr[gRealFontBoundsReturn08]
+        }
+    }
+
+    void InstallHighResolutionAptFonts08()
+    {
+        gRealFontRasterScale08 =
+            (RES_Y > 0)
+            ? static_cast<float>(RES_Y) / 480.0f
+            : 1.0f;
+
+        if (gRealFontRasterScale08 <= 0.0f)
+            gRealFontRasterScale08 = 1.0f;
+
+        const float fontTextureScale =
+            1.0f / gRealFontRasterScale08;
+
+
+        // RealFont scaling
+        patch::SetUInt(0xD5CC84, 0);
+        patch::SetFloat(0xD5CC7C, gRealFontRasterScale08);
+        patch::SetFloat(0xD5CC80, gRealFontRasterScale08);
+
+
+        // Keep generated quad at logical size
+        patch::Nop(0x8CCCA7, 4);
+        patch::Nop(0x8CCCC4, 4);
+
+
+        // TextureScaleApt
+        patch::SetFloat(0x8CD26F, fontTextureScale);
+        patch::SetFloat(0x8CD276, fontTextureScale);
+
+
+        // Logical APT bounds
+        patch::RedirectJump(
+            0x8CCA6B,
+            RealFontLogicalAptBounds08
+        );
+
+        patch::Nop(
+            0x8CCA70,
+            0x11
+        );
+
+        // FFN isolation:
+        // 8CC1D2: mov eax, [D5CC7C]
+        patch::SetUChar(0x8CC1D2, 0xB8);
+        patch::SetUInt(0x8CC1D3, 0x3F800000);
+
+        // 8CC1EF: mov edx, [D5CC80]
+        patch::SetUChar(0x8CC1EF, 0xBA);
+        patch::SetUInt(0x8CC1F0, 0x3F800000);
+        patch::Nop(0x8CC1F4, 1);
+    }
+
     float loadYPos = ((400.0f / 480.0f) * RES_Y);
     float loadXPos(float xPos) {
         return ((xPos / 640.0f) * (RES_Y * 1.33333f)) + ((RES_X - (RES_Y * 1.33333f)) / 2);
@@ -253,6 +327,7 @@ void Install_LIVE08() {
     // resolutions
     patch::RedirectJump(0x43B341, SetPerspectiveProjection08);
     patch::RedirectJump(0x69F780, SetTestInConicalFrustum08);
+    InstallHighResolutionAptFonts08();
     for (const auto& resolution : ids) {
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 8, resolution.height);

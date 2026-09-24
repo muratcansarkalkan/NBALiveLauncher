@@ -358,8 +358,10 @@ void ParseElements(const std::string& json, Config* c)
         const std::string alignment = StringValue(object, "alignment", "center");
         e.alignment = alignment == "left" ? TextAlignment::Left :
             alignment == "right" ? TextAlignment::Right : TextAlignment::Center;
-        e.overflow = StringValue(object, "overflow", "overflow") == "fit" ?
-            TextOverflow::Fit : TextOverflow::Overflow;
+        const std::string overflow = StringValue(object, "overflow", "overflow");
+        e.overflow = overflow == "fit" ? TextOverflow::Fit :
+            overflow == "fitWidth" ? TextOverflow::FitWidth :
+            TextOverflow::Overflow;
         const std::string textTransform = StringValue(object,
             "textTransform", "none");
         e.textTransform = textTransform == "uppercase" ? TextTransform::Uppercase :

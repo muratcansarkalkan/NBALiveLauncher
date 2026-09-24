@@ -8,13 +8,93 @@
 
 namespace
 {
+    bool gDebugLoggingEnabled = false;
+
+    void InitializeDebugLogging()
+    {
+        char exePath[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        if (!length || length >= MAX_PATH)
+            return;
+
+        char* slash = std::strrchr(exePath, '\\');
+        if (!slash)
+            return;
+
+        *(slash + 1) = '\0';
+
+        char iniPath[MAX_PATH] = {};
+        std::snprintf(iniPath, sizeof(iniPath), "%smain.ini", exePath);
+
+        gDebugLoggingEnabled =
+            GetPrivateProfileIntA("DEBUG", "CONSOLE", 0, iniPath) != 0;
+
+        if (!gDebugLoggingEnabled)
+            return;
+
+        char logsPath[MAX_PATH] = {};
+        std::snprintf(logsPath, sizeof(logsPath), "%slogs", exePath);
+        CreateDirectoryA(logsPath, nullptr);
+    }
+
+    bool BuildDebugLogPath(
+        char* outPath,
+        size_t outSize,
+        const char* fileName)
+    {
+        if (!outPath || !outSize || !fileName || !gDebugLoggingEnabled)
+        {
+            if (outPath && outSize)
+                outPath[0] = '\0';
+            return false;
+        }
+
+        char exePath[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        if (!length || length >= MAX_PATH)
+        {
+            outPath[0] = '\0';
+            return false;
+        }
+
+        char* slash = std::strrchr(exePath, '\\');
+        if (!slash)
+        {
+            outPath[0] = '\0';
+            return false;
+        }
+
+        *(slash + 1) = '\0';
+
+        const int written =
+            std::snprintf(outPath, outSize, "%slogs\\%s", exePath, fileName);
+
+        if (written < 0 || static_cast<size_t>(written) >= outSize)
+        {
+            outPath[0] = '\0';
+            return false;
+        }
+
+        return true;
+    }
+
     void MemoryLog(const char* text)
     {
-        FILE* f = nullptr;
-        if (fopen_s(&f, "MemoryUpgrader.log", "a") == 0 && f)
+        if (!gDebugLoggingEnabled || !text)
+            return;
+
+        char logPath[MAX_PATH] = {};
+        if (BuildDebugLogPath(
+                logPath,
+                sizeof(logPath),
+                "MemoryUpgrader.log"))
         {
-            fputs(text, f);
-            fclose(f);
+            FILE* f = nullptr;
+            if (fopen_s(&f, logPath, "a") == 0 && f)
+            {
+                fputs(text, f);
+                fclose(f);
+            }
         }
 
         OutputDebugStringA(text);
@@ -195,7 +275,7 @@ namespace
             !Matches(kReadLastSub, oReadLastSub, sizeof(oReadLastSub)) ||
             !Matches(kReadLast,    oReadLast,    sizeof(oReadLast)))
         {
-            OutputDebugStringA(
+            MemoryLog(
                 "[MemoryUpgrader] NBA Live 2005 verification failed.\n");
 
             return false;
@@ -652,6 +732,8 @@ namespace
 
 void InitializeMemoryUpgrader()
 {
+    InitializeDebugLogging();
+
     const std::uintptr_t ep = FM::GetEntryPoint();
 
     if (ep == 0xCD8005)

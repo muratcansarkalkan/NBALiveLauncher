@@ -72,6 +72,9 @@
     <ClCompile Include="CustomPaths.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AntiAliasing.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Resolutions.h">
@@ -106,6 +109,9 @@
     </ClInclude>
     <ClInclude Include="DebugConsole.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AntiAliasing.h">
+      <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

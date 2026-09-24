@@ -12,7 +12,7 @@ enum class PeriodFormat { Number, Ordinal, OrdinalQuarter, ShortQuarter, LongQua
 enum class IndicatorMode { None, Number, Text, Dots, Bars, Images };
 enum class ElementType { Rectangle, Image, Text, Indicator };
 enum class TextAlignment { Left, Center, Right };
-enum class TextOverflow { Overflow, Fit };
+enum class TextOverflow { Overflow, Fit, FitWidth };
 enum class TextTransform { None, Uppercase, Lowercase, Capitalize, SmallCaps };
 enum class FillType { Solid, LinearGradient };
 enum class ImageFit { Contain, Stretch };

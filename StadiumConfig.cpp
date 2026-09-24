@@ -18,6 +18,76 @@ using namespace plugin;
 
 namespace
 {
+    bool gDebugLoggingEnabled = false;
+
+    void InitializeDebugLogging()
+    {
+        char exePath[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        if (!length || length >= MAX_PATH)
+            return;
+
+        char* slash = std::strrchr(exePath, '\\');
+        if (!slash)
+            return;
+
+        *(slash + 1) = '\0';
+
+        char iniPath[MAX_PATH] = {};
+        std::snprintf(iniPath, sizeof(iniPath), "%smain.ini", exePath);
+
+        gDebugLoggingEnabled =
+            GetPrivateProfileIntA("DEBUG", "CONSOLE", 0, iniPath) != 0;
+
+        if (!gDebugLoggingEnabled)
+            return;
+
+        char logsPath[MAX_PATH] = {};
+        std::snprintf(logsPath, sizeof(logsPath), "%slogs", exePath);
+        CreateDirectoryA(logsPath, nullptr);
+    }
+
+    bool BuildDebugLogPath(
+        char* outPath,
+        size_t outSize,
+        const char* fileName)
+    {
+        if (!outPath || !outSize || !fileName || !gDebugLoggingEnabled)
+        {
+            if (outPath && outSize)
+                outPath[0] = '\0';
+            return false;
+        }
+
+        char exePath[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        if (!length || length >= MAX_PATH)
+        {
+            outPath[0] = '\0';
+            return false;
+        }
+
+        char* slash = std::strrchr(exePath, '\\');
+        if (!slash)
+        {
+            outPath[0] = '\0';
+            return false;
+        }
+
+        *(slash + 1) = '\0';
+
+        const int written =
+            std::snprintf(outPath, outSize, "%slogs\\%s", exePath, fileName);
+
+        if (written < 0 || static_cast<size_t>(written) >= outSize)
+        {
+            outPath[0] = '\0';
+            return false;
+        }
+
+        return true;
+    }
+
     // ============================================================
     // Shared stadium JSON
     //
@@ -124,6 +194,9 @@ namespace
 
     void Log(const char* format, ...)
     {
+        if (!gDebugLoggingEnabled)
+            return;
+
         char message[1024]{};
 
         va_list args;
@@ -139,12 +212,18 @@ namespace
 
         va_end(args);
 
-        const std::string logPath =
-            GetGameDirectory() + "\\StadiumConfig.log";
+        char logPath[MAX_PATH] = {};
+        if (!BuildDebugLogPath(
+                logPath,
+                sizeof(logPath),
+                "StadiumConfig.log"))
+        {
+            return;
+        }
 
         FILE* file = nullptr;
 
-        if (fopen_s(&file, logPath.c_str(), "a") == 0 && file)
+        if (fopen_s(&file, logPath, "a") == 0 && file)
         {
             SYSTEMTIME st{};
             GetLocalTime(&st);
@@ -1448,6 +1527,8 @@ namespace
 
 void InitializeStadiumDornaConfig()
 {
+    InitializeDebugLogging();
+
     switch (FM::GetEntryPoint())
     {
     case 0xCD8005:

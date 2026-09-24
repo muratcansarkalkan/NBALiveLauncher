@@ -34,11 +34,14 @@ const Style& GetStyle();
 
 float Measure(const char* text, float height);
 void DrawLeft(IDirect3DDevice9* device, const char* text,
-              float x, float y, float height, D3DCOLOR color);
+              float x, float y, float height, D3DCOLOR color,
+              float horizontalScale = 1.0f);
 void DrawCentered(IDirect3DDevice9* device, const char* text,
-                  float centerX, float y, float height, D3DCOLOR color);
+                  float centerX, float y, float height, D3DCOLOR color,
+                  float horizontalScale = 1.0f);
 void DrawRight(IDirect3DDevice9* device, const char* text,
-               float right, float y, float height, D3DCOLOR color);
+               float right, float y, float height, D3DCOLOR color,
+               float horizontalScale = 1.0f);
 
 void Shutdown();
 

@@ -196,7 +196,7 @@ namespace live06 {
                 originalTan * aspectScale;
 
             /*
-                sec(theta) = sqrt(1 + tan²(theta))
+                sec(theta) = sqrt(1 + tan^2(theta))
                 sin(theta) = tan(theta) / sec(theta)
             */
             const float coneInvCosine =
@@ -233,7 +233,7 @@ namespace live06 {
                 {
                     /*
                         Original constant = 0.5f:
-                        0.5² = 0.25
+                        0.5^2 = 0.25
                     */
                     return 1;
                 }
@@ -244,6 +244,127 @@ namespace live06 {
         }
 
         return 0;
+    }
+
+
+    // -------------------------------------------------------------------------
+    // High-resolution APT RealFont rendering
+    //
+    // NBA Live 06 renders APT RealFont text through FontFusion into temporary
+    // Text_N textures. The original game couples raster resolution, text-quad
+    // size, and texture scale around a 480-line reference resolution.
+    //
+    // For higher resolutions:
+    //   - rasterize the font at RES_Y / 480 resolution,
+    //   - keep the APT text quad at its original logical size,
+    //   - apply the reciprocal TextureScaleApt value,
+    //   - report logical text bounds to controls that auto-size from text.
+    //
+    // Relevant original globals:
+    //   0xC874C4 = size threshold (64)
+    //   0xC874BC = RealFont X raster scale (~0.7071 above threshold)
+    //   0xC874C0 = RealFont Y raster scale (~0.7071 above threshold)
+    //
+    // Relevant sub_7BDC00 instructions:
+    //   0x7BE237 = fmul [var_27C]  (quad width)
+    //   0x7BE254 = fmul [var_260]  (quad height)
+    //   0x7BE7FC = mov [ebx+2Ch], 1.0f
+    //   0x7BE803 = mov [ebx+30h], 1.0f
+    // -------------------------------------------------------------------------
+    static float gRealFontRasterScale06 = 1.0f;
+    static DWORD gRealFontBoundsReturn06 = 0x007BE011;
+
+    __declspec(naked) void RealFontLogicalAptBounds06()
+    {
+        __asm
+        {
+            // Original:
+            // fild [esp+290h+var_274]
+            //
+            // var_274 is at ESP + 0x1C here.
+            fild dword ptr[esp + 0x1C]
+
+            // Convert supersampled measurement back to logical APT units.
+            fdiv dword ptr[gRealFontRasterScale06]
+
+                // Original positioning.
+                fadd dword ptr[edi + 4]
+                    fstp dword ptr[edi + 0x0C]
+
+                    // Original:
+                    // fild [esp+290h+var_25C]
+                    //
+                    // var_25C is at ESP + 0x34 here.
+                    fild dword ptr[esp + 0x34]
+
+                    // Important: preserve one copy of the ORIGINAL height on the FPU
+                    // stack because stock code at 0x7BE01E subsequently scales it
+                    // for the physical raster.
+                    fld st(0)
+
+                    // Only the copy used for the APT bottom bound is logicalized.
+                    fdiv dword ptr[gRealFontRasterScale06]
+                    fadd dword ptr[edi + 8]
+                        fstp dword ptr[edi + 0x10]
+
+                        // ST(0) is now still the original measured height, exactly as
+                        // stock code expects when execution resumes at 0x7BE011.
+                        jmp dword ptr[gRealFontBoundsReturn06]
+        }
+    }
+    void InstallHighResolutionAptFonts06()
+    {
+        gRealFontRasterScale06 =
+            static_cast<float>(RES_Y) / 480.0f;
+
+        if (gRealFontRasterScale06 <= 0.0f)
+            gRealFontRasterScale06 = 1.0f;
+
+        const float fontTextureScale =
+            1.0f / gRealFontRasterScale06;
+
+        // Force all RealFonts through EA's scalable path.
+        patch::SetUInt(0xC874C4, 0);
+
+        // Higher-resolution FontFusion raster.
+        patch::SetFloat(0xC874BC, gRealFontRasterScale06);
+        patch::SetFloat(0xC874C0, gRealFontRasterScale06);
+
+        // Keep rendered text quad at logical size.
+        patch::Nop(0x7BE237, 4);
+        patch::Nop(0x7BE254, 4);
+
+        // Map the supersampled texture back onto the logical-size quad.
+        patch::SetFloat(
+            0x7BE7FF,
+            fontTextureScale
+        );
+
+        patch::SetFloat(
+            0x7BE806,
+            fontTextureScale
+        );
+
+        // 007BD762:
+        patch::SetUChar(0x7BD762, 0xB8);
+        patch::SetUInt(0x7BD763, 0x3F800000);
+
+        // 007BD77F:
+        patch::SetUChar(0x7BD77F, 0xBA);
+        patch::SetUInt(0x7BD780, 0x3F800000);
+        patch::Nop(0x7BD784, 1);
+        // Keep APT's reported text bounds at logical size so buttons,
+        // backgrounds and other auto-sized elements don't grow with
+        // the supersampled font texture.
+        //
+        // Replaces 0x7BDFFB through 0x7BE010 (0x16 bytes).
+        patch::RedirectJump(
+            0x7BDFFB,
+            RealFontLogicalAptBounds06
+        );
+
+        // RedirectJump consumes the first 5 bytes; clear the rest.
+        patch::Nop(0x7BE000, 0x11);
     }
 
     // Function that scales UI components properly for widescreen
@@ -386,6 +507,8 @@ void Install_LIVE06() {
     // Change aspect ratio in-game
     patch::RedirectJump(0x70221E, SetPerspectiveProjection06);
     patch::RedirectJump(0x73E3C0, SetTestInConicalFrustum06);
+    // High-resolution APT/RealFont rendering
+    InstallHighResolutionAptFonts06();
     // Sets resolutions
     for (const auto& resolution : ids) {
         patch::SetUInt(0xC4CF38 + 20 * resolution.id + 4, resolution.width);

@@ -48,6 +48,7 @@ struct Frame {
     const char* lineupsValues[14];
     const char* playerFirstName;
     const char* playerLastName;
+    const char* playerJerseyNumber;
     const char* statLabel1;
     const char* statValue1;
     const char* statLabel2;

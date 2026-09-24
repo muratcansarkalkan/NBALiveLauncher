@@ -224,6 +224,153 @@ namespace live07 {
         return 0;
     }
 
+    static float gRealFontRasterScale07 = 1.0f;
+    static DWORD gRealFontBoundsReturn07 = 0x0089DA41;
+
+    __declspec(naked) void RealFontLogicalAptBounds07()
+    {
+        __asm
+        {
+            // Width returned by the supersampled text measurement.
+            fild dword ptr[esp + 0x1C]
+
+            // Convert only the APT-reported width back to logical units.
+            fdiv dword ptr[gRealFontRasterScale07]
+
+                fadd dword ptr[edi + 4]
+                    fstp dword ptr[edi + 0x0C]
+
+                    // Height returned by the supersampled text measurement.
+                    fild dword ptr[esp + 0x34]
+
+                    // Preserve the original physical height on the x87 stack.
+                    //
+                    // Stock code expects this value to remain in ST(0) when execution
+                    // resumes at 0x89DA41, because the following raster-sizing code
+                    // continues using it.
+                    fld st(0)
+
+                    // Logicalize only the copy used for the APT bounding rectangle.
+                    fdiv dword ptr[gRealFontRasterScale07]
+
+                    fadd dword ptr[edi + 8]
+                        fstp dword ptr[edi + 0x10]
+
+                        // ST(0) still contains the original unmodified physical height.
+                        jmp dword ptr[gRealFontBoundsReturn07]
+        }
+    }
+
+    void InstallHighResolutionAptFonts07()
+    {
+        gRealFontRasterScale07 =
+            (RES_Y > 0)
+            ? static_cast<float>(RES_Y) / 480.0f
+            : 1.0f;
+
+        if (gRealFontRasterScale07 <= 0.0f)
+            gRealFontRasterScale07 = 1.0f;
+
+        const float fontTextureScale =
+            1.0f / gRealFontRasterScale07;
+
+
+        // RealFont / TTF supersampling
+
+        // Stock:
+        // 0xCA0FF4 = large-font threshold
+        // 0xCA0FEC = X raster scale
+        // 0xCA0FF0 = Y raster scale
+        // Force all RealFont sizes through the scalable path.
+        patch::SetUInt(0xCA0FF4, 0);
+
+        // Render the temporary Text_* backing texture at native-resolution scale.
+        patch::SetFloat(
+            0xCA0FEC,
+            gRealFontRasterScale07
+        );
+
+        patch::SetFloat(
+            0xCA0FF0,
+            gRealFontRasterScale07
+        );
+
+        // ------------------------------------------------------------------------
+        // Preserve logical text-quad dimensions
+        // ------------------------------------------------------------------------
+        // These would otherwise enlarge the generated text geometry by the same
+        // factor used for the higher-resolution raster.
+        patch::Nop(0x89DC67, 4);
+        patch::Nop(0x89DC84, 4);
+
+        // ------------------------------------------------------------------------
+        // TextureScaleApt compensation
+        // ------------------------------------------------------------------------
+        // Stock:
+        // 0089E22C  C7 43 2C 00 00 80 3F
+        //           mov dword ptr [ebx+2Ch], 1.0f
+        // 0089E233  C7 43 30 00 00 80 3F
+        //           mov dword ptr [ebx+30h], 1.0f
+        // The actual immediate operands begin at 0x89E22F / 0x89E236.
+        patch::SetFloat(
+            0x89E22F,
+            fontTextureScale
+        );
+
+        patch::SetFloat(
+            0x89E236,
+            fontTextureScale
+        );
+
+
+        // ------------------------------------------------------------------------
+        // Restore logical APT text bounds
+        // ------------------------------------------------------------------------
+        // Replaces:
+        //     0x89DA2B .. 0x89DA40
+        // Total length = 0x16 bytes.
+        // RedirectJump consumes the first 5 bytes, so NOP the remaining 0x11.
+        patch::RedirectJump(
+            0x89DA2B,
+            RealFontLogicalAptBounds07
+        );
+
+        patch::Nop(
+            0x89DA30,
+            0x11
+        );
+        // ------------------------------------------------------------------------
+        // FFN / fixed-font isolation
+        // ------------------------------------------------------------------------
+        // sub_89D0D0 is the 07 equivalent of 06 sub_7BD6A0.
+        // It also reads CA0FEC/CA0FF0. Those globals are now > 1.0 for RealFont
+        // supersampling, but FFN fonts must NOT inherit that scale.
+        // Force the two FFN-local scale values to 1.0f.
+
+
+        // Original:
+        // 0089D192  A1 EC 0F CA 00
+        //           mov eax, dword_CA0FEC
+        // Replace:
+        // B8 00 00 80 3F
+        // mov eax, 3F800000h
+        patch::SetUChar(0x89D192, 0xB8);
+        patch::SetUInt(0x89D193, 0x3F800000);
+
+
+        // Original:
+        // 0089D1AF  8B 15 F0 0F CA 00
+        //           mov edx, dword_CA0FF0
+        // Replace:
+        // BA 00 00 80 3F
+        // 90
+        // mov edx, 3F800000h
+        // nop
+        patch::SetUChar(0x89D1AF, 0xBA);
+        patch::SetUInt(0x89D1B0, 0x3F800000);
+        patch::Nop(0x89D1B4, 1);
+    }
+
     DWORD METHOD FEAptInterface_Render(DWORD* t, DUMMY_ARG, char a1, int a2)
     {
         int v3;
@@ -368,6 +515,7 @@ void Install_LIVE07() {
     using namespace live07;
     patch::RedirectJump(0x438B11, SetPerspectiveProjection07);
     patch::RedirectJump(0x67BE80, SetTestInConicalFrustum07);
+    InstallHighResolutionAptFonts07();
     for (const auto& resolution : ids) {
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 8, resolution.height);
