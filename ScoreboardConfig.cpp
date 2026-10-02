@@ -40,6 +40,9 @@ char g_playerFoulTheme[64] = {};
 char g_statTheme[64] = {};
 char g_statSubtype[64] = {};
 int g_statValueCase = 0;
+char g_statLayoutName[64] = {};
+char g_statLayoutFamilyName[64] = {};
+char g_playerFoulLayoutName[64] = {};
 char g_lastError[512] = {};
 
 void SetDefaults(Config* c)
@@ -113,6 +116,44 @@ void SetDefaults(Config* c)
     c->exitToY = 0.0f;
     c->exitMilliseconds = 200;
     c->freezeWhilePaused = true;
+}
+
+const char* SharedStatLayoutKey(const char* subtypeKey)
+{
+    if (!subtypeKey || !*subtypeKey)
+        return nullptr;
+
+    if (std::strcmp(subtypeKey, "leaders_centers") == 0 ||
+        std::strcmp(subtypeKey, "leaders_point_guards") == 0 ||
+        std::strcmp(subtypeKey, "leaders_power_forwards") == 0 ||
+        std::strcmp(subtypeKey, "leaders_shooting_guards") == 0 ||
+        std::strcmp(subtypeKey, "leaders_small_forwards") == 0)
+        return "position_leaders";
+
+    if (std::strcmp(subtypeKey, "season_assists") == 0 ||
+        std::strcmp(subtypeKey, "season_blocks") == 0 ||
+        std::strcmp(subtypeKey, "season_rebounds") == 0 ||
+        std::strcmp(subtypeKey, "season_steals") == 0)
+        return "season_comparison";
+
+    if (std::strcmp(subtypeKey, "team_makes_quarter") == 0 ||
+        std::strcmp(subtypeKey, "team_misses_quarter") == 0 ||
+        std::strcmp(subtypeKey, "team_makes_game") == 0 ||
+        std::strcmp(subtypeKey, "team_misses_game") == 0)
+        return "team_streak";
+
+    return nullptr;
+}
+
+void CopyFileName(const std::string& path, char* output, size_t capacity)
+{
+    if (!output || capacity == 0) return;
+    output[0] = '\0';
+    const size_t slash = path.find_last_of("\\/");
+    const char* name = slash == std::string::npos ?
+        path.c_str() : path.c_str() + slash + 1;
+    std::strncpy(output, name, capacity - 1);
+    output[capacity - 1] = '\0';
 }
 
 std::string GameDirectory()
@@ -369,8 +410,8 @@ void ParseElements(const std::string& json, Config* c)
             textTransform == "capitalize" ? TextTransform::Capitalize :
             textTransform == "smallCaps" ? TextTransform::SmallCaps :
             TextTransform::None;
-        e.smallCapsScale = Number(object, "smallCapsScale", 0.75f);
-        if (e.smallCapsScale <= 0.0f) e.smallCapsScale = 0.75f;
+        e.smallCapsScale = Number(object, "smallCapsScale", 0.82f);
+        if (e.smallCapsScale <= 0.0f) e.smallCapsScale = 0.82f;
         if (e.smallCapsScale > 1.0f) e.smallCapsScale = 1.0f;
         e.fontHeight = Number(object, "fontHeight", 0.0f);
         e.textColor = Color(object, "textColor", D3DCOLOR_XRGB(255, 255, 255));
@@ -830,6 +871,7 @@ bool LoadPlayerFoul(const char* themeName)
             std::strncpy(g_playerFoulTheme, themeName,
                 sizeof(g_playerFoulTheme) - 1);
             g_playerFoulTheme[sizeof(g_playerFoulTheme) - 1] = '\0';
+            g_playerFoulLayoutName[0] = '\0';
             return false;
         }
     }
@@ -839,6 +881,9 @@ bool LoadPlayerFoul(const char* themeName)
     g_playerFoulAvailable = true;
     std::strncpy(g_playerFoulTheme, themeName,
         sizeof(g_playerFoulTheme) - 1);
+    g_playerFoulTheme[sizeof(g_playerFoulTheme) - 1] = '\0';
+    CopyFileName(path, g_playerFoulLayoutName,
+        sizeof(g_playerFoulLayoutName));
     g_lastError[0] = '\0';
     return true;
 }
@@ -848,6 +893,7 @@ bool ReloadPlayerFoul(const char* themeName)
     g_playerFoulLoaded = false;
     g_playerFoulAvailable = false;
     g_playerFoulTheme[0] = '\0';
+    g_playerFoulLayoutName[0] = '\0';
     return LoadPlayerFoul(themeName);
 }
 
@@ -870,13 +916,31 @@ bool LoadStat(const char* themeName, const char* subtypeKey,
 
     const std::string base = GameDirectory() + "\\assets\\popups\\" + themeName +
         "\\stats\\";
+    const char* sharedLayoutKey = SharedStatLayoutKey(subtypeKey);
+    g_statLayoutFamilyName[0] = '\0';
+    if (sharedLayoutKey) {
+        std::strncpy(g_statLayoutFamilyName, sharedLayoutKey,
+            sizeof(g_statLayoutFamilyName) - 1);
+        g_statLayoutFamilyName[sizeof(g_statLayoutFamilyName) - 1] = '\0';
+    }
+
+    // Resolution order:
+    //   1. exact semantic subtype (leaders_centers.json)
+    //   2. shared semantic family (position_leaders.json / season_comparison.json)
+    //   3. generic value-count family (team_3.json / player_2.json)
+    //   4. generic payload fallback (team.json / player.json)
     std::string path = base + subtypeKey + ".json";
     std::string json;
     if (!ReadFile(path.c_str(), &json)) {
+        if (sharedLayoutKey) {
+            path = base + sharedLayoutKey + ".json";
+            ReadFile(path.c_str(), &json);
+        }
+
         // Generic player and team layouts may provide different geometry for
         // one, two, or three populated value groups/columns.
         const int maximumCase = playerPayload ? 5 : 3;
-        if (valueCase >= 1 && valueCase <= maximumCase) {
+        if (json.empty() && valueCase >= 1 && valueCase <= maximumCase) {
             char caseName[32];
             std::snprintf(caseName, sizeof(caseName),
                 "%s_%d.json", playerPayload ? "player" : "team",
@@ -898,6 +962,7 @@ bool LoadStat(const char* themeName, const char* subtypeKey,
                 sizeof(g_statSubtype) - 1);
             g_statSubtype[sizeof(g_statSubtype) - 1] = '\0';
             g_statValueCase = valueCase;
+            g_statLayoutName[0] = '\0';
             return false;
         }
     }
@@ -911,6 +976,7 @@ bool LoadStat(const char* themeName, const char* subtypeKey,
     std::strncpy(g_statSubtype, subtypeKey, sizeof(g_statSubtype) - 1);
     g_statSubtype[sizeof(g_statSubtype) - 1] = '\0';
     g_statValueCase = valueCase;
+    CopyFileName(path, g_statLayoutName, sizeof(g_statLayoutName));
     g_lastError[0] = '\0';
     return true;
 }
@@ -923,9 +989,26 @@ bool ReloadStat(const char* themeName, const char* subtypeKey,
     g_statTheme[0] = '\0';
     g_statSubtype[0] = '\0';
     g_statValueCase = 0;
+    g_statLayoutName[0] = '\0';
+    g_statLayoutFamilyName[0] = '\0';
     if (!subtypeKey || !*subtypeKey)
         return true;
     return LoadStat(themeName, subtypeKey, playerPayload, valueCase);
+}
+
+const char* GetLoadedStatLayoutName()
+{
+    return g_statLayoutName;
+}
+
+const char* GetLoadedStatLayoutFamilyName()
+{
+    return g_statLayoutFamilyName;
+}
+
+const char* GetLoadedPlayerFoulLayoutName()
+{
+    return g_playerFoulLayoutName;
 }
 
 const char* GetLastError() { return g_lastError; }

@@ -172,6 +172,9 @@ bool LoadStat(const char* themeName, const char* subtypeKey,
     bool playerPayload, int valueCase = 0);
 bool ReloadStat(const char* themeName, const char* subtypeKey,
     bool playerPayload, int valueCase = 0);
+const char* GetLoadedStatLayoutName();
+const char* GetLoadedStatLayoutFamilyName();
+const char* GetLoadedPlayerFoulLayoutName();
 const char* GetLastError();
 
 } // namespace scoreboardconfig

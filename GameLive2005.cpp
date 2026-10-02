@@ -1,5 +1,6 @@
 #include "plugin-std.h"
 #include "Resolutions.h"
+#include "ResolutionMenuStrings.h"
 #include "AdjustWSUI.h"
 
 using namespace plugin;
@@ -11,6 +12,8 @@ const unsigned int INTRO = GetPrivateProfileIntW(L"BOOTUP", L"INTRO", 1, L".\\ma
 const float ASPECT_RATIO = static_cast<float>(RES_X) / static_cast<float>(RES_Y);
 
 namespace live2005 {
+
+    static ResolutionMenuStringPatcher gResolutionMenuStrings05;
 
     ResolutionID ids[] = {
     { 640,  480, 32, 0 }, // 640x480x16
@@ -178,7 +181,7 @@ namespace live2005 {
                 Recover sin(theta) and 1/cos(theta)
                 from the widened tangent.
 
-                    sec(theta) = sqrt(1 + tan²(theta))
+                    sec(theta) = sqrt(1 + tanï¿½(theta))
                     sin(theta) = tan(theta) / sec(theta)
             */
             const float coneInvCos =
@@ -233,142 +236,144 @@ namespace live2005 {
     }
 
 	static float gRealFontRasterScale05 = 1.0f;
+	static float gRealFontSecondaryScale05 = 1.0f;
+
 	static DWORD gRealFontBoundsReturn05 = 0x0079E2B1;
+    static DWORD gRealFontSecondaryBoundsReturn05 = 0x0079E45A;
+
+    __declspec(naked) void RealFontLogicalAptBounds05()
+    {
+        __asm
+        {
+            // Width returned by the high-resolution font measurement.
+            // Convert it back to logical APT units.
+            fild dword ptr[esp + 0x10]
+            fdiv dword ptr[gRealFontRasterScale05]
+                fadd dword ptr[edi + 4]
+                    fstp dword ptr[edi + 0x0C]
 
 
-	__declspec(naked) void RealFontLogicalAptBounds05()
-	{
-		__asm
-		{
-			// Width returned by the high-resolution font measurement.
-			// Convert it back to logical APT units.
-			fild dword ptr [esp + 0x10]
-			fdiv dword ptr [gRealFontRasterScale05]
-			fadd dword ptr [edi + 4]
-			fstp dword ptr [edi + 0x0C]
+                    // Height.
+                    //
+                    // Preserve the physical height underneath the logical copy,
+                    // because stock code after 79E2B1 consumes it.
+                    fild dword ptr[esp + 0x2C]
+                    fld st(0)
+
+                    fdiv dword ptr[gRealFontRasterScale05]
+                    fadd dword ptr[edi + 8]
+                        fstp dword ptr[edi + 0x10]
+
+                        jmp dword ptr[gRealFontBoundsReturn05]
+        }
+    }
+
+    __declspec(naked) void RealFontSecondaryLogicalBounds05()
+    {
+        __asm
+        {
+            // Physical raster width -> logical APT width.
+            fld dword ptr[ebx + 0x18]
+            fdiv dword ptr[gRealFontRasterScale05]
+                fstp dword ptr[edi + 0x40]
+
+                    // Physical raster height -> logical APT height.
+                    fld dword ptr[ebx + 0x1C]
+                    fdiv dword ptr[gRealFontRasterScale05]
+                    fstp dword ptr[edi + 0x44]
+
+                        // Original stack cleanup.
+                        add esp, 4
+
+                        mov dword ptr[edi + 0x20], 0x447A0000
+
+                        jmp dword ptr[gRealFontSecondaryBoundsReturn05]
+        }
+    }
+
+    void InstallHighResolutionAptFonts05()
+    {
+        gRealFontRasterScale05 =
+            (RES_Y > 0)
+            ? static_cast<float>(RES_Y) / 480.0f
+            : 1.0f;
+
+        if (gRealFontRasterScale05 <= 0.0f)
+            gRealFontRasterScale05 = 1.0f;
+
+        const float fontTextureScale =
+            1.0f / gRealFontRasterScale05;
 
 
-			// Height.
-			//
-			// Preserve the physical height underneath the logical copy,
-			// because stock code after 79E2B1 consumes it.
-			fild dword ptr [esp + 0x2C]
-			fld st(0)
+        // Enable scalable RealFont rasterization.
+        patch::SetUInt(0xC14A1C, 0);
 
-			fdiv dword ptr [gRealFontRasterScale05]
-			fadd dword ptr [edi + 8]
-			fstp dword ptr [edi + 0x10]
+        patch::SetFloat(
+            0xC14A10,
+            gRealFontRasterScale05
+        );
 
-			jmp dword ptr [gRealFontBoundsReturn05]
-		}
-	}
-
-	static DWORD gRealFontSecondaryBoundsReturn05 = 0x0079E45A;
-
-	__declspec(naked) void RealFontSecondaryLogicalBounds05()
-	{
-		__asm
-		{
-			// Physical raster width -> logical APT width.
-			fld dword ptr [ebx + 0x18]
-			fdiv dword ptr [gRealFontRasterScale05]
-			fstp dword ptr [edi + 0x40]
-
-			// Physical raster height -> logical APT height.
-			fld dword ptr [ebx + 0x1C]
-			fdiv dword ptr [gRealFontRasterScale05]
-			fstp dword ptr [edi + 0x44]
-
-			// Original stack cleanup.
-			add esp, 4
-
-			mov dword ptr [edi + 0x20], 0x447A0000
-
-			jmp dword ptr [gRealFontSecondaryBoundsReturn05]
-		}
-	}
-	void InstallHighResolutionAptFonts05()
-	{
-		gRealFontRasterScale05 =
-			(RES_Y > 0)
-			? static_cast<float>(RES_Y) / 480.0f
-			: 1.0f;
-
-		if (gRealFontRasterScale05 <= 0.0f)
-			gRealFontRasterScale05 = 1.0f;
-
-		const float fontTextureScale =
-			1.0f / gRealFontRasterScale05;
+        patch::SetFloat(
+            0xC14A14,
+            gRealFontRasterScale05
+        );
 
 
-		// Enable scalable RealFont rasterization.
-		patch::SetUInt(0xC14A1C, 0);
+        // Convert measured bounds back to logical APT coordinates.
+        patch::RedirectJump(
+            0x79E29B,
+            RealFontLogicalAptBounds05
+        );
 
-		patch::SetFloat(
-			0xC14A10,
-			gRealFontRasterScale05
-		);
-
-		patch::SetFloat(
-			0xC14A14,
-			gRealFontRasterScale05
-		);
+        patch::Nop(
+            0x79E2A0,
+            0x11
+        );
 
 
-		// Convert measured bounds back to logical APT coordinates.
-		patch::RedirectJump(
-			0x79E29B,
-			RealFontLogicalAptBounds05
-		);
-
-		patch::Nop(
-			0x79E2A0,
-			0x11
-		);
-
-		patch::RedirectJump(
-			0x79E444,
-			RealFontSecondaryLogicalBounds05
-		);
-
-		patch::Nop(
-			0x79E449,
-			0x11
-		);
-		// IMPORTANT 2005 difference:
-		//
-		// var_258 / var_254 have already been measured using
-		// the supersampled font. Do not multiply them by the
-		// scale again.
-		patch::Nop(0x79E2B5, 4);
-		patch::Nop(0x79E2BE, 4);
+        // IMPORTANT 2005 difference:
+        //
+        // var_258 / var_254 have already been measured using
+        // the supersampled font. Do not multiply them by the
+        // scale again.
+        patch::Nop(0x79E2B5, 4);
+        patch::Nop(0x79E2BE, 4);
 
 
-		// Visible quad stays at logical size.
-		patch::Nop(0x79E483, 4);
-		patch::Nop(0x79E4A0, 4);
+        // Visible quad stays at logical size.
+        patch::Nop(0x79E483, 4);
+        patch::Nop(0x79E4A0, 4);
 
 
-		// Sample the larger generated texture correctly.
-		patch::SetFloat(
-			0x79EA55,
-			fontTextureScale
-		);
+        // Sample the larger generated texture correctly.
+        patch::SetFloat(
+            0x79EA55,
+            fontTextureScale
+        );
 
-		patch::SetFloat(
-			0x79EA5C,
-			fontTextureScale
-		);
+        patch::SetFloat(
+            0x79EA5C,
+            fontTextureScale
+        );
 
+        patch::RedirectJump(
+            0x79E444,
+            RealFontSecondaryLogicalBounds05
+        );
 
-		// FFN isolation.
-		patch::SetUChar(0x79DA02, 0xB8);
-		patch::SetUInt(0x79DA03, 0x3F800000);
+        patch::Nop(
+            0x79E449,
+            0x11
+        );
+        // FFN isolation.
+        patch::SetUChar(0x79DA02, 0xB8);
+        patch::SetUInt(0x79DA03, 0x3F800000);
 
-		patch::SetUChar(0x79DA1F, 0xBA);
-		patch::SetUInt(0x79DA20, 0x3F800000);
-		patch::Nop(0x79DA24, 1);
-	}
+        patch::SetUChar(0x79DA1F, 0xBA);
+        patch::SetUInt(0x79DA20, 0x3F800000);
+        patch::Nop(0x79DA24, 1);
+    }
+
     // Changes resolution after exiting game but remains as sample ASM injection
     void __declspec(naked) OnSetArrangeWindow3() {
         __asm {
@@ -544,6 +549,13 @@ void Install_LIVE2005() {
     patch::SetUInt(0x5F85DA + 1, RES_X);
     patch::SetUInt(0x5F2BA6 + 1, RES_Y);
     patch::SetUInt(0x5F2BAB + 1, RES_X);
+    // Capture the stock labels before overwriting the original mode table.
+    gResolutionMenuStrings05.Initialize(
+        0xBDF758,
+        ids,
+        sizeof(ids) / sizeof(ids[0])
+    );
+
     // modify resolution addresses
     for (const auto& resolution : ids) {
         patch::SetUInt(0xBDF758 + 20 * resolution.id + 4, resolution.width);

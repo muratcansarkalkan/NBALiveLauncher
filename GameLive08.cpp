@@ -1,5 +1,6 @@
 #include "plugin-std.h"
 #include "Resolutions.h"
+#include "ResolutionMenuStrings.h"
 
 using namespace plugin;
 
@@ -12,24 +13,123 @@ static float gAspectScale08 = 1.0f;
 
 namespace live08 {
 
+    static ResolutionMenuStringPatcher gResolutionMenuStrings08;
+
+    // Logical menu order. NBA Live 08, like 07, uses physical
+    // resolution-table slot 1 as the startup/current mode.
+    //
+    // PrepareResolutionSlots08() keeps that native invariant by swapping the
+    // configured RES_X/RES_Y mode into physical slot 1, then builds a separate
+    // logical -> physical index map for the Display Settings menu.
     ResolutionID ids[] = {
-        { 640,  480, 32, 0 }, // 640x480x16
-        { RES_X,  RES_Y, 32, 1 }, // 640x480x32
-        { 1024,  768, 32, 2 }, // 800x600x16
-        { 1280,  720, 32, 3 }, // 800x600x32
+        { 640, 480, 32, 0 },
+        { 800, 600, 32, 1 },
+        { 1024, 768, 32, 2 },
+        { 1280, 720, 32, 3 },
         { 1280, 1024, 32, 4 },
         { 1366, 768, 32, 5 },
-        { 1440,  900, 32, 6 },
-        { 1600,  900, 32, 7 },
+        { 1440, 900, 32, 6 },
+        { 1600, 900, 32, 7 },
         { 1600, 1200, 32, 8 },
         { 1680, 1050, 32, 9 },
         { 1920, 1080, 32, 10 },
         { 2560, 1440, 32, 11 },
-        { 3440, 1440, 32, 12 }, // 640x480x16
-        { 3840, 1080, 32, 13 }, // 640x480x32
-        { 3840, 1200, 32, 14 }, // 800x600x16
-        { 3840, 1600, 32, 15 }, // 800x600x32
+        { 3440, 1440, 32, 12 },
+        { 3840, 1080, 32, 13 },
+        { 3840, 1200, 32, 14 },
+        { 3840, 1600, 32, 15 },
     };
+
+    static unsigned int gResolutionMenuOrder08[16] = {
+        0, 1, 2, 3, 4, 5, 6, 7,
+        8, 9, 10, 11, 12, 13, 14, 15
+    };
+
+    static void PrepareResolutionSlots08()
+    {
+        int configuredLogicalIndex = -1;
+
+        for (int i = 0; i < 16; ++i)
+        {
+            if (ids[i].width == RES_X &&
+                ids[i].height == RES_Y)
+            {
+                configuredLogicalIndex = i;
+                break;
+            }
+        }
+
+        // Preserve the game's native startup/current-mode slot.
+        // Swap only width/height/depth; id remains the physical table slot.
+        if (configuredLogicalIndex >= 0 &&
+            configuredLogicalIndex != 1)
+        {
+            const unsigned int width = ids[1].width;
+            const unsigned int height = ids[1].height;
+            const unsigned int depth = ids[1].depth;
+
+            ids[1].width = ids[configuredLogicalIndex].width;
+            ids[1].height = ids[configuredLogicalIndex].height;
+            ids[1].depth = ids[configuredLogicalIndex].depth;
+
+            ids[configuredLogicalIndex].width = width;
+            ids[configuredLogicalIndex].height = height;
+            ids[configuredLogicalIndex].depth = depth;
+        }
+
+        static const unsigned int logicalWidth[16] = {
+            640, 800, 1024, 1280,
+            1280, 1366, 1440, 1600,
+            1600, 1680, 1920, 2560,
+            3440, 3840, 3840, 3840
+        };
+
+        static const unsigned int logicalHeight[16] = {
+            480, 600, 768, 720,
+            1024, 768, 900, 900,
+            1200, 1050, 1080, 1440,
+            1440, 1080, 1200, 1600
+        };
+
+        for (int logical = 0; logical < 16; ++logical)
+        {
+            gResolutionMenuOrder08[logical] =
+                static_cast<unsigned int>(logical);
+
+            for (int physical = 0; physical < 16; ++physical)
+            {
+                if (ids[physical].width == logicalWidth[logical] &&
+                    ids[physical].height == logicalHeight[logical])
+                {
+                    gResolutionMenuOrder08[logical] =
+                        static_cast<unsigned int>(physical);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 0055B7C0 builds the supported-resolution index vector.
+    //
+    // Stock append:
+    //   0055B840  mov [edi], esi
+    //   0055B842  add edi, 4
+    //
+    // Replace only the value appended to the vector. ESI remains the native
+    // physical-table loop counter and EBP continues walking the 20-byte mode
+    // records unchanged.
+    static DWORD gResolutionMenuAppendReturn08 = 0x0055B845;
+
+    __declspec(naked) static void AppendResolutionInLogicalOrder08()
+    {
+        __asm
+        {
+            mov edx, dword ptr [gResolutionMenuOrder08 + esi * 4]
+            mov [edi], edx
+            add edi, 4
+            jmp dword ptr [gResolutionMenuAppendReturn08]
+        }
+    }
 
     // NBA Live 08
     DWORD* METHOD SetPerspectiveProjection08(
@@ -167,7 +267,7 @@ namespace live08 {
             /*
                 08 previously used:
 
-                    coneRadius² > radialDistance² * 0.3
+                    coneRadiusï¿½ > radialDistanceï¿½ * 0.3
 
                 Equivalent cone expansion:
 
@@ -328,6 +428,21 @@ void Install_LIVE08() {
     patch::RedirectJump(0x43B341, SetPerspectiveProjection08);
     patch::RedirectJump(0x69F780, SetTestInConicalFrustum08);
     InstallHighResolutionAptFonts08();
+
+    // Keep physical slot 1 as the configured startup/current mode, but make
+    // the Display Settings menu enumerate modes in logical resolution order.
+    PrepareResolutionSlots08();
+
+    // 55B840: mov [edi], esi / add edi, 4
+    patch::RedirectJump(0x55B840, AppendResolutionInLogicalOrder08);
+
+    // Capture the stock resolution labels before overwriting the mode table.
+    gResolutionMenuStrings08.Initialize(
+        0xD21F60,
+        ids,
+        sizeof(ids) / sizeof(ids[0])
+    );
+
     for (const auto& resolution : ids) {
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 8, resolution.height);

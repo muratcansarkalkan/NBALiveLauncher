@@ -328,17 +328,26 @@ float MeasureSmallCaps(const char* text, float height, float smallScale)
     return width;
 }
 
+// Approximate the visual baseline inside the popup-font atlas. Reduced
+// uppercase glyphs used for small caps must share this baseline with adjacent
+// full-height glyphs instead of being aligned to the bottom of their texture
+// boxes.
+constexpr float kSmallCapsBaselineRatio = 0.82f;
+
 void DrawSmallCapsLeft(IDirect3DDevice9* device, const char* text,
                        float x, float y, float height, float smallScale,
                        D3DCOLOR color, float horizontalScale = 1.0f)
 {
+    const float fullBaseline = y + height * kSmallCapsBaselineRatio;
     for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
          p && *p; ++p) {
         const bool isSmallCap = std::islower(*p) != 0;
         const float glyphHeight = isSmallCap ? height * smallScale : height;
         char glyph[2] = { static_cast<char>(isSmallCap ?
             std::toupper(*p) : *p), '\0' };
-        popupfont::DrawLeft(device, glyph, x, y + height - glyphHeight,
+        const float glyphY = fullBaseline -
+            glyphHeight * kSmallCapsBaselineRatio;
+        popupfont::DrawLeft(device, glyph, x, glyphY,
             glyphHeight, color, horizontalScale);
         x += popupfont::Measure(glyph, glyphHeight) * horizontalScale;
     }
@@ -351,7 +360,7 @@ void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
                        scoreboardconfig::TextOverflow::Overflow,
                    scoreboardconfig::TextTransform transform =
                        scoreboardconfig::TextTransform::None,
-                   float smallCapsScale = 0.75f)
+                   float smallCapsScale = 0.82f)
 {
     char transformed[128] = {};
     TransformText(sourceText, transform, transformed, sizeof(transformed));
@@ -408,6 +417,28 @@ void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
             y, actualHeight, color, horizontalScale);
 }
 
+struct StatTeamPair {
+    const popup::TeamVisual* left;
+    const popup::TeamVisual* right;
+};
+
+StatTeamPair ResolveStatTeams(const scoreboard::Frame& frame)
+{
+    StatTeamPair result = { nullptr, nullptr };
+    const int count = frame.statValueCount < 15 ? frame.statValueCount : 15;
+    for (int i = 0; i < count; ++i) {
+        const char* value = frame.statValues[i];
+        if (!value || !*value) continue;
+        const popup::TeamVisual* team = popup::FindTeamByName(value);
+        if (!team) continue;
+        if (!result.left) { result.left = team; continue; }
+        if (team->databaseTeamID == result.left->databaseTeamID) continue;
+        result.right = team;
+        break;
+    }
+    return result;
+}
+
 D3DCOLOR WithOpacity(D3DCOLOR color, int opacity)
 {
     if (opacity < 0) opacity = 0;
@@ -437,6 +468,20 @@ D3DCOLOR ResolveLayerColor(const char* binding, D3DCOLOR fallback,
         color = frame.statPrimaryColor;
     else if (binding && std::strcmp(binding, "stat.secondaryColor") == 0)
         color = frame.statSecondaryColor;
+    else if (binding && std::strcmp(binding, "player1.teamColor") == 0)
+        color = frame.player1TeamColor;
+    else if (binding && std::strcmp(binding, "player2.teamColor") == 0)
+        color = frame.player2TeamColor;
+    else if (binding && (std::strcmp(binding, "stat.leftTeamPrimaryColor") == 0 ||
+                         std::strcmp(binding, "stat.leftTeamSecondaryColor") == 0 ||
+                         std::strcmp(binding, "stat.rightTeamPrimaryColor") == 0 ||
+                         std::strcmp(binding, "stat.rightTeamSecondaryColor") == 0)) {
+        const StatTeamPair teams = ResolveStatTeams(frame);
+        const bool left = std::strncmp(binding, "stat.leftTeam", 13) == 0;
+        const bool secondary = std::strstr(binding, "SecondaryColor") != nullptr;
+        const popup::TeamVisual* team = left ? teams.left : teams.right;
+        if (team) color = secondary ? team->secondaryColor : team->primaryColor;
+    }
     else if (binding && std::strcmp(binding, "starting5.teamColor") == 0)
         color = frame.starting5TeamColor;
     else if (binding && std::strcmp(binding, "starting5.primaryColor") == 0)
@@ -481,6 +526,11 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
         output[0] = '\0';
         *color = style.scoreColor;
         *defaultHeight = style.teamNameHeight;
+
+        // Match the editor behavior: the first successful template binding
+        // determines the line's default height/color unless the layer has an
+        // explicit fontHeight. Previously the last binding won.
+        bool templateStyleResolved = false;
         size_t written = 0;
         const char* source = element.textTemplate;
         for (size_t i = 0; source[i] && written + 1 < capacity;) {
@@ -517,8 +567,11 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
                     valueLength : available;
                 std::memcpy(output + written, value, copyLength);
                 written += copyLength;
-                *defaultHeight = tokenHeight;
-                *color = tokenColor;
+                if (!templateStyleResolved) {
+                    *defaultHeight = tokenHeight;
+                    *color = tokenColor;
+                    templateStyleResolved = true;
+                }
             }
             i = static_cast<size_t>(close - source) + 1;
         }
@@ -628,10 +681,37 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
             return true;
         }
     }
+    // Enriched Starting 5 identity from the live player cache. The original
+    // starting5.playerNName binding remains EA's abbreviated presentation name.
+    if (std::strncmp(b, "starting5.player", 16) == 0 &&
+        b[16] >= '1' && b[16] <= '5') {
+        const int playerIndex = b[16] - '1';
+        const char* suffix = b + 17;
+        const char* value = nullptr;
+        if (std::strcmp(suffix, "FirstName") == 0)
+            value = frame.starting5PlayerFirstNames[playerIndex];
+        else if (std::strcmp(suffix, "LastName") == 0)
+            value = frame.starting5PlayerLastNames[playerIndex];
+        else if (std::strcmp(suffix, "FullName") == 0)
+            value = frame.starting5PlayerFullNames[playerIndex];
+        else if (std::strcmp(suffix, "Number") == 0 ||
+                 std::strcmp(suffix, "JerseyNumber") == 0)
+            value = frame.starting5PlayerNumbers[playerIndex];
+        else if (std::strcmp(suffix, "Position") == 0)
+            value = frame.starting5PlayerPositions[playerIndex];
+        if (value) {
+            std::snprintf(output, capacity, "%s", value);
+            *defaultHeight = style.teamNameHeight;
+            return true;
+        }
+    }
     if (std::strcmp(b, "starting5.teamName") == 0 ||
+        std::strcmp(b, "starting5.cityName") == 0 ||
         std::strcmp(b, "starting5.side") == 0) {
         const char* value = std::strcmp(b, "starting5.teamName") == 0 ?
-            frame.starting5TeamName : frame.starting5Side;
+            frame.starting5TeamName :
+            std::strcmp(b, "starting5.cityName") == 0 ?
+                frame.starting5CityName : frame.starting5Side;
         std::snprintf(output, capacity, "%s", value ? value : "");
         *defaultHeight = style.teamNameHeight;
         return true;
@@ -719,6 +799,19 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
                 frame.playerLastName ? frame.playerLastName : "");
         *defaultHeight = style.teamNameHeight; return true;
     }
+    if (std::strcmp(b, "player1.name") == 0 ||
+        std::strcmp(b, "player1.value") == 0 ||
+        std::strcmp(b, "player2.name") == 0 ||
+        std::strcmp(b, "player2.value") == 0) {
+        const char* value =
+            std::strcmp(b, "player1.name") == 0 ? frame.player1Name :
+            std::strcmp(b, "player1.value") == 0 ? frame.player1Value :
+            std::strcmp(b, "player2.name") == 0 ? frame.player2Name :
+            frame.player2Value;
+        std::snprintf(output, capacity, "%s", value ? value : "");
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
     if (std::strcmp(b, "stat.label1") == 0 ||
         std::strcmp(b, "stat.value1") == 0 ||
         std::strcmp(b, "stat.label2") == 0 ||
@@ -731,6 +824,30 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
             frame.statTeamName;
         std::snprintf(output, capacity, "%s", value ? value : "");
         *defaultHeight = style.teamNameHeight; return true;
+    }
+    if (std::strncmp(b, "stat.leftTeam", 13) == 0 ||
+        std::strncmp(b, "stat.rightTeam", 14) == 0) {
+        const StatTeamPair teams = ResolveStatTeams(frame);
+        const bool left = std::strncmp(b, "stat.leftTeam", 13) == 0;
+        const popup::TeamVisual* team = left ? teams.left : teams.right;
+        if (!team) { output[0] = '\0'; return true; }
+        const char* suffix = b + (left ? 13 : 14);
+        if (std::strcmp(suffix, "City") == 0)
+            std::snprintf(output, capacity, "%s", team->cityName);
+        else if (std::strcmp(suffix, "Name") == 0 ||
+                 std::strcmp(suffix, "Nickname") == 0)
+            std::snprintf(output, capacity, "%s", team->teamName);
+        else if (std::strcmp(suffix, "Abbreviation") == 0)
+            std::snprintf(output, capacity, "%s", team->abbreviation);
+        else if (std::strcmp(suffix, "ShortCode") == 0)
+            std::snprintf(output, capacity, "%s", team->shortCode);
+        else if (std::strcmp(suffix, "FullName") == 0)
+            std::snprintf(output, capacity, "%s %s",
+                team->cityName, team->teamName);
+        else
+            output[0] = '\0';
+        *defaultHeight = style.teamNameHeight;
+        return true;
     }
     if (std::strncmp(b, "stat.raw", 8) == 0) {
         const char* indexText = b + 8;
@@ -864,6 +981,19 @@ bool RenderGenericElements(IDirect3DDevice9* device,
                 texture = frame.violationTeamLogo;
             else if (std::strcmp(e.binding, "stat.teamLogo") == 0)
                 texture = frame.statTeamLogo;
+            else if (std::strcmp(e.binding, "player1.teamLogo") == 0)
+                texture = frame.player1TeamLogo;
+            else if (std::strcmp(e.binding, "player2.teamLogo") == 0)
+                texture = frame.player2TeamLogo;
+            else if (std::strcmp(e.binding, "stat.leftTeamLogo") == 0 ||
+                     std::strcmp(e.binding, "stat.rightTeamLogo") == 0) {
+                const StatTeamPair teams = ResolveStatTeams(frame);
+                const popup::TeamVisual* team =
+                    std::strcmp(e.binding, "stat.leftTeamLogo") == 0 ?
+                    teams.left : teams.right;
+                if (team) texture = popup::GetLogoTexture(
+                    device, team->databaseTeamID);
+            }
             else if (std::strcmp(e.binding, "intro.awayLogo") == 0)
                 texture = frame.awayLogo;
             else if (std::strcmp(e.binding, "intro.homeLogo") == 0)

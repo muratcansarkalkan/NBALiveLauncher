@@ -21,6 +21,10 @@ bool Load(const char* themeName);
 bool Reload(const char* themeName);
 const TeamVisual* FindTeam(int databaseTeamID);
 const TeamVisual* FindTeamByShortCode(const char* shortCode);
+// Matches exact team identity text from stat payloads. The lookup accepts
+// abbreviation, two-character short code, city, nickname, or full name.
+// Ambiguous city/nickname matches return nullptr.
+const TeamVisual* FindTeamByName(const char* value);
 
 // Loaded lazily from TeamVisual::logoPath and cached per D3D device.
 IDirect3DTexture9* GetLogoTexture(

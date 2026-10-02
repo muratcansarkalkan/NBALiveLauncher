@@ -1,5 +1,6 @@
 #include "plugin-std.h"
 #include "Resolutions.h"
+#include "ResolutionMenuStrings.h"
 
 using namespace plugin;
 
@@ -12,18 +13,113 @@ static float gAspectScale07 = 1.0f;
 
 namespace live07 {
 
+    static ResolutionMenuStringPatcher gResolutionMenuStrings07;
+
+    // Logical menu order. NBA Live 07 has one important native invariant:
+    // renderer mode index 1 is the startup/current mode. Do not fight that.
+    //
+    // Before patching the native table, PrepareResolutionSlots07() swaps the
+    // configured RES_X/RES_Y mode into physical slot 1, then builds a mapping
+    // that makes the Display Settings menu enumerate the modes in this logical
+    // order.
     ResolutionID ids[] = {
-        { 640,  480, 32, 0 }, // 640x480x16
-        { RES_X,  RES_Y, 32, 1 }, // 640x480x32
-        { 1024,  768, 32, 2 }, // 800x600x16
-        { 1280,  720, 32, 3 }, // 800x600x32
+        { 640,  480, 32, 0 },
+        { 800,  600, 32, 1 },
+        { 1024, 768, 32, 2 },
+        { 1280, 720, 32, 3 },
         { 1280, 1024, 32, 4 },
-        { 1366,  768, 32, 5 },
-        { 1440,  900, 32, 6 },
-        { 1600,  900, 32, 7 },
+        { 1366, 768, 32, 5 },
+        { 1440, 900, 32, 6 },
+        { 1600, 900, 32, 7 },
         { 1920, 1080, 32, 8 },
         { 2560, 1440, 32, 9 },
     };
+
+    static unsigned int gResolutionMenuOrder07[10] = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+    };
+
+    static void PrepareResolutionSlots07()
+    {
+        int configuredLogicalIndex = -1;
+
+        for (int i = 0; i < 10; ++i)
+        {
+            if (ids[i].width == RES_X &&
+                ids[i].height == RES_Y)
+            {
+                configuredLogicalIndex = i;
+                break;
+            }
+        }
+
+        // If main.ini requests one of our ten exposed modes, keep NBA Live's
+        // native startup invariant by placing that mode in physical slot 1.
+        //
+        // Swap only the mode values. The id member always remains the physical
+        // native-table slot number.
+        if (configuredLogicalIndex >= 0 &&
+            configuredLogicalIndex != 1)
+        {
+            const unsigned int width = ids[1].width;
+            const unsigned int height = ids[1].height;
+            const unsigned int depth = ids[1].depth;
+
+            ids[1].width = ids[configuredLogicalIndex].width;
+            ids[1].height = ids[configuredLogicalIndex].height;
+            ids[1].depth = ids[configuredLogicalIndex].depth;
+
+            ids[configuredLogicalIndex].width = width;
+            ids[configuredLogicalIndex].height = height;
+            ids[configuredLogicalIndex].depth = depth;
+        }
+
+        // Desired visible menu order.
+        static const unsigned int logicalWidth[10] = {
+            640, 800, 1024, 1280, 1280,
+            1366, 1440, 1600, 1920, 2560
+        };
+
+        static const unsigned int logicalHeight[10] = {
+            480, 600, 768, 720, 1024,
+            768, 900, 900, 1080, 1440
+        };
+
+        for (int logical = 0; logical < 10; ++logical)
+        {
+            gResolutionMenuOrder07[logical] =
+                static_cast<unsigned int>(logical);
+
+            for (int physical = 0; physical < 10; ++physical)
+            {
+                if (ids[physical].width == logicalWidth[logical] &&
+                    ids[physical].height == logicalHeight[logical])
+                {
+                    gResolutionMenuOrder07[logical] =
+                        static_cast<unsigned int>(physical);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 0053A870 builds the list of supported resolution *indices*.
+    // At 0053A8CF the stock code appends ESI (0..9), forcing physical table
+    // order into the menu. Replace only that append operation with our logical
+    // -> physical slot mapping. ESI remains untouched as the native loop
+    // counter; EBX continues walking the physical table exactly as stock.
+    static DWORD gResolutionMenuAppendReturn07 = 0x0053A8D4;
+
+    __declspec(naked) static void AppendResolutionInLogicalOrder07()
+    {
+        __asm
+        {
+            mov edx, dword ptr [gResolutionMenuOrder07 + esi * 4]
+            mov [edi], edx
+            add edi, 4
+            jmp dword ptr [gResolutionMenuAppendReturn07]
+        }
+    }
 
     DWORD* METHOD SetPerspectiveProjection07(
         float* _this, DUMMY_ARG,
@@ -159,7 +255,7 @@ namespace live07 {
             /*
                 07's previous culling test used:
 
-                    v5² > v12 * 0.33333
+                    v5ï¿½ > v12 * 0.33333
 
                 Equivalent expansion:
 
@@ -516,6 +612,21 @@ void Install_LIVE07() {
     patch::RedirectJump(0x438B11, SetPerspectiveProjection07);
     patch::RedirectJump(0x67BE80, SetTestInConicalFrustum07);
     InstallHighResolutionAptFonts07();
+
+    // Preserve Live 07's native startup/current-mode slot (index 1), but
+    // decouple menu ordering from physical table ordering.
+    PrepareResolutionSlots07();
+
+    // 53A8CF: mov [edi], esi / add edi, 4
+    patch::RedirectJump(0x53A8CF, AppendResolutionInLogicalOrder07);
+
+    // Capture the stock resolution labels before overwriting the mode table.
+    gResolutionMenuStrings07.Initialize(
+        0xC65CA0,
+        ids,
+        sizeof(ids) / sizeof(ids[0])
+    );
+
     for (const auto& resolution : ids) {
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 8, resolution.height);

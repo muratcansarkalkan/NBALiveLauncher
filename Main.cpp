@@ -13,8 +13,11 @@ void InitializeMemoryUpgrader();
 void InitializeStadiumDornaConfig();
 void InitializeJumbotronRuntime();
 void InitializeCustomPaths();
+void InitializeCustomCamera();
+void InitializeArenaLighting();
 void InitializeAntiAliasing();
 void InitializeDebugLogging();
+void InitializeCourtTextureRendering();
 
 void NBAResolution0508() {
     switch (FM::GetEntryPoint()) {
@@ -27,7 +30,7 @@ void NBAResolution0508() {
             Install_LIVE06();
 
         }
-        else if (patch::GetFloat(0xBBBC3C) == 1.3333334f) { // NBA Live 07 1.1 NOCD  
+        else if (patch::GetFloat(0xBBBC3C) == 1.3333334f) { // NBA Live 07 1.1 NOCD
             Install_LIVE07();
         }
         else if (patch::GetFloat(0xC3DF84) == 1.3333334f) { // NBA Live 08 1.0 NOCD
@@ -42,21 +45,23 @@ public:
     NBALiveLauncher() {
         // Start diagnostics before the other launcher features.
         InitializeDebugConsole();
-		InitializeDebugLogging();
-		InitializeMemoryUpgrader();
+        InitializeDebugLogging();
+        InitializeMemoryUpgrader();
         InitializeCustomPaths();
+        InitializeCustomCamera();
+        InitializeArenaLighting();
 
         // Install the Live 06 D3D9 MSAA hook before the game creates its
         // rendering device. Disabled unless [DISPLAY] ANTI_ALIASING=1.
         InitializeAntiAliasing();
-
-        // Keep initialization order explicit.
         NBAResolution0508();
+		// InitializeCourtTextureRendering();
+        // Keep initialization order explicit.
         EnableWindowed();
         InitializeShotClock();
         InitializeStartupTeams();
         InitializeStadiumDornaConfig();
-		InitializeJumbotronRuntime();
-        // InitializeAntiAliasing();
+        InitializeJumbotronRuntime();
+        InitializeAntiAliasing();
     }
 } g_nbaLiveLauncher;

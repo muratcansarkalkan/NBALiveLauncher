@@ -256,8 +256,21 @@ bool g_introLayoutAvailable = false;
 bool g_introPresentationSuppressed = false;
 DWORD g_introTransitionHiddenAt = 0;
 
+struct Starting5PlayerIdentity {
+    char firstName[64];
+    char lastName[64];
+    char fullName[128];
+    char jerseyNumber[8];
+    char position[4];
+    int side;
+    int rosterSlot;
+    int databasePlayerId;
+    bool resolved;
+};
+
 struct Starting5State {
     char values[11][128];
+    Starting5PlayerIdentity players[5];
     unsigned int payloadHash;
     DWORD startedAt;
     bool active;
@@ -322,6 +335,10 @@ struct GenericStatState {
     D3DCOLOR teamColor;
     DWORD startedAt;
     int valueCase;
+    int leaderSide[2];              // -1 unknown, 0 home, 1 away
+    int leaderRosterSlot[2];
+    int leaderDatabasePlayerId[2];
+    bool leaderResolved[2];
     bool playerPayload;
     bool active;
 };
@@ -478,6 +495,9 @@ enum PlayerGameStatsId08 {
 };
 struct LivePlayerData08 {
     int nativePlayerId, databasePlayerId, jerseyNumber, currentPosition, initialPosition;
+    char firstName[64];
+    char lastName[64];
+    char shortDisplayName[96];
     int courtSlot; // -1 = bench, 0..4 = active lineup slot
     int fgMade, fgAttempts, threeMade, threeAttempts, ftMade, ftAttempts;
     int offensiveRebounds, defensiveRebounds, rebounds, blocks, steals, assists, turnovers, fouls, minutes, points;
@@ -486,6 +506,13 @@ struct LivePlayerData08 {
 };
 struct LiveTeamData08 { int teamId, playerCount; LivePlayerData08 players[12]; };
 struct LiveGameData08 { LiveTeamData08 teams[2]; int homeTeamIndex, awayTeamIndex; DWORD refreshedAt; bool valid; };
+const LiveGameData08* GetLiveGameForVersion(GameVersion version);
+bool ResolveLivePlayerByDisplayName(
+    const char* displayName, GameVersion version,
+    int& sideOut, int& slotOut, const LivePlayerData08*& playerOut);
+bool RefreshLiveGameData07(const ExtendedState& state);
+bool RefreshLiveGameData08(const ExtendedState& state);
+bool TryReadState(ExtendedState* state);
 void* g_boxScoreMgr08 = nullptr;
 BoxScoreInitFn g_originalBoxScoreInit08 = nullptr;
 GetBoxScoreGameFn g_getBoxScoreGame08 = nullptr;
@@ -1147,6 +1174,40 @@ void LogPresentationPayload(const char* category, DWORD* vector)
     }
 }
 
+bool EnsureStarting5LiveCache()
+{
+    if (!g_game)
+        return false;
+
+    if (g_game->version == GameVersion::Live2007 && g_liveGame07.valid)
+        return true;
+    if (g_game->version == GameVersion::Live2008 && g_liveGame08.valid)
+        return true;
+    if (g_game->version != GameVersion::Live2007 &&
+        g_game->version != GameVersion::Live2008)
+        return false;
+
+    ExtendedState state = {};
+    if (!TryReadState(&state)) {
+        AppendDiagnostic(
+            "Starting5 live-cache refresh: version=%s stateRead=no.\n",
+            g_game->version == GameVersion::Live2007 ? "07" : "08");
+        return false;
+    }
+
+    const bool refreshed = g_game->version == GameVersion::Live2007 ?
+        RefreshLiveGameData07(state) : RefreshLiveGameData08(state);
+    const bool valid = g_game->version == GameVersion::Live2007 ?
+        g_liveGame07.valid : g_liveGame08.valid;
+    AppendDiagnostic(
+        "Starting5 live-cache refresh: version=%s refreshed=%s valid=%s "
+        "homeDBID=%d awayDBID=%d.\n",
+        g_game->version == GameVersion::Live2007 ? "07" : "08",
+        refreshed ? "yes" : "no", valid ? "yes" : "no",
+        state.homeTeamDBID, state.awayTeamDBID);
+    return refreshed && valid;
+}
+
 void CaptureStarting5Payload(DWORD* vector)
 {
     if (!g_customOverlayEnabled || !g_starting5LayoutAvailable || !vector)
@@ -1168,6 +1229,159 @@ void CaptureStarting5Payload(DWORD* vector)
         for (int i = 0; i < 11; ++i)
             CopyText(target->values[i], sizeof(target->values[i]),
                 values[i].sharedstring);
+
+        // Starting 5 can arrive during presentation before normal scoreboard
+        // polling has populated the live-player cache. Refresh it on demand
+        // so the five abbreviated names can be resolved immediately.
+        if (g_game &&
+            (g_game->version == GameVersion::Live2007 ||
+             g_game->version == GameVersion::Live2008))
+            EnsureStarting5LiveCache();
+
+        // Starting 5 row order is fixed by position:
+        // row 1..5 = PG, SG, SF, PF, C and live roster slots = 4,3,2,1,0.
+        // The payload also identifies the team, so use team + roster slot as
+        // the primary identity key. This avoids ambiguous abbreviated names
+        // such as "M. Williams" when both teams contain one.
+        static const int kStarting5RosterSlots[5] = { 4, 3, 2, 1, 0 };
+        static const char* kStarting5Positions[5] = {
+            "PG", "SG", "SF", "PF", "C"
+        };
+
+        const LiveGameData08* liveGame =
+            g_game ? GetLiveGameForVersion(g_game->version) : nullptr;
+        int starting5Side = -1;
+
+        // Prefer the payload team code mapped through teams.json. Fall back to
+        // the intro's home/away short codes when necessary.
+        popup::Load(g_customOverlayName);
+        const popup::TeamVisual* starting5Team =
+            popup::FindTeamByShortCode(target->values[10]);
+        if (liveGame && liveGame->valid && starting5Team) {
+            const int homeIndex = liveGame->homeTeamIndex;
+            const int awayIndex = liveGame->awayTeamIndex;
+            if (homeIndex >= 0 && homeIndex < 2 &&
+                liveGame->teams[homeIndex].teamId ==
+                    starting5Team->databaseTeamID)
+                starting5Side = 0;
+            else if (awayIndex >= 0 && awayIndex < 2 &&
+                     liveGame->teams[awayIndex].teamId ==
+                        starting5Team->databaseTeamID)
+                starting5Side = 1;
+        }
+        if (starting5Side < 0) {
+            if (_stricmp(target->values[10], g_broadcast.homeLogoId) == 0)
+                starting5Side = 0;
+            else if (_stricmp(target->values[10],
+                              g_broadcast.awayLogoId) == 0)
+                starting5Side = 1;
+        }
+
+        const int starting5TeamIndex =
+            liveGame && starting5Side == 0 ? liveGame->homeTeamIndex :
+            liveGame && starting5Side == 1 ? liveGame->awayTeamIndex : -1;
+
+        for (int i = 0; i < 5; ++i) {
+            Starting5PlayerIdentity& identity = target->players[i];
+            std::memset(&identity, 0, sizeof(identity));
+            identity.side = starting5Side;
+            identity.rosterSlot = kStarting5RosterSlots[i];
+            identity.databasePlayerId = -1;
+            CopyText(identity.position, sizeof(identity.position),
+                kStarting5Positions[i]);
+
+            if (!g_game ||
+                (g_game->version != GameVersion::Live2007 &&
+                 g_game->version != GameVersion::Live2008) ||
+                !liveGame || !liveGame->valid ||
+                starting5TeamIndex < 0 || starting5TeamIndex > 1) {
+                AppendDiagnostic(
+                    "Starting5 direct identity: row=%d position=%s "
+                    "teamCode='%s' side=%s rosterSlot=%d package='%s' "
+                    "payloadName='%s' resolved=no reason=team/cache.\n",
+                    i + 1, identity.position, target->values[10],
+                    starting5Side == 0 ? "home" :
+                    starting5Side == 1 ? "away" : "unknown",
+                    identity.rosterSlot, target->values[i],
+                    target->values[5 + i]);
+                continue;
+            }
+
+            const LivePlayerData08* resolvedPlayer = nullptr;
+            const LivePlayerData08& direct =
+                liveGame->teams[starting5TeamIndex]
+                    .players[identity.rosterSlot];
+            if (direct.valid)
+                resolvedPlayer = &direct;
+
+            // Safety fallback only: if a custom roster does not preserve the
+            // expected 4..0 starter-slot layout, try the abbreviated name
+            // within this team only. Never search the opposing roster.
+            bool usedFallback = false;
+            if (!resolvedPlayer) {
+                const char* payloadName = target->values[5 + i];
+                for (int slot = 0; slot < 12; ++slot) {
+                    const LivePlayerData08& candidate =
+                        liveGame->teams[starting5TeamIndex].players[slot];
+                    if (!candidate.valid || !candidate.shortDisplayName[0])
+                        continue;
+                    if (_stricmp(payloadName, candidate.shortDisplayName) == 0) {
+                        resolvedPlayer = &candidate;
+                        identity.rosterSlot = slot;
+                        usedFallback = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!resolvedPlayer) {
+                AppendDiagnostic(
+                    "Starting5 direct identity: row=%d position=%s "
+                    "teamCode='%s' side=%s rosterSlot=%d package='%s' "
+                    "payloadName='%s' resolved=no reason=slot.\n",
+                    i + 1, identity.position, target->values[10],
+                    starting5Side == 0 ? "home" :
+                    starting5Side == 1 ? "away" : "unknown",
+                    identity.rosterSlot, target->values[i],
+                    target->values[5 + i]);
+                continue;
+            }
+
+            identity.resolved = true;
+            identity.databasePlayerId = resolvedPlayer->databasePlayerId;
+            CopyText(identity.firstName, sizeof(identity.firstName),
+                resolvedPlayer->firstName);
+            CopyText(identity.lastName, sizeof(identity.lastName),
+                resolvedPlayer->lastName);
+            std::snprintf(identity.fullName, sizeof(identity.fullName),
+                "%s%s%s", identity.firstName,
+                identity.firstName[0] && identity.lastName[0] ? " " : "",
+                identity.lastName);
+            if (resolvedPlayer->jerseyNumber >= 0)
+                std::snprintf(identity.jerseyNumber,
+                    sizeof(identity.jerseyNumber), "%d",
+                    resolvedPlayer->jerseyNumber);
+
+            const bool nameMatches =
+                resolvedPlayer->shortDisplayName[0] &&
+                _stricmp(target->values[5 + i],
+                         resolvedPlayer->shortDisplayName) == 0;
+            AppendDiagnostic(
+                "Starting5 direct identity: row=%d position=%s "
+                "teamCode='%s' side=%s rosterSlot=%d package='%s' "
+                "payloadName='%s' runtimeName='%s' nameMatch=%s "
+                "fallback=%s databasePlayerID=%d first='%s' last='%s' "
+                "number='%s'.\n",
+                i + 1, identity.position, target->values[10],
+                starting5Side == 0 ? "home" :
+                starting5Side == 1 ? "away" : "unknown",
+                identity.rosterSlot, target->values[i],
+                target->values[5 + i], resolvedPlayer->shortDisplayName,
+                nameMatches ? "yes" : "no", usedFallback ? "yes" : "no",
+                identity.databasePlayerId, identity.firstName,
+                identity.lastName, identity.jerseyNumber);
+        }
+
         target->payloadHash = hash;
         target->startedAt = target == &g_starting5 ? GetTickCount() : 0;
         target->active = true;
@@ -1677,6 +1891,13 @@ void __fastcall HookStatsDataStore(void* thisPtr, void*, DWORD* payload)
                     scoreboardconfig::LoadStat(g_customOverlayName,
                         subtype.key, subtype.playerPayload, valueCase);
                 if (genericStat) {
+					AppendDiagnostic(
+						"Generic-stat layout selected: subtype=%s payload=%s "
+						"valueCase=%d json=%s.\n",
+						subtype.key,
+						subtype.playerPayload ? "player" : "team",
+						valueCase,
+						scoreboardconfig::GetLoadedStatLayoutName());
                     std::memset(&g_genericStat, 0, sizeof(g_genericStat));
                     if (subtype.playerPayload) {
                         CopyText(g_genericStat.jerseyNumber,
@@ -1754,6 +1975,50 @@ void __fastcall HookStatsDataStore(void* thisPtr, void*, DWORD* payload)
                                 compactRight[column]);
                         }
                     }
+                    for (int leader = 0; leader < 2; ++leader) {
+                        g_genericStat.leaderSide[leader] = -1;
+                        g_genericStat.leaderRosterSlot[leader] = -1;
+                        g_genericStat.leaderDatabasePlayerId[leader] = -1;
+                        g_genericStat.leaderResolved[leader] = false;
+                    }
+
+                    // Team Leaders can put either team in either row. Resolve
+                    // raw4/raw8 by EA's own abbreviated name form against the
+                    // current 24-player live cache instead of using row order.
+                    if (!subtype.playerPayload &&
+                        std::strcmp(subtype.key, "team_leaders") == 0 &&
+                        g_game) {
+                        const char* leaderNames[2] = {
+                            g_genericStat.values[4],
+                            g_genericStat.values[8]
+                        };
+                        for (int leader = 0; leader < 2; ++leader) {
+                            int resolvedSide = -1;
+                            int resolvedSlot = -1;
+                            const LivePlayerData08* resolvedPlayer = nullptr;
+                            const bool resolved = ResolveLivePlayerByDisplayName(
+                                leaderNames[leader], g_game->version,
+                                resolvedSide, resolvedSlot, resolvedPlayer);
+
+                            g_genericStat.leaderResolved[leader] = resolved;
+                            if (resolved) {
+                                g_genericStat.leaderSide[leader] = resolvedSide;
+                                g_genericStat.leaderRosterSlot[leader] = resolvedSlot;
+                                g_genericStat.leaderDatabasePlayerId[leader] =
+                                    resolvedPlayer->databasePlayerId;
+                            }
+
+                            AppendDiagnostic(
+                                "Team Leaders name resolution: row=%d name='%s' "
+                                "resolved=%s side=%s rosterSlot=%d databasePlayerID=%d.\\n",
+                                leader + 1, leaderNames[leader],
+                                resolved ? "yes" : "no",
+                                resolved ? (resolvedSide == 0 ? "home" : "away") : "unknown",
+                                resolved ? resolvedSlot : -1,
+                                resolvedPlayer ? resolvedPlayer->databasePlayerId : -1);
+                        }
+                    }
+
                     CopyText(g_genericStat.subtypeKey,
                         sizeof(g_genericStat.subtypeKey), subtype.key);
                     CopyText(g_genericStat.teamCode,
@@ -2021,6 +2286,118 @@ bool __fastcall HookSubstitutionBuilder05(
     return result;
 }
 
+// Runtime player name storage is exposed by the same compact player-description
+// object in all four games. Field 0x80 is first name, 0x81 is last name and
+// field 0x84 formats "%c. %s". The backing offsets were verified in each EXE:
+//   2005: first +0x1E2, last +0x1D4
+//   2006: first +0x1EA, last +0x1DC
+//   2007: first +0x20A, last +0x1FC
+//   2008: first +0x20A, last +0x1FC
+void FillLiveRuntimePlayerNames(LivePlayerData08& o, void* player, GameVersion version)
+{
+    o.firstName[0] = '\0';
+    o.lastName[0] = '\0';
+    o.shortDisplayName[0] = '\0';
+
+    if (!player)
+        return;
+
+    size_t firstOffset = 0;
+    size_t lastOffset = 0;
+    switch (version) {
+    case GameVersion::Live2005:
+        firstOffset = 0x1E2;
+        lastOffset = 0x1D4;
+        break;
+    case GameVersion::Live2006:
+        firstOffset = 0x1EA;
+        lastOffset = 0x1DC;
+        break;
+    case GameVersion::Live2007:
+    case GameVersion::Live2008:
+        firstOffset = 0x20A;
+        lastOffset = 0x1FC;
+        break;
+    default:
+        return;
+    }
+
+    __try {
+        const unsigned char* base = static_cast<const unsigned char*>(player);
+        CopyText(o.firstName, sizeof(o.firstName),
+            reinterpret_cast<const char*>(base + firstOffset));
+        CopyText(o.lastName, sizeof(o.lastName),
+            reinterpret_cast<const char*>(base + lastOffset));
+
+        if (o.firstName[0] && o.lastName[0]) {
+            std::snprintf(o.shortDisplayName, sizeof(o.shortDisplayName),
+                "%c. %s", o.firstName[0], o.lastName);
+        }
+        else if (o.lastName[0]) {
+            CopyText(o.shortDisplayName, sizeof(o.shortDisplayName), o.lastName);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        o.firstName[0] = '\0';
+        o.lastName[0] = '\0';
+        o.shortDisplayName[0] = '\0';
+    }
+}
+
+const LiveGameData08* GetLiveGameForVersion(GameVersion version)
+{
+    switch (version) {
+    case GameVersion::Live2005: return &g_liveGame05;
+    case GameVersion::Live2006: return &g_liveGame06;
+    case GameVersion::Live2007: return &g_liveGame07;
+    case GameVersion::Live2008: return &g_liveGame08;
+    default: return nullptr;
+    }
+}
+
+bool ResolveLivePlayerByDisplayName(
+    const char* displayName, GameVersion version,
+    int& sideOut, int& slotOut, const LivePlayerData08*& playerOut)
+{
+    sideOut = -1;
+    slotOut = -1;
+    playerOut = nullptr;
+
+    const LiveGameData08* liveGame = GetLiveGameForVersion(version);
+    if (!displayName || !*displayName || !liveGame || !liveGame->valid)
+        return false;
+
+    const LivePlayerData08* match = nullptr;
+    int matchSide = -1;
+    int matchSlot = -1;
+
+    for (int side = 0; side < 2; ++side) {
+        for (int slot = 0; slot < 12; ++slot) {
+            const LivePlayerData08& p = liveGame->teams[side].players[slot];
+            if (!p.valid || !p.shortDisplayName[0] ||
+                _stricmp(displayName, p.shortDisplayName) != 0)
+                continue;
+
+            // Initial + surname is not guaranteed unique. Never guess if two
+            // players in the current 24-player cache produce the same label.
+            if (match)
+                return false;
+
+            match = &p;
+            matchSide = side;
+            matchSlot = slot;
+        }
+    }
+
+    if (!match)
+        return false;
+
+    sideOut = matchSide;
+    slotOut = matchSlot;
+    playerOut = match;
+    return true;
+}
+
 bool FillLiveRuntimePlayerData05(LivePlayerData08& o, DWORD nativePlayerId, void* player)
 {
     if (!player || !g_getRuntimePlayerInt05 || nativePlayerId == 0 || nativePlayerId == 0xFFFFFFFFu)
@@ -2033,6 +2410,7 @@ bool FillLiveRuntimePlayerData05(LivePlayerData08& o, DWORD nativePlayerId, void
         o.jerseyNumber = g_getRuntimePlayerInt05(player, 0x85);
         o.currentPosition = g_getRuntimePlayerInt05(player, 0x87);
         o.initialPosition = g_getRuntimePlayerInt05(player, 0x89);
+        FillLiveRuntimePlayerNames(o, player, GameVersion::Live2005);
         o.threeAttempts = g_getRuntimePlayerInt05(player, 0x00);
         o.threeMade = g_getRuntimePlayerInt05(player, 0x01);
         o.fgAttempts = g_getRuntimePlayerInt05(player, 0x02);
@@ -2235,13 +2613,14 @@ bool FillLiveRuntimePlayerData07(LivePlayerData08& o, DWORD nativePlayerId, void
         o.jerseyNumber = g_getRuntimePlayerInt07(player, 0x85);
         o.currentPosition = g_getRuntimePlayerInt07(player, 0x87);
         o.initialPosition = g_getRuntimePlayerInt07(player, 0x89);
+        FillLiveRuntimePlayerNames(o, player, GameVersion::Live2007);
         o.threeAttempts = g_getRuntimePlayerInt07(player, 0x00);
         o.threeMade = g_getRuntimePlayerInt07(player, 0x01);
         o.fgAttempts = g_getRuntimePlayerInt07(player, 0x02);
         o.fgMade = g_getRuntimePlayerInt07(player, 0x03);
         o.ftAttempts = g_getRuntimePlayerInt07(player, 0x04);
         o.ftMade = g_getRuntimePlayerInt07(player, 0x05);
-        o.assists = g_getRuntimePlayerInt07(player, 0x05);
+        o.assists = g_getRuntimePlayerInt07(player, 0x06);
         o.blocks = g_getRuntimePlayerInt07(player, 0x07);
         o.defensiveRebounds = g_getRuntimePlayerInt07(player, 0x08);
         o.fouls = g_getRuntimePlayerInt07(player, 0x09);
@@ -2377,6 +2756,7 @@ bool FillLiveRuntimePlayerData06(LivePlayerData08& o, DWORD nativePlayerId, void
         o.jerseyNumber = g_getRuntimePlayerInt06(player, 0x85);
         o.currentPosition = g_getRuntimePlayerInt06(player, 0x87);
         o.initialPosition = g_getRuntimePlayerInt06(player, 0x89);
+        FillLiveRuntimePlayerNames(o, player, GameVersion::Live2006);
         o.threeAttempts = g_getRuntimePlayerInt06(player, 0x00);
         o.threeMade = g_getRuntimePlayerInt06(player, 0x01);
         o.fgAttempts = g_getRuntimePlayerInt06(player, 0x02);
@@ -2659,6 +3039,7 @@ bool FillLiveRuntimePlayerData08(LivePlayerData08& o, DWORD nativePlayerId, void
         o.jerseyNumber = g_getRuntimePlayerInt08(player, 0x85);
         o.currentPosition = g_getRuntimePlayerInt08(player, 0x87);
         o.initialPosition = g_getRuntimePlayerInt08(player, 0x89);
+        FillLiveRuntimePlayerNames(o, player, GameVersion::Live2008);
 
         // Runtime-player stat IDs, proven from the featured-player path.
         o.threeAttempts      = g_getRuntimePlayerInt08(player, 0x00);
@@ -2887,8 +3268,8 @@ bool ExportBoxScoreCsv05()
             if (p.jerseyNumber == -1) std::strcpy(j, "00");
             else if (p.jerseyNumber != INT_MIN) std::snprintf(j, sizeof(j), "%d", p.jerseyNumber);
             std::fprintf(f, "%s,%d,%d,%d,%d,%d,", home ? "home" : "away", ti, t.teamId, i, p.nativePlayerId, p.databasePlayerId);
-            WriteCsvQuoted08(f, ""); std::fputc(',', f);
-            WriteCsvQuoted08(f, ""); std::fputc(',', f);
+            WriteCsvQuoted08(f, p.firstName); std::fputc(',', f);
+            WriteCsvQuoted08(f, p.lastName); std::fputc(',', f);
             WriteCsvQuoted08(f, j);
             std::fprintf(f, ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                 p.jerseyNumber, p.currentPosition, p.initialPosition,
@@ -2922,8 +3303,8 @@ bool ExportBoxScoreCsv06()
             if (p.jerseyNumber == -1) std::strcpy(j, "00");
             else if (p.jerseyNumber != INT_MIN) std::snprintf(j, sizeof(j), "%d", p.jerseyNumber);
             std::fprintf(f, "%s,%d,%d,%d,%d,%d,", home ? "home" : "away", ti, t.teamId, i, p.nativePlayerId, p.databasePlayerId);
-            WriteCsvQuoted08(f, ""); std::fputc(',', f);
-            WriteCsvQuoted08(f, ""); std::fputc(',', f);
+            WriteCsvQuoted08(f, p.firstName); std::fputc(',', f);
+            WriteCsvQuoted08(f, p.lastName); std::fputc(',', f);
             WriteCsvQuoted08(f, j);
             std::fprintf(f, ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                 p.jerseyNumber, p.currentPosition, p.initialPosition,
@@ -2957,8 +3338,8 @@ bool ExportBoxScoreCsv07()
             if (p.jerseyNumber == -1) std::strcpy(j, "00");
             else if (p.jerseyNumber != INT_MIN) std::snprintf(j, sizeof(j), "%d", p.jerseyNumber);
             std::fprintf(f, "%s,%d,%d,%d,%d,%d,", home ? "home" : "away", ti, t.teamId, i, p.nativePlayerId, p.databasePlayerId);
-            WriteCsvQuoted08(f, ""); std::fputc(',', f);
-            WriteCsvQuoted08(f, ""); std::fputc(',', f);
+            WriteCsvQuoted08(f, p.firstName); std::fputc(',', f);
+            WriteCsvQuoted08(f, p.lastName); std::fputc(',', f);
             WriteCsvQuoted08(f, j);
             std::fprintf(f, ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                 p.jerseyNumber, p.currentPosition, p.initialPosition,
@@ -2980,10 +3361,10 @@ bool ExportBoxScoreCsv08()
     std::fputs("side,team_index,team_id,slot,runtime_player_id,database_player_id,first_name,last_name,jersey,jersey_raw,position,roster_slot,on_court,court_slot,fgm,fga,3pm,3pa,ftm,fta,oreb,dreb,reb,blk,stl,ast,to,pf,minutes,points\n",f);
     for(int sp=0;sp<2;++sp){ bool home=sp==1; int ti=home?g_liveGame08.homeTeamIndex:g_liveGame08.awayTeamIndex; if(ti<0||ti>1)continue; const auto& t=g_liveGame08.teams[ti];
         for(int i=0;i<12;++i){ const auto& p=t.players[i]; if(!p.valid)continue; char j[16]={}; if(p.jerseyNumber==-1)std::strcpy(j,"00"); else if(p.jerseyNumber!=INT_MIN)std::snprintf(j,sizeof(j),"%d",p.jerseyNumber);
-            std::fprintf(f,"%s,%d,%d,%d,%d,%d,",home?"home":"away",ti,t.teamId,i,p.nativePlayerId,p.databasePlayerId); WriteCsvQuoted08(f,""); fputc(',',f); WriteCsvQuoted08(f,""); fputc(',',f); WriteCsvQuoted08(f,j);
+            std::fprintf(f,"%s,%d,%d,%d,%d,%d,",home?"home":"away",ti,t.teamId,i,p.nativePlayerId,p.databasePlayerId); WriteCsvQuoted08(f,p.firstName); fputc(',',f); WriteCsvQuoted08(f,p.lastName); fputc(',',f); WriteCsvQuoted08(f,j);
             std::fprintf(f,",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",p.jerseyNumber,p.currentPosition,p.initialPosition,p.onCourt ? 1 : 0,p.courtSlot,p.fgMade,p.fgAttempts,p.threeMade,p.threeAttempts,p.ftMade,p.ftAttempts,p.offensiveRebounds,p.defensiveRebounds,p.rebounds,p.blocks,p.steals,p.assists,p.turnovers,p.fouls,p.minutes,p.points); }
     }
-    std::fclose(f); AppendDiagnostic("Box score CSV exported: boxscore.csv. Name columns are reserved but blank until direct all-player name getters are mapped.\n"); return true;
+    std::fclose(f); AppendDiagnostic("NBA Live 08 box score CSV exported: boxscore.csv.\n"); return true;
 }
 
 bool TryReadState(ExtendedState* state)
@@ -3915,6 +4296,57 @@ void RenderGenericStatOverlay(IDirect3DDevice9* device)
     frame.statValueCount = g_genericStat.count;
     for (int i = 0; i < g_genericStat.count && i < 15; ++i)
         frame.statValues[i] = g_genericStat.values[i];
+
+    // Team Leaders: raw4/raw5 and raw8/raw9 are presentation rows, not
+    // fixed home/away slots. HookStatsDataStore already resolves each name
+    // against the current 24-player cache and stores its real side. Reuse the
+    // normal scoreboard TeamVisual/logo path so raw13 (league logo id) is
+    // never treated as either player's team identity.
+    if (std::strcmp(g_genericStat.subtypeKey, "team_leaders") == 0) {
+        frame.player1Name = g_genericStat.count > 4 ?
+            g_genericStat.values[4] : "";
+        frame.player1Value = g_genericStat.count > 5 ?
+            g_genericStat.values[5] : "";
+        frame.player2Name = g_genericStat.count > 8 ?
+            g_genericStat.values[8] : "";
+        frame.player2Value = g_genericStat.count > 9 ?
+            g_genericStat.values[9] : "";
+
+        for (int leader = 0; leader < 2; ++leader) {
+            const int side = g_genericStat.leaderResolved[leader] ?
+                g_genericStat.leaderSide[leader] : -1;
+            const int teamDatabaseId = side == 0 ? g_lastState.homeTeamDBID :
+                side == 1 ? g_lastState.awayTeamDBID : -1;
+            const popup::TeamVisual* leaderTeam = teamDatabaseId >= 0 ?
+                popup::FindTeam(teamDatabaseId) : nullptr;
+            IDirect3DTexture9* leaderLogo = teamDatabaseId >= 0 ?
+                popup::GetLogoTexture(device, teamDatabaseId) : nullptr;
+            const D3DCOLOR leaderColor = leaderTeam ?
+                leaderTeam->primaryColor :
+                side == 0 ? g_broadcast.homeColor :
+                side == 1 ? g_broadcast.awayColor :
+                D3DCOLOR_XRGB(255, 255, 255);
+
+            if (leader == 0) {
+                frame.player1TeamLogo = leaderLogo;
+                frame.player1TeamColor = leaderColor;
+            }
+            else {
+                frame.player2TeamLogo = leaderLogo;
+                frame.player2TeamColor = leaderColor;
+            }
+
+            AppendDiagnostic(
+                "Team Leaders render mapping: row=%d name='%s' resolved=%s "
+                "side=%s databasePlayerID=%d teamDatabaseID=%d logo=%p.\n",
+                leader + 1,
+                leader == 0 ? frame.player1Name : frame.player2Name,
+                g_genericStat.leaderResolved[leader] ? "yes" : "no",
+                side == 0 ? "home" : side == 1 ? "away" : "unknown",
+                g_genericStat.leaderDatabasePlayerId[leader],
+                teamDatabaseId, leaderLogo);
+        }
+    }
     // NBA Live 06 compatibility path: expose the custom jersey number through
     // the renderer's already-existing stat.raw14 channel. This is render-only;
     // it does not modify the native FEOverlayStats payload or the 07/08 path.
@@ -4076,7 +4508,20 @@ void RenderStarting5Overlay(IDirect3DDevice9* device)
     scoreboard::Frame frame = {};
     for (int i = 0; i < 11; ++i)
         frame.starting5Values[i] = g_starting5.values[i];
+    for (int i = 0; i < 5; ++i) {
+        frame.starting5PlayerFirstNames[i] =
+            g_starting5.players[i].firstName;
+        frame.starting5PlayerLastNames[i] =
+            g_starting5.players[i].lastName;
+        frame.starting5PlayerFullNames[i] =
+            g_starting5.players[i].fullName;
+        frame.starting5PlayerNumbers[i] =
+            g_starting5.players[i].jerseyNumber;
+        frame.starting5PlayerPositions[i] =
+            g_starting5.players[i].position;
+    }
     frame.starting5TeamName = team ? team->teamName : "";
+    frame.starting5CityName = team ? team->cityName : "";
     frame.starting5Side = awaySide ? "away" : homeSide ? "home" : "unknown";
     const D3DCOLOR fallback = awaySide ? g_broadcast.awayColor :
         homeSide ? g_broadcast.homeColor : D3DCOLOR_XRGB(48, 48, 48);

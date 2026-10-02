@@ -257,6 +257,31 @@ bool ParseTeams(const std::string& json, const std::string& themeDirectory)
     return !g_teams.empty();
 }
 
+std::string NormalizeTeamLookup(const char* value)
+{
+    std::string result;
+    if (!value) return result;
+    bool pendingSpace = false;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(value);
+         *p; ++p) {
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            if (!result.empty()) pendingSpace = true;
+            continue;
+        }
+        if (pendingSpace && !result.empty()) result.push_back(' ');
+        pendingSpace = false;
+        const unsigned char c = *p;
+        result.push_back(static_cast<char>(
+            c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c));
+    }
+    return result;
+}
+
+bool LookupEquals(const char* candidate, const std::string& wanted)
+{
+    return !wanted.empty() && NormalizeTeamLookup(candidate) == wanted;
+}
+
 } // namespace
 
 bool Load(const char* themeName)
@@ -340,6 +365,34 @@ const TeamVisual* FindTeamByShortCode(const char* shortCode)
             return &team;
     }
     return nullptr;
+}
+
+const TeamVisual* FindTeamByName(const char* value)
+{
+    const std::string wanted = NormalizeTeamLookup(value);
+    if (wanted.empty()) return nullptr;
+
+    // Codes are intended to be unique, so prefer those first.
+    for (const TeamVisual& team : g_teams) {
+        if (LookupEquals(team.abbreviation, wanted) ||
+            LookupEquals(team.shortCode, wanted))
+            return &team;
+    }
+
+    const TeamVisual* match = nullptr;
+    for (const TeamVisual& team : g_teams) {
+        char fullName[160] = {};
+        std::snprintf(fullName, sizeof(fullName), "%s %s",
+            team.cityName, team.teamName);
+        const bool matches = LookupEquals(team.cityName, wanted) ||
+            LookupEquals(team.teamName, wanted) ||
+            LookupEquals(fullName, wanted);
+        if (!matches) continue;
+        if (match && match->databaseTeamID != team.databaseTeamID)
+            return nullptr; // e.g. an ambiguous city such as Los Angeles.
+        match = &team;
+    }
+    return match;
 }
 
 IDirect3DTexture9* GetLogoTexture(

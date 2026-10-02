@@ -16,6 +16,14 @@
 
 using namespace plugin;
 
+void SetArenaLightingStadiumLighting(
+    const char* stadiumId,
+    bool enabled,
+    float brightness,
+    float contrast,
+    float saturation,
+    float gamma);
+
 namespace
 {
     bool gDebugLoggingEnabled = false;
@@ -98,6 +106,13 @@ namespace
     //     "ad_count": 12,
     //     "period": 8.6,
     //     "transition_period": 0.6
+    //   },
+    //   "camera": "assets/camera/boston_low.mgd",
+    //   "stadiumLighting": {
+    //     "brightness": 0.8,
+    //     "contrast": 1.2,
+    //     "saturation": 1.15,
+    //     "gamma": 1.05
     //   }
     // }
     //
@@ -153,8 +168,18 @@ namespace
     int   gCurrentAdCount = kDefaultAdCount;
     float gCurrentPeriodSeconds = kDefaultPeriodSeconds;
     float gCurrentTransitionSeconds = kDefaultTransitionSeconds;
+    std::string gCurrentCameraPath;
+    constexpr float kDefaultStadiumBrightness = 1.0f;
+    constexpr float kDefaultStadiumContrast = 1.0f;
+    constexpr float kDefaultStadiumSaturation = 1.0f;
+    constexpr float kDefaultStadiumGamma = 1.0f;
+    bool  gCurrentStadiumLightingEnabled = false;
+    float gCurrentStadiumBrightness = kDefaultStadiumBrightness;
+    float gCurrentStadiumContrast = kDefaultStadiumContrast;
+    float gCurrentStadiumSaturation = kDefaultStadiumSaturation;
+    float gCurrentStadiumGamma = kDefaultStadiumGamma;
 
-    struct StadiumDornaConfig
+    struct StadiumConfigData
     {
         bool hasAdCount = false;
         int adCount = kDefaultAdCount;
@@ -164,6 +189,19 @@ namespace
 
         bool hasTransitionPeriod = false;
         float transitionPeriod = kDefaultTransitionSeconds;
+
+        bool hasCamera = false;
+        std::string camera;
+
+        bool hasStadiumColourScale = false;
+        float stadiumColourScale =
+            kDefaultStadiumBrightness;
+
+        bool hasStadiumLighting = false;
+        float stadiumBrightness = kDefaultStadiumBrightness;
+        float stadiumContrast = kDefaultStadiumContrast;
+        float stadiumSaturation = kDefaultStadiumSaturation;
+        float stadiumGamma = kDefaultStadiumGamma;
     };
 
     // ------------------------------------------------------------
@@ -684,9 +722,214 @@ namespace
         return true;
     }
 
-    bool LoadStadiumDornaConfig(
+    bool FindString(
+        const std::string& json,
+        const char* key,
+        std::string& outValue)
+    {
+        const std::string quotedKey =
+            std::string("\"") + key + "\"";
+
+        const size_t keyPos =
+            json.find(quotedKey);
+
+        if (keyPos == std::string::npos)
+            return false;
+
+        const size_t colonPos =
+            json.find(
+                ':',
+                keyPos + quotedKey.size()
+            );
+
+        if (colonPos == std::string::npos)
+            return false;
+
+        size_t position = colonPos + 1;
+
+        while (position < json.size() &&
+               std::isspace(
+                   static_cast<unsigned char>(
+                       json[position])))
+        {
+            ++position;
+        }
+
+        if (position >= json.size() ||
+            json[position] != '"')
+        {
+            return false;
+        }
+
+        ++position;
+        std::string value;
+
+        while (position < json.size())
+        {
+            const char c = json[position++];
+
+            if (c == '"')
+            {
+                outValue = value;
+                return true;
+            }
+
+            if (static_cast<unsigned char>(c) < 0x20)
+                return false;
+
+            if (c != '\\')
+            {
+                value.push_back(c);
+                continue;
+            }
+
+            if (position >= json.size())
+                return false;
+
+            const char escaped = json[position++];
+
+            switch (escaped)
+            {
+            case '"': value.push_back('"'); break;
+            case '\\': value.push_back('\\'); break;
+            case '/': value.push_back('/'); break;
+            case 'b': value.push_back('\b'); break;
+            case 'f': value.push_back('\f'); break;
+            case 'n': value.push_back('\n'); break;
+            case 'r': value.push_back('\r'); break;
+            case 't': value.push_back('\t'); break;
+            default:
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    bool NormalizeCameraPath(
+        const std::string& configuredPath,
+        std::string& outPath)
+    {
+        std::string path = configuredPath;
+
+        while (!path.empty() &&
+               std::isspace(
+                   static_cast<unsigned char>(
+                       path.back())))
+        {
+            path.pop_back();
+        }
+
+        size_t first = 0;
+
+        while (first < path.size() &&
+               std::isspace(
+                   static_cast<unsigned char>(
+                       path[first])))
+        {
+            ++first;
+        }
+
+        if (first)
+            path.erase(0, first);
+
+        std::replace(
+            path.begin(),
+            path.end(),
+            '/',
+            '\\'
+        );
+
+        if (path.size() <= 7 ||
+            path.find(':') != std::string::npos ||
+            path[0] == '\\')
+        {
+            return false;
+        }
+
+        for (char c : path)
+        {
+            const unsigned char uc =
+                static_cast<unsigned char>(c);
+
+            if (uc < 0x20 ||
+                c == '"' ||
+                c == '<' ||
+                c == '>' ||
+                c == '|' ||
+                c == '*' ||
+                c == '?')
+            {
+                return false;
+            }
+        }
+
+        const char assetsPrefix[] = "assets\\";
+
+        for (size_t i = 0;
+             i < sizeof(assetsPrefix) - 1;
+             ++i)
+        {
+            if (std::tolower(
+                    static_cast<unsigned char>(path[i])) !=
+                assetsPrefix[i])
+            {
+                return false;
+            }
+        }
+
+        size_t componentStart = 0;
+
+        while (componentStart <= path.size())
+        {
+            const size_t separator =
+                path.find('\\', componentStart);
+
+            const size_t componentLength =
+                (separator == std::string::npos)
+                    ? path.size() - componentStart
+                    : separator - componentStart;
+
+            if (componentLength == 2 &&
+                path[componentStart] == '.' &&
+                path[componentStart + 1] == '.')
+            {
+                return false;
+            }
+
+            if (separator == std::string::npos)
+                break;
+
+            componentStart = separator + 1;
+        }
+
+        if (path.size() < 4)
+            return false;
+
+        std::string extension =
+            path.substr(path.size() - 4);
+
+        std::transform(
+            extension.begin(),
+            extension.end(),
+            extension.begin(),
+            [](unsigned char c)
+            {
+                return static_cast<char>(
+                    std::tolower(c));
+            }
+        );
+
+        if (extension != ".mgd")
+            return false;
+
+        outPath = path;
+        return true;
+    }
+
+    bool LoadStadiumConfig(
         const std::string& stadiumId,
-        StadiumDornaConfig& outConfig)
+        StadiumConfigData& outConfig)
     {
         outConfig = {};
 
@@ -722,22 +965,172 @@ namespace
         std::ostringstream stream;
         stream << file.rdbuf();
 
+        const std::string json = stream.str();
+        std::string configuredCamera;
+
+        if (FindString(
+                json,
+                "camera",
+                configuredCamera))
+        {
+            std::string normalizedCamera;
+
+            if (NormalizeCameraPath(
+                    configuredCamera,
+                    normalizedCamera))
+            {
+                outConfig.hasCamera = true;
+                outConfig.camera = normalizedCamera;
+
+                Log(
+                    "  camera = %s",
+                    outConfig.camera.c_str()
+                );
+            }
+            else
+            {
+                Log(
+                    "  camera path rejected: %s",
+                    configuredCamera.c_str()
+                );
+            }
+        }
+
+        double value = 0.0;
+
+        if (FindNumber(
+                json,
+                "stadiumColourScale",
+                value))
+        {
+            if (value >= 0.0 && value <= 2.0)
+            {
+                outConfig.hasStadiumColourScale = true;
+                outConfig.stadiumColourScale =
+                    static_cast<float>(value);
+
+                Log(
+                    "  stadiumColourScale = %.4f",
+                    outConfig.stadiumColourScale
+                );
+            }
+            else
+            {
+                Log(
+                    "  stadiumColourScale rejected: %.4f (valid range 0.0-2.0)",
+                    value
+                );
+            }
+        }
+
+        std::string lightingBody;
+
+        if (FindObjectBody(
+                json,
+                "stadiumLighting",
+                lightingBody))
+        {
+            outConfig.hasStadiumLighting = true;
+
+            if (FindNumber(
+                    lightingBody,
+                    "brightness",
+                    value))
+            {
+                if (value >= 0.0 && value <= 2.0)
+                {
+                    outConfig.stadiumBrightness =
+                        static_cast<float>(value);
+                }
+                else
+                {
+                    Log(
+                        "  stadiumLighting.brightness rejected: %.4f (valid range 0.0-2.0)",
+                        value
+                    );
+                }
+            }
+
+            if (FindNumber(
+                    lightingBody,
+                    "contrast",
+                    value))
+            {
+                if (value >= 0.0 && value <= 2.0)
+                {
+                    outConfig.stadiumContrast =
+                        static_cast<float>(value);
+                }
+                else
+                {
+                    Log(
+                        "  stadiumLighting.contrast rejected: %.4f (valid range 0.0-2.0)",
+                        value
+                    );
+                }
+            }
+
+            if (FindNumber(
+                    lightingBody,
+                    "saturation",
+                    value))
+            {
+                if (value >= 0.0 && value <= 2.0)
+                {
+                    outConfig.stadiumSaturation =
+                        static_cast<float>(value);
+                }
+                else
+                {
+                    Log(
+                        "  stadiumLighting.saturation rejected: %.4f (valid range 0.0-2.0)",
+                        value
+                    );
+                }
+            }
+
+            if (FindNumber(
+                    lightingBody,
+                    "gamma",
+                    value))
+            {
+                if (value >= 0.1 && value <= 3.0)
+                {
+                    outConfig.stadiumGamma =
+                        static_cast<float>(value);
+                }
+                else
+                {
+                    Log(
+                        "  stadiumLighting.gamma rejected: %.4f (valid range 0.1-3.0)",
+                        value
+                    );
+                }
+            }
+
+            Log(
+                "  stadiumLighting = { brightness: %.4f, contrast: %.4f, saturation: %.4f, gamma: %.4f }",
+                outConfig.stadiumBrightness,
+                outConfig.stadiumContrast,
+                outConfig.stadiumSaturation,
+                outConfig.stadiumGamma
+            );
+        }
+
         std::string dornaBody;
 
         if (!FindObjectBody(
-                stream.str(),
+                json,
                 "dorna",
                 dornaBody))
         {
             Log(
-                "Config '%s' has no dorna object. Using EA defaults.",
+                "Config '%s' has no dorna object. Dorna uses EA defaults.",
                 stadiumId.c_str()
             );
 
             return true;
         }
-
-        double value = 0.0;
 
         if (FindNumber(
                 dornaBody,
@@ -1039,6 +1432,25 @@ namespace
                 stadiumShortName
             );
 
+        gCurrentCameraPath.clear();
+        gCurrentStadiumLightingEnabled = false;
+        gCurrentStadiumBrightness = kDefaultStadiumBrightness;
+        gCurrentStadiumContrast = kDefaultStadiumContrast;
+        gCurrentStadiumSaturation = kDefaultStadiumSaturation;
+        gCurrentStadiumGamma = kDefaultStadiumGamma;
+
+        if (gGame.game == GAME_2005)
+        {
+            SetArenaLightingStadiumLighting(
+                gCurrentStadiumId.c_str(),
+                false,
+                gCurrentStadiumBrightness,
+                gCurrentStadiumContrast,
+                gCurrentStadiumSaturation,
+                gCurrentStadiumGamma
+            );
+        }
+
         // Always reset first so a missing JSON cannot inherit
         // settings from the previous arena.
         RestoreDefaultDornaConfig();
@@ -1046,9 +1458,9 @@ namespace
         if (gCurrentStadiumId.empty())
             return;
 
-        StadiumDornaConfig config{};
+        StadiumConfigData config{};
 
-        if (!LoadStadiumDornaConfig(
+        if (!LoadStadiumConfig(
                 gCurrentStadiumId,
                 config))
         {
@@ -1071,6 +1483,42 @@ namespace
         {
             gCurrentTransitionSeconds =
                 config.transitionPeriod;
+        }
+
+        if (config.hasCamera)
+        {
+            gCurrentCameraPath =
+                config.camera;
+        }
+
+        if (config.hasStadiumLighting)
+        {
+            gCurrentStadiumLightingEnabled = true;
+            gCurrentStadiumBrightness = config.stadiumBrightness;
+            gCurrentStadiumContrast = config.stadiumContrast;
+            gCurrentStadiumSaturation = config.stadiumSaturation;
+            gCurrentStadiumGamma = config.stadiumGamma;
+        }
+        else if (config.hasStadiumColourScale)
+        {
+            // Backward-compatible alias for the earlier single-control test.
+            gCurrentStadiumLightingEnabled = true;
+            gCurrentStadiumBrightness = config.stadiumColourScale;
+            gCurrentStadiumContrast = 1.0f;
+            gCurrentStadiumSaturation = 1.0f;
+            gCurrentStadiumGamma = 1.0f;
+        }
+
+        if (gGame.game == GAME_2005)
+        {
+            SetArenaLightingStadiumLighting(
+                gCurrentStadiumId.c_str(),
+                gCurrentStadiumLightingEnabled,
+                gCurrentStadiumBrightness,
+                gCurrentStadiumContrast,
+                gCurrentStadiumSaturation,
+                gCurrentStadiumGamma
+            );
         }
 
         if (gCurrentTransitionSeconds >
@@ -1520,6 +1968,58 @@ namespace
 
 }
 
+
+bool ResolveStadiumCameraPath(
+    const char* stadiumId,
+    char* outPath,
+    size_t outPathSize)
+{
+    if (!outPath || outPathSize == 0)
+        return false;
+
+    outPath[0] = '\0';
+
+    const std::string normalizedId =
+        NormalizeStadiumId(stadiumId);
+
+    if (normalizedId.empty())
+        return false;
+
+    std::string cameraPath;
+
+    if (normalizedId == gCurrentStadiumId)
+    {
+        cameraPath = gCurrentCameraPath;
+    }
+    else
+    {
+        StadiumConfigData config{};
+
+        if (!LoadStadiumConfig(
+                normalizedId,
+                config) ||
+            !config.hasCamera)
+        {
+            return false;
+        }
+
+        cameraPath = config.camera;
+    }
+
+    if (cameraPath.empty() ||
+        cameraPath.size() + 1 > outPathSize)
+    {
+        return false;
+    }
+
+    strcpy_s(
+        outPath,
+        outPathSize,
+        cameraPath.c_str()
+    );
+
+    return true;
+}
 
 // ============================================================
 // Public entry point

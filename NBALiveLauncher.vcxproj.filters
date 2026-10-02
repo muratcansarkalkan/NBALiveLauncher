@@ -75,6 +75,15 @@
     <ClCompile Include="AntiAliasing.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="CustomCamera.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ArenaLighting.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CourtTextureRendering.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Resolutions.h">
@@ -111,6 +120,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AntiAliasing.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ResolutionMenuStrings.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

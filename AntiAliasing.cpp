@@ -36,6 +36,35 @@ unsigned int gRequestedSamples = 4;
 unsigned int gCreateDeviceCount = 0;
 unsigned int gResetCount = 0;
 
+// NBA Live 2005/06/07/08 supersampling v31.
+//
+// The swap chain remains at the normal game resolution. The game therefore
+// continues to report its native logical dimensions to UI/mouse code.
+//
+// While supersampling is active, attempts to bind the real backbuffer/depth
+// are transparently redirected to private 2x surfaces. Immediately before
+// Present(), the 2x color surface is downsampled to the real backbuffer.
+bool gSupersamplingEnabled = false;
+
+// Supersampling scale is stored as a rational number so 1.5x does not rely
+// on floating-point viewport/scissor rounding.
+// 100 = native, 150 = 1.5x, 200 = 2x.
+unsigned int gSupersamplingPercent = 200;
+unsigned int gSupersamplingScale = 2; // legacy/display convenience
+
+IDirect3DSurface9* gSsColor = nullptr;
+IDirect3DSurface9* gSsDepth = nullptr;
+IDirect3DSurface9* gSsRealBackBuffer = nullptr;
+IDirect3DSurface9* gSsRealDepth = nullptr;
+
+UINT gSsLogicalWidth = 0;
+UINT gSsLogicalHeight = 0;
+UINT gSsPhysicalWidth = 0;
+UINT gSsPhysicalHeight = 0;
+
+bool gSsInternalOperation = false;
+unsigned int gSsPresentCount = 0;
+
 bool gDebugLoggingEnabled = false;
 
 void InitializeDebugLogging()
@@ -113,6 +142,8 @@ typedef HRESULT (STDMETHODCALLTYPE* CreateDeviceFn)(
     D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
 typedef HRESULT (STDMETHODCALLTYPE* ResetFn)(
     IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+typedef HRESULT (STDMETHODCALLTYPE* PresentFn)(
+    IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 
 typedef HRESULT (STDMETHODCALLTYPE* CreateTextureFn)(
     IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
@@ -130,6 +161,10 @@ typedef HRESULT (STDMETHODCALLTYPE* SetRenderTargetFn)(
     IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
 typedef HRESULT (STDMETHODCALLTYPE* SetDepthStencilSurfaceFn)(
     IDirect3DDevice9*, IDirect3DSurface9*);
+typedef HRESULT (STDMETHODCALLTYPE* SetViewportFn)(
+    IDirect3DDevice9*, const D3DVIEWPORT9*);
+typedef HRESULT (STDMETHODCALLTYPE* SetScissorRectFn)(
+    IDirect3DDevice9*, const RECT*);
 
 typedef HRESULT (STDMETHODCALLTYPE* SetRenderStateFn)(
     IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);
@@ -146,6 +181,7 @@ typedef HRESULT (STDMETHODCALLTYPE* StateBlockApplyFn)(
 Direct3DCreate9Fn gOriginalDirect3DCreate9 = nullptr;
 CreateDeviceFn gOriginalCreateDevice = nullptr;
 ResetFn gOriginalReset = nullptr;
+PresentFn gOriginalPresent = nullptr;
 
 CreateTextureFn gOriginalCreateTexture = nullptr;
 CreateRenderTargetFn gOriginalCreateRenderTarget = nullptr;
@@ -153,6 +189,8 @@ CreateDepthStencilSurfaceFn gOriginalCreateDepthStencilSurface = nullptr;
 StretchRectFn gOriginalStretchRect = nullptr;
 SetRenderTargetFn gOriginalSetRenderTarget = nullptr;
 SetDepthStencilSurfaceFn gOriginalSetDepthStencilSurface = nullptr;
+SetViewportFn gOriginalSetViewport = nullptr;
+SetScissorRectFn gOriginalSetScissorRect = nullptr;
 
 SetRenderStateFn gOriginalSetRenderState = nullptr;
 unsigned int gMsaaStateWriteCount = 0;
@@ -461,13 +499,20 @@ void ApplyMsaa(
 }
 
 
+void HookD3D9CreateDevice(IDirect3D9* d3d);
+void HookDeviceReset(IDirect3DDevice9* device);
+void HookRenderTargetMethods(IDirect3DDevice9* device);
+
 IDirect3D9* __cdecl PrepareCreateDevice07()
 {
     IDirect3D9* d3d =
         *reinterpret_cast<IDirect3D9**>(kLive07D3D9Ptr);
 
-    if (!gEnabled || !d3d)
+    if ((!gEnabled && !gSupersamplingEnabled) || !d3d)
         return d3d;
+
+    if (gSupersamplingEnabled)
+        HookD3D9CreateDevice(d3d);
 
     D3DPRESENT_PARAMETERS* pp =
         reinterpret_cast<D3DPRESENT_PARAMETERS*>(kLive07PresentParams);
@@ -491,8 +536,13 @@ IDirect3DDevice9* __cdecl PrepareReset07()
     IDirect3DDevice9* device =
         *reinterpret_cast<IDirect3DDevice9**>(kLive07DevicePtr);
 
-    if (!gEnabled || !device)
+    if ((!gEnabled && !gSupersamplingEnabled) || !device)
         return device;
+
+    if (gSupersamplingEnabled) {
+        HookDeviceReset(device);
+        HookRenderTargetMethods(device);
+    }
 
     IDirect3D9* d3d = nullptr;
     D3DDEVICE_CREATION_PARAMETERS cp = {};
@@ -525,8 +575,11 @@ IDirect3D9* __cdecl PrepareCreateDevice05()
     IDirect3D9* d3d =
         *reinterpret_cast<IDirect3D9**>(kLive05D3D9Ptr);
 
-    if (!gEnabled || !d3d)
+    if ((!gEnabled && !gSupersamplingEnabled) || !d3d)
         return d3d;
+
+    if (gSupersamplingEnabled)
+        HookD3D9CreateDevice(d3d);
 
     D3DPRESENT_PARAMETERS* pp =
         reinterpret_cast<D3DPRESENT_PARAMETERS*>(kLive05PresentParams);
@@ -550,8 +603,13 @@ IDirect3DDevice9* __cdecl PrepareReset05()
     IDirect3DDevice9* device =
         *reinterpret_cast<IDirect3DDevice9**>(kLive05DevicePtr);
 
-    if (!gEnabled || !device)
+    if ((!gEnabled && !gSupersamplingEnabled) || !device)
         return device;
+
+    if (gSupersamplingEnabled) {
+        HookDeviceReset(device);
+        HookRenderTargetMethods(device);
+    }
 
     IDirect3D9* d3d = nullptr;
     D3DDEVICE_CREATION_PARAMETERS cp = {};
@@ -582,8 +640,11 @@ IDirect3D9* __cdecl PrepareCreateDevice08()
     IDirect3D9* d3d =
         *reinterpret_cast<IDirect3D9**>(kLive08D3D9Ptr);
 
-    if (!gEnabled || !d3d)
+    if ((!gEnabled && !gSupersamplingEnabled) || !d3d)
         return d3d;
+
+    if (gSupersamplingEnabled)
+        HookD3D9CreateDevice(d3d);
 
     D3DPRESENT_PARAMETERS* pp =
         reinterpret_cast<D3DPRESENT_PARAMETERS*>(kLive08PresentParams);
@@ -607,8 +668,13 @@ IDirect3DDevice9* __cdecl PrepareReset08()
     IDirect3DDevice9* device =
         *reinterpret_cast<IDirect3DDevice9**>(kLive08DevicePtr);
 
-    if (!gEnabled || !device)
+    if ((!gEnabled && !gSupersamplingEnabled) || !device)
         return device;
+
+    if (gSupersamplingEnabled) {
+        HookDeviceReset(device);
+        HookRenderTargetMethods(device);
+    }
 
     IDirect3D9* d3d = nullptr;
     D3DDEVICE_CREATION_PARAMETERS cp = {};
@@ -760,11 +826,13 @@ bool InstallLive07DirectMsaaHooks()
             ok = false;
     }
 
-    if (!PatchLive07NativeMsaaRestore())
-        ok = false;
+    if (gEnabled) {
+        if (!PatchLive07NativeMsaaRestore())
+            ok = false;
+    }
 
     if (ok) {
-        Log("NBA Live 07 direct MSAA hooks installed without touching D3D9 COM vtables.");
+        Log("NBA Live 07 direct graphics prep hooks installed.");
     }
 
     return ok;
@@ -851,11 +919,13 @@ bool InstallLive05DirectMsaaHooks()
             ok = false;
     }
 
-    if (!PatchLive05NativeMsaaRestore())
-        ok = false;
+    if (gEnabled) {
+        if (!PatchLive05NativeMsaaRestore())
+            ok = false;
+    }
 
     if (ok) {
-        Log("NBA Live 2005 direct MSAA hooks installed without touching D3D9 COM vtables.");
+        Log("NBA Live 2005 direct graphics prep hooks installed.");
     }
 
     return ok;
@@ -940,15 +1010,406 @@ bool InstallLive08DirectMsaaHooks()
             ok = false;
     }
 
-    if (!PatchLive08NativeMsaaRestore())
-        ok = false;
+    if (gEnabled) {
+        if (!PatchLive08NativeMsaaRestore())
+            ok = false;
+    }
 
     if (ok) {
-        Log("NBA Live 08 direct MSAA hooks installed without touching D3D9 COM vtables.");
+        Log("NBA Live 08 direct graphics prep hooks installed.");
     }
 
     return ok;
 }
+
+
+UINT ScaleSsDimension(UINT value)
+{
+    return static_cast<UINT>(
+        (static_cast<unsigned long long>(value) *
+         gSupersamplingPercent + 99ull) / 100ull);
+}
+
+LONG ScaleSsCoordSigned(LONG value)
+{
+    if (value <= 0)
+        return value;
+
+    return static_cast<LONG>(
+        (static_cast<long long>(value) *
+         static_cast<long long>(gSupersamplingPercent) + 99ll) / 100ll);
+}
+
+DWORD ScaleSsCoordUnsigned(DWORD value)
+{
+    return static_cast<DWORD>(
+        (static_cast<unsigned long long>(value) *
+         gSupersamplingPercent + 99ull) / 100ull);
+}
+
+void ReleaseSupersamplingResources()
+{
+    if (gSsColor) {
+        gSsColor->Release();
+        gSsColor = nullptr;
+    }
+
+    if (gSsDepth) {
+        gSsDepth->Release();
+        gSsDepth = nullptr;
+    }
+
+    if (gSsRealBackBuffer) {
+        gSsRealBackBuffer->Release();
+        gSsRealBackBuffer = nullptr;
+    }
+
+    if (gSsRealDepth) {
+        gSsRealDepth->Release();
+        gSsRealDepth = nullptr;
+    }
+
+    gSsLogicalWidth = 0;
+    gSsLogicalHeight = 0;
+    gSsPhysicalWidth = 0;
+    gSsPhysicalHeight = 0;
+    gSsInternalOperation = false;
+}
+
+bool IsSameSurface(
+    IDirect3DSurface9* a,
+    IDirect3DSurface9* b)
+{
+    return a != nullptr && b != nullptr && a == b;
+}
+
+void SetSupersampledViewport(IDirect3DDevice9* device)
+{
+    if (!device ||
+        !gSupersamplingEnabled ||
+        gSsPhysicalWidth == 0 ||
+        gSsPhysicalHeight == 0)
+        return;
+
+    D3DVIEWPORT9 vp = {};
+    vp.X = 0;
+    vp.Y = 0;
+    vp.Width = gSsPhysicalWidth;
+    vp.Height = gSsPhysicalHeight;
+    vp.MinZ = 0.0f;
+    vp.MaxZ = 1.0f;
+
+    gSsInternalOperation = true;
+    if (gOriginalSetViewport)
+        gOriginalSetViewport(device, &vp);
+    else
+        device->SetViewport(&vp);
+    gSsInternalOperation = false;
+}
+
+bool BindSupersamplingTargets(IDirect3DDevice9* device)
+{
+    if (!device ||
+        !gSupersamplingEnabled ||
+        !gSsColor)
+        return false;
+
+    gSsInternalOperation = true;
+
+    HRESULT rtHr = gOriginalSetRenderTarget
+        ? gOriginalSetRenderTarget(device, 0, gSsColor)
+        : device->SetRenderTarget(0, gSsColor);
+
+    HRESULT depthHr = D3D_OK;
+    if (gSsDepth) {
+        depthHr = gOriginalSetDepthStencilSurface
+            ? gOriginalSetDepthStencilSurface(device, gSsDepth)
+            : device->SetDepthStencilSurface(gSsDepth);
+    }
+
+    gSsInternalOperation = false;
+
+    if (FAILED(rtHr) || FAILED(depthHr)) {
+        Log("SSAA: BindSupersamplingTargets failed rt=0x%08lX depth=0x%08lX.",
+            (unsigned long)rtHr,
+            (unsigned long)depthHr);
+        return false;
+    }
+
+    SetSupersampledViewport(device);
+    return true;
+}
+
+bool CreateSupersamplingResources(IDirect3DDevice9* device)
+{
+    if (!gSupersamplingEnabled ||
+        (gGame != LiveGame::Live05 &&
+         gGame != LiveGame::Live06 &&
+         gGame != LiveGame::Live07 &&
+         gGame != LiveGame::Live08) ||
+        !device)
+        return false;
+
+    ReleaseSupersamplingResources();
+
+    HRESULT hr = device->GetBackBuffer(
+        0,
+        0,
+        D3DBACKBUFFER_TYPE_MONO,
+        &gSsRealBackBuffer);
+
+    if (FAILED(hr) || !gSsRealBackBuffer) {
+        Log("SSAA: GetBackBuffer failed hr=0x%08lX.",
+            (unsigned long)hr);
+        ReleaseSupersamplingResources();
+        return false;
+    }
+
+    D3DSURFACE_DESC colorDesc = {};
+    hr = gSsRealBackBuffer->GetDesc(&colorDesc);
+    if (FAILED(hr)) {
+        Log("SSAA: backbuffer GetDesc failed hr=0x%08lX.",
+            (unsigned long)hr);
+        ReleaseSupersamplingResources();
+        return false;
+    }
+
+    // v26 intentionally requires a non-MSAA real backbuffer. Mixing the
+    // supersampling resolve with the game's old MSAA swap chain adds another
+    // incompatible resolve step. Supersampling is tested independently first.
+    if (colorDesc.MultiSampleType != D3DMULTISAMPLE_NONE) {
+        Log("SSAA: real backbuffer is already multisampled (%s); v26 requires ANTI_ALIASING=0.",
+            SampleName(colorDesc.MultiSampleType));
+        ReleaseSupersamplingResources();
+        return false;
+    }
+
+    gSsLogicalWidth = colorDesc.Width;
+    gSsLogicalHeight = colorDesc.Height;
+    gSsPhysicalWidth = ScaleSsDimension(colorDesc.Width);
+    gSsPhysicalHeight = ScaleSsDimension(colorDesc.Height);
+
+    D3DCAPS9 caps = {};
+    hr = device->GetDeviceCaps(&caps);
+    if (FAILED(hr) ||
+        gSsPhysicalWidth > caps.MaxTextureWidth ||
+        gSsPhysicalHeight > caps.MaxTextureHeight)
+    {
+        Log("SSAA: requested %ux%u exceeds device caps.",
+            gSsPhysicalWidth,
+            gSsPhysicalHeight);
+        ReleaseSupersamplingResources();
+        return false;
+    }
+
+    hr = device->CreateRenderTarget(
+        gSsPhysicalWidth,
+        gSsPhysicalHeight,
+        colorDesc.Format,
+        D3DMULTISAMPLE_NONE,
+        0,
+        FALSE,
+        &gSsColor,
+        nullptr);
+
+    if (FAILED(hr) || !gSsColor) {
+        Log("SSAA: CreateRenderTarget %ux%u fmt=%lu failed hr=0x%08lX.",
+            gSsPhysicalWidth,
+            gSsPhysicalHeight,
+            (unsigned long)colorDesc.Format,
+            (unsigned long)hr);
+        ReleaseSupersamplingResources();
+        return false;
+    }
+
+    hr = device->GetDepthStencilSurface(&gSsRealDepth);
+    if (SUCCEEDED(hr) && gSsRealDepth) {
+        D3DSURFACE_DESC depthDesc = {};
+
+        if (SUCCEEDED(gSsRealDepth->GetDesc(&depthDesc))) {
+            hr = device->CreateDepthStencilSurface(
+                gSsPhysicalWidth,
+                gSsPhysicalHeight,
+                depthDesc.Format,
+                D3DMULTISAMPLE_NONE,
+                0,
+                TRUE,
+                &gSsDepth,
+                nullptr);
+
+            if (FAILED(hr) || !gSsDepth) {
+                Log("SSAA: CreateDepthStencilSurface %ux%u fmt=%lu failed hr=0x%08lX.",
+                    gSsPhysicalWidth,
+                    gSsPhysicalHeight,
+                    (unsigned long)depthDesc.Format,
+                    (unsigned long)hr);
+                ReleaseSupersamplingResources();
+                return false;
+            }
+        }
+    }
+
+    Log("SSAA: resources ready: game/backbuffer=%ux%u private=%ux%u.",
+        gSsLogicalWidth,
+        gSsLogicalHeight,
+        gSsPhysicalWidth,
+        gSsPhysicalHeight);
+
+    return BindSupersamplingTargets(device);
+}
+
+HRESULT STDMETHODCALLTYPE HookSetViewportSSAA(
+    IDirect3DDevice9* self,
+    const D3DVIEWPORT9* viewport)
+{
+    if (!gOriginalSetViewport)
+        return D3DERR_INVALIDCALL;
+
+    if (gSsInternalOperation ||
+        !gSupersamplingEnabled ||
+        !viewport ||
+        gSsLogicalWidth == 0 ||
+        gSsLogicalHeight == 0)
+    {
+        return gOriginalSetViewport(self, viewport);
+    }
+
+    D3DVIEWPORT9 scaled = *viewport;
+
+    // Scale coordinates only when the game is expressing them in its normal
+    // logical backbuffer coordinate system.
+    if (viewport->X + viewport->Width <= gSsLogicalWidth &&
+        viewport->Y + viewport->Height <= gSsLogicalHeight)
+    {
+        scaled.X = ScaleSsCoordUnsigned(viewport->X);
+        scaled.Y = ScaleSsCoordUnsigned(viewport->Y);
+        scaled.Width = ScaleSsDimension(viewport->Width);
+        scaled.Height = ScaleSsDimension(viewport->Height);
+    }
+
+    return gOriginalSetViewport(self, &scaled);
+}
+
+HRESULT STDMETHODCALLTYPE HookSetScissorRectSSAA(
+    IDirect3DDevice9* self,
+    const RECT* rect)
+{
+    if (!gOriginalSetScissorRect)
+        return D3DERR_INVALIDCALL;
+
+    if (gSsInternalOperation ||
+        !gSupersamplingEnabled ||
+        !rect ||
+        gSsLogicalWidth == 0 ||
+        gSsLogicalHeight == 0)
+    {
+        return gOriginalSetScissorRect(self, rect);
+    }
+
+    RECT scaled = *rect;
+
+    if (rect->left >= 0 &&
+        rect->top >= 0 &&
+        rect->right >= rect->left &&
+        rect->bottom >= rect->top &&
+        static_cast<UINT>(rect->right) <= gSsLogicalWidth &&
+        static_cast<UINT>(rect->bottom) <= gSsLogicalHeight)
+    {
+        scaled.left = ScaleSsCoordSigned(rect->left);
+        scaled.top = ScaleSsCoordSigned(rect->top);
+        scaled.right = ScaleSsCoordSigned(rect->right);
+        scaled.bottom = ScaleSsCoordSigned(rect->bottom);
+    }
+
+    return gOriginalSetScissorRect(self, &scaled);
+}
+
+HRESULT STDMETHODCALLTYPE HookPresentSSAA(
+    IDirect3DDevice9* self,
+    const RECT* sourceRect,
+    const RECT* destRect,
+    HWND destWindowOverride,
+    const RGNDATA* dirtyRegion)
+{
+    ++gSsPresentCount;
+
+    if (gSupersamplingEnabled &&
+        gSsColor &&
+        gSsRealBackBuffer)
+    {
+        // Bypass our SetRenderTarget substitution while doing the resolve.
+        gSsInternalOperation = true;
+
+        HRESULT rtHr = gOriginalSetRenderTarget
+            ? gOriginalSetRenderTarget(self, 0, gSsRealBackBuffer)
+            : self->SetRenderTarget(0, gSsRealBackBuffer);
+
+        if (gSsRealDepth) {
+            if (gOriginalSetDepthStencilSurface)
+                gOriginalSetDepthStencilSurface(self, gSsRealDepth);
+            else
+                self->SetDepthStencilSurface(gSsRealDepth);
+        }
+
+        D3DVIEWPORT9 logicalVp = {};
+        logicalVp.X = 0;
+        logicalVp.Y = 0;
+        logicalVp.Width = gSsLogicalWidth;
+        logicalVp.Height = gSsLogicalHeight;
+        logicalVp.MinZ = 0.0f;
+        logicalVp.MaxZ = 1.0f;
+
+        if (gOriginalSetViewport)
+            gOriginalSetViewport(self, &logicalVp);
+
+        // Actual SSAA resolve: high-resolution scene -> normal backbuffer.
+        HRESULT stretchHr = gOriginalStretchRect
+            ? gOriginalStretchRect(
+                self,
+                gSsColor,
+                nullptr,
+                gSsRealBackBuffer,
+                nullptr,
+                D3DTEXF_LINEAR)
+            : self->StretchRect(
+                gSsColor,
+                nullptr,
+                gSsRealBackBuffer,
+                nullptr,
+                D3DTEXF_LINEAR);
+
+        gSsInternalOperation = false;
+
+        if (gSsPresentCount <= 10 || FAILED(stretchHr)) {
+            Log("SSAA Present #%u: restoreRT=0x%08lX resolve=0x%08lX.",
+                gSsPresentCount,
+                (unsigned long)rtHr,
+                (unsigned long)stretchHr);
+        }
+    }
+
+    HRESULT hr = gOriginalPresent
+        ? gOriginalPresent(
+            self,
+            sourceRect,
+            destRect,
+            destWindowOverride,
+            dirtyRegion)
+        : D3DERR_INVALIDCALL;
+
+    // Prepare the private surfaces again for the next frame. This happens
+    // after Present, so Clear calls issued before BeginScene also hit the
+    // supersampled color/depth surfaces.
+    if (SUCCEEDED(hr) &&
+        gSupersamplingEnabled &&
+        gSsColor)
+    {
+        BindSupersamplingTargets(self);
+    }
+
+    return hr;
+}
+
 
 void ProbeDevice(const char* reason, IDirect3DDevice9* device)
 {
@@ -1149,6 +1610,18 @@ HRESULT STDMETHODCALLTYPE HookSetRenderTarget(
         }
     }
 
+    if (!gSsInternalOperation &&
+        gSupersamplingEnabled &&
+        index == 0 &&
+        IsSameSurface(surface, gSsRealBackBuffer) &&
+        gSsColor)
+    {
+        Log("SSAA: substituting real backbuffer bind with private %ux%u target.",
+            gSsPhysicalWidth,
+            gSsPhysicalHeight);
+        return gOriginalSetRenderTarget(self, index, gSsColor);
+    }
+
     return gOriginalSetRenderTarget(self, index, surface);
 }
 
@@ -1163,6 +1636,17 @@ HRESULT STDMETHODCALLTYPE HookSetDepthStencilSurface(
             Log("SetDepthStencilSurface main-sized=%s",
                 IsMainSizedSurface(self, surface) ? "yes" : "no");
         }
+    }
+
+    if (!gSsInternalOperation &&
+        gSupersamplingEnabled &&
+        IsSameSurface(surface, gSsRealDepth) &&
+        gSsDepth)
+    {
+        Log("SSAA: substituting real depth bind with private %ux%u depth.",
+            gSsPhysicalWidth,
+            gSsPhysicalHeight);
+        return gOriginalSetDepthStencilSurface(self, gSsDepth);
     }
 
     return gOriginalSetDepthStencilSurface(self, surface);
@@ -1207,10 +1691,14 @@ HRESULT STDMETHODCALLTYPE HookSetRenderState(
     if (state == D3DRS_MULTISAMPLEANTIALIAS) {
         ++gMsaaStateWriteCount;
 
-        Log("SetRenderState MSAA write #%u: requested=%lu (%s)",
-            gMsaaStateWriteCount,
-            (unsigned long)value,
-            value ? "ON" : "OFF");
+        // Avoid turning debug logging itself into a frame-time cost while
+        // supersampling is being tested without MSAA.
+        if (gEnabled || gMsaaStateWriteCount <= 16) {
+            Log("SetRenderState MSAA write #%u: requested=%lu (%s)",
+                gMsaaStateWriteCount,
+                (unsigned long)value,
+                value ? "ON" : "OFF");
+        }
 
         if (gEnabled && value == FALSE) {
             Log("SetRenderState MSAA write #%u: overriding OFF -> ON",
@@ -1376,6 +1864,11 @@ void HookRenderTargetMethods(IDirect3DDevice9* device)
     if (!device)
         return;
 
+    Log("Device hook profile: %s",
+        gEnabled
+            ? "MSAA full"
+            : (gSupersamplingEnabled ? "SSAA minimal" : "none"));
+
     void** vtbl = *reinterpret_cast<void***>(device);
 
     struct HookSpec {
@@ -1386,6 +1879,8 @@ void HookRenderTargetMethods(IDirect3DDevice9* device)
     };
 
     HookSpec specs[] = {
+        { 17, reinterpret_cast<void*>(&HookPresentSSAA),
+          reinterpret_cast<void**>(&gOriginalPresent), "Present" },
         { 23, reinterpret_cast<void*>(&HookCreateTexture),
           reinterpret_cast<void**>(&gOriginalCreateTexture), "CreateTexture" },
         { 28, reinterpret_cast<void*>(&HookCreateRenderTarget),
@@ -1398,6 +1893,8 @@ void HookRenderTargetMethods(IDirect3DDevice9* device)
           reinterpret_cast<void**>(&gOriginalSetRenderTarget), "SetRenderTarget" },
         { 39, reinterpret_cast<void*>(&HookSetDepthStencilSurface),
           reinterpret_cast<void**>(&gOriginalSetDepthStencilSurface), "SetDepthStencilSurface" },
+        { 47, reinterpret_cast<void*>(&HookSetViewportSSAA),
+          reinterpret_cast<void**>(&gOriginalSetViewport), "SetViewport" },
         { 57, reinterpret_cast<void*>(&HookSetRenderState),
           reinterpret_cast<void**>(&gOriginalSetRenderState), "SetRenderState" },
         { 59, reinterpret_cast<void*>(&HookCreateStateBlock),
@@ -1406,9 +1903,38 @@ void HookRenderTargetMethods(IDirect3DDevice9* device)
           reinterpret_cast<void**>(&gOriginalBeginStateBlock), "BeginStateBlock" },
         { 61, reinterpret_cast<void*>(&HookEndStateBlock),
           reinterpret_cast<void**>(&gOriginalEndStateBlock), "EndStateBlock" },
+        { 75, reinterpret_cast<void*>(&HookSetScissorRectSSAA),
+          reinterpret_cast<void**>(&gOriginalSetScissorRect), "SetScissorRect" },
     };
 
     for (const HookSpec& spec : specs) {
+        bool needed = false;
+
+        // Preserve the original MSAA path exactly: when MSAA is enabled,
+        // install every existing renderer/state diagnostic and repair hook.
+        if (gEnabled) {
+            needed = true;
+        }
+        // SSAA does not depend on the MSAA state machinery. It only needs
+        // the methods involved in frame presentation, main target/depth
+        // substitution, and logical -> supersampled viewport/scissor mapping.
+        else if (gSupersamplingEnabled) {
+            switch (spec.index) {
+            case 17: // Present
+            case 37: // SetRenderTarget
+            case 39: // SetDepthStencilSurface
+            case 47: // SetViewport
+            case 75: // SetScissorRect
+                needed = true;
+                break;
+            default:
+                break;
+            }
+        }
+
+        if (!needed)
+            continue;
+
         void** slot = &vtbl[spec.index];
 
         if (*slot == spec.replacement)
@@ -1553,8 +2079,18 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(
 
     if (SUCCEEDED(hr) && device) {
         HookDeviceReset(device);
-        HookRenderTargetMethods(device);
-        device->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, TRUE);
+
+        if (gEnabled || gSupersamplingEnabled)
+            HookRenderTargetMethods(device);
+
+        if (gEnabled)
+            device->SetRenderState(
+                D3DRS_MULTISAMPLEANTIALIAS,
+                TRUE);
+
+        if (gSupersamplingEnabled)
+            CreateSupersamplingResources(device);
+
         ProbeDevice("CreateDevice ACTUAL", device);
     }
 
@@ -1566,6 +2102,9 @@ HRESULT STDMETHODCALLTYPE HookReset(
     D3DPRESENT_PARAMETERS* pp)
 {
     ++gResetCount;
+
+    if (gSupersamplingEnabled)
+        ReleaseSupersamplingResources();
     Log("Reset #%u intercepted: device=%p", gResetCount, self);
 
     IDirect3D9* d3d = nullptr;
@@ -1596,7 +2135,14 @@ HRESULT STDMETHODCALLTYPE HookReset(
     Log("Reset #%u returned hr=0x%08lX", gResetCount, (unsigned long)hr);
 
     if (SUCCEEDED(hr)) {
-        self->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, TRUE);
+        if (gEnabled)
+            self->SetRenderState(
+                D3DRS_MULTISAMPLEANTIALIAS,
+                TRUE);
+
+        if (gSupersamplingEnabled)
+            CreateSupersamplingResources(self);
+
         ProbeDevice("Reset ACTUAL", self);
     }
 
@@ -2775,59 +3321,65 @@ LiveGame DetectGame()
 {
     const uintptr_t ep = FM::GetEntryPoint();
 
-    // NBA Live 2005 uses a different executable entry point. Verify the
-    // renderer and screenshot signatures instead of relying on 06-08 markers.
-    if (ep == 0x00CD8005) {
-        const BYTE live05CreateSig[5] = {
-            0xA1, 0xD0, 0x6C, 0xC5, 0x00
-        };
-        const BYTE live05ScreenshotSig[6] = {
-            0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8
-        };
+    // NBA Live 2005.
+    //
+    // Confirmed executable entry point:
+    //     0x00CD8005
+    //
+    // Prefer the entry point because renderer instructions can already have
+    // been touched by another launcher component before this module starts.
+    if (ep == 0x00CD8005)
+        return LiveGame::Live05;
 
+    const BYTE live05CreateSig[5] = {
+        0xA1, 0xD0, 0x6C, 0xC5, 0x00
+    };
+
+    __try {
         if (std::memcmp(
                 reinterpret_cast<const void*>(0x006DBA24),
                 live05CreateSig,
-                sizeof(live05CreateSig)) == 0 &&
-            std::memcmp(
-                reinterpret_cast<const void*>(kLive05TakeScreenshot),
-                live05ScreenshotSig,
-                sizeof(live05ScreenshotSig)) == 0)
+                sizeof(live05CreateSig)) == 0)
         {
             return LiveGame::Live05;
         }
-
-        return LiveGame::Unknown;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 
-    if (ep != 0x40109F)
-        return LiveGame::Unknown;
+    // NBA Live 06, 07 and 08 supported builds share 0x0040109F.
+    //
+    // 06 and 07 have established unique 4:3 float markers. 08 is the
+    // remaining supported title with this entry point. This is intentionally
+    // checked before relying on renderer instructions because those
+    // instructions can already be patched by other launcher components.
+    if (ep == 0x0040109F) {
+        if (patch::GetFloat(0xBD832C) == 1.3333334f)
+            return LiveGame::Live06;
 
-    // NBA Live 08 1.0 NOCD: verify two independent renderer signatures.
-    const BYTE live08CreateSig[5] = {
-        0xA1, 0x70, 0x50, 0xD8, 0x00
-    };
-    const BYTE live08ScreenshotSig[6] = {
-        0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8
-    };
+        if (patch::GetFloat(0xBBBC3C) == 1.3333334f)
+            return LiveGame::Live07;
 
-    if (std::memcmp(
-            reinterpret_cast<const void*>(0x0042C773),
-            live08CreateSig,
-            sizeof(live08CreateSig)) == 0 &&
-        std::memcmp(
-            reinterpret_cast<const void*>(kLive08TakeScreenshot),
-            live08ScreenshotSig,
-            sizeof(live08ScreenshotSig)) == 0)
-    {
         return LiveGame::Live08;
     }
 
-    if (patch::GetFloat(0xBD832C) == 1.3333334f)
-        return LiveGame::Live06;
+    // Secondary Live 08 signature for builds where the entry point differs
+    // but the known renderer layout is still present.
+    const BYTE live08CreateSig[5] = {
+        0xA1, 0x70, 0x50, 0xD8, 0x00
+    };
 
-    if (patch::GetFloat(0xBBBC3C) == 1.3333334f)
-        return LiveGame::Live07;
+    __try {
+        if (std::memcmp(
+                reinterpret_cast<const void*>(0x0042C773),
+                live08CreateSig,
+                sizeof(live08CreateSig)) == 0)
+        {
+            return LiveGame::Live08;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
 
     return LiveGame::Unknown;
 }
@@ -2855,7 +3407,15 @@ void InitializeAntiAliasing()
             std::remove(logPath);
     }
 
-    Log("InitializeAntiAliasing v24 direct 2005/06/07/08 + independent screenshots entered.");
+    Log("InitializeAntiAliasing v31 + Live05/06/07/08 Present-time supersampling entered.");
+    Log("Executable entry point = %08lX.",
+        (unsigned long)FM::GetEntryPoint());
+
+    if (FM::GetEntryPoint() == 0x0040109F) {
+        Log("Shared 06/07/08 markers: Live06=%0.7f Live07=%0.7f",
+            patch::GetFloat(0xBD832C),
+            patch::GetFloat(0xBBBC3C));
+    }
 
     gGame = DetectGame();
     if (gGame == LiveGame::Unknown) {
@@ -2897,42 +3457,106 @@ void InitializeAntiAliasing()
         enabled,
         samples);
 
-    if (enabled != 1) {
-        gEnabled = false;
-        Log("MSAA disabled; rewritten screenshot path remains active.");
-        return;
+    const int supersampling = GetPrivateProfileIntA(
+        "DISPLAY",
+        "SUPERSAMPLING",
+        0,
+        ".\\main.ini");
+
+    int supersamplePercent = GetPrivateProfileIntA(
+        "DISPLAY",
+        "SUPERSAMPLE_PERCENT",
+        0,
+        ".\\main.ini");
+
+    // Backward compatibility with the earlier SUPERSAMPLE_SCALE=2 setting.
+    if (supersamplePercent == 0) {
+        int legacyScale = GetPrivateProfileIntA(
+            "DISPLAY",
+            "SUPERSAMPLE_SCALE",
+            2,
+            ".\\main.ini");
+
+        supersamplePercent =
+            legacyScale == 1 ? 100 : 200;
     }
 
-    if (samples != 2 &&
-        samples != 4 &&
-        samples != 8 &&
-        samples != 16)
-        samples = 4;
+    // Supported quality/performance points for now.
+    if (supersamplePercent != 125 &&
+        supersamplePercent != 150 &&
+        supersamplePercent != 175 &&
+        supersamplePercent != 200)
+    {
+        supersamplePercent = 200;
+    }
 
-    gEnabled = true;
-    gRequestedSamples =
-        static_cast<unsigned int>(samples);
+    gSupersamplingPercent =
+        static_cast<unsigned int>(supersamplePercent);
+
+    gSupersamplingScale =
+        gSupersamplingPercent / 100;
+
+    gSupersamplingEnabled =
+        supersampling == 1 &&
+        (gGame == LiveGame::Live05 ||
+         gGame == LiveGame::Live06 ||
+         gGame == LiveGame::Live07 ||
+         gGame == LiveGame::Live08);
+
+    Log("main.ini: SUPERSAMPLING=%d SUPERSAMPLE_PERCENT=%u",
+        supersampling,
+        gSupersamplingPercent);
+
+    // v31 deliberately tests SSAA without the old MSAA swap chain. This keeps
+    // the final downsample legal and isolates whether spatial supersampling
+    // actually solves the court texture edge.
+    if (gSupersamplingEnabled) {
+        if (enabled == 1) {
+            Log("SSAA v31: ANTI_ALIASING=1 requested too; disabling MSAA for this run. Test SSAA independently.");
+        }
+        gEnabled = false;
+    }
+    else if (enabled == 1) {
+        if (samples != 2 &&
+            samples != 4 &&
+            samples != 8 &&
+            samples != 16)
+            samples = 4;
+
+        gEnabled = true;
+        gRequestedSamples =
+            static_cast<unsigned int>(samples);
+    }
+    else {
+        gEnabled = false;
+        Log("MSAA disabled; rewritten screenshot path remains active.");
+    }
 
     if (gGame == LiveGame::Live05) {
-        // Direct game-owned renderer patches only.
-        InstallLive05DirectMsaaHooks();
+        if (gEnabled || gSupersamplingEnabled)
+            InstallLive05DirectMsaaHooks();
         return;
     }
 
     if (gGame == LiveGame::Live07) {
-        // Direct game-owned renderer patches only.
-        InstallLive07DirectMsaaHooks();
+        if (gEnabled || gSupersamplingEnabled)
+            InstallLive07DirectMsaaHooks();
         return;
     }
 
     if (gGame == LiveGame::Live08) {
-        // Direct game-owned renderer patches only.
-        InstallLive08DirectMsaaHooks();
+        if (gEnabled || gSupersamplingEnabled)
+            InstallLive08DirectMsaaHooks();
         return;
     }
 
-    // NBA Live 06: retain the proven MSAA implementation.
-    PatchNativeMsaaRestore();
+    if (!gEnabled && !gSupersamplingEnabled) {
+        Log("No D3D9 AA feature enabled.");
+        return;
+    }
+
+    if (gEnabled)
+        PatchNativeMsaaRestore();
 
     void* original = nullptr;
     bool ok = HookImport(

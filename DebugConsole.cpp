@@ -24,6 +24,7 @@ HANDLE g_console = nullptr;
 CRITICAL_SECTION g_consoleLock;
 bool g_lockReady = false;
 volatile LONG g_debugConsoleInitState = 0;
+const char kFilteredAssetSentinel[] = "__nbl_filtered_asset__|";
 
 using CreateFileA_t = HANDLE (WINAPI *)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using CreateFileW_t = HANDLE (WINAPI *)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
@@ -251,6 +252,7 @@ void ForgetHandle(HANDLE h) {
 
 void PrintFileResult(const char* path, HANDLE result, DWORD error, void* caller) {
     if (!g_files) return;
+    if (path && std::strstr(path, kFilteredAssetSentinel)) return;
     const bool failed = result == INVALID_HANDLE_VALUE;
     if (failed && !g_failedFiles) return;
 
@@ -505,12 +507,43 @@ bool IsReadableObject07(uintptr_t p, size_t size)
     return IsReadablePointerRange(p, size);
 }
 
-bool IsSafeCleanupResource07(uintptr_t objectPtr, uintptr_t& ownerPtr)
+enum Live07CleanupRejectReason : DWORD {
+    LIVE07_CLEANUP_OK = 0,
+    LIVE07_CLEANUP_BAD_OBJECT,
+    LIVE07_CLEANUP_BAD_OWNER,
+    LIVE07_CLEANUP_BAD_OWNER_COUNT,
+    LIVE07_CLEANUP_BAD_OWNER_LIST
+};
+
+const char* Live07CleanupRejectReasonName(
+    Live07CleanupRejectReason reason)
+{
+    switch (reason) {
+    case LIVE07_CLEANUP_BAD_OBJECT:      return "BAD_OBJECT";
+    case LIVE07_CLEANUP_BAD_OWNER:       return "BAD_OWNER";
+    case LIVE07_CLEANUP_BAD_OWNER_COUNT: return "BAD_OWNER_COUNT";
+    case LIVE07_CLEANUP_BAD_OWNER_LIST:  return "BAD_OWNER_LIST";
+    default:                             return "OK";
+    }
+}
+
+bool IsSafeCleanupResource07(
+    uintptr_t objectPtr,
+    uintptr_t& ownerPtr,
+    uintptr_t& ownerListPtr,
+    DWORD& ownerCount,
+    Live07CleanupRejectReason& rejectReason)
 {
     ownerPtr = 0;
+    ownerListPtr = 0;
+    ownerCount = 0;
+    rejectReason = LIVE07_CLEANUP_OK;
 
-    if (!objectPtr || !IsReadableObject07(objectPtr, 0x30))
+    // 0080B32B reads object+2C before calling 0080B103.
+    if (!objectPtr || !IsReadableObject07(objectPtr, 0x30)) {
+        rejectReason = LIVE07_CLEANUP_BAD_OBJECT;
         return false;
+    }
 
     __try {
         ownerPtr =
@@ -518,11 +551,59 @@ bool IsSafeCleanupResource07(uintptr_t objectPtr, uintptr_t& ownerPtr)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         ownerPtr = 0;
+        rejectReason = LIVE07_CLEANUP_BAD_OBJECT;
         return false;
     }
 
-    if (!ownerPtr || !IsReadableObject07(ownerPtr, 0x20))
+    // 0080B103 uses owner+18 as the list pointer and owner+1C as count.
+    if (!ownerPtr || !IsReadableObject07(ownerPtr, 0x20)) {
+        rejectReason = LIVE07_CLEANUP_BAD_OWNER;
         return false;
+    }
+
+    __try {
+        ownerListPtr =
+            *reinterpret_cast<const uintptr_t*>(ownerPtr + 0x18);
+        ownerCount =
+            *reinterpret_cast<const DWORD*>(ownerPtr + 0x1C);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        ownerListPtr = 0;
+        ownerCount = 0;
+        rejectReason = LIVE07_CLEANUP_BAD_OWNER;
+        return false;
+    }
+
+    // Observed bad stock-game state:
+    //   owner      = 00060000
+    //   owner+18   = 00021000
+    //   owner+1C   = D24841A3
+    //
+    // Use a deliberately generous ceiling. This catches clearly stale/reused
+    // owner memory without pretending to know the exact engine maximum.
+    constexpr DWORD kMaxReasonableOwnerEntries = 0x00010000;
+
+    if (ownerCount > kMaxReasonableOwnerEntries) {
+        rejectReason = LIVE07_CLEANUP_BAD_OWNER_COUNT;
+        return false;
+    }
+
+    // Zero entries means the list pointer is irrelevant.
+    if (ownerCount == 0)
+        return true;
+
+    if (!ownerListPtr) {
+        rejectReason = LIVE07_CLEANUP_BAD_OWNER_LIST;
+        return false;
+    }
+
+    const size_t listBytes =
+        static_cast<size_t>(ownerCount) * sizeof(uintptr_t);
+
+    if (!IsReadableObject07(ownerListPtr, listBytes)) {
+        rejectReason = LIVE07_CLEANUP_BAD_OWNER_LIST;
+        return false;
+    }
 
     return true;
 }
@@ -533,7 +614,17 @@ void __cdecl SafeReleaseResource07(void* resultPtr, void* resourceObject)
         reinterpret_cast<uintptr_t>(resourceObject);
 
     uintptr_t ownerPtr = 0;
-    if (!IsSafeCleanupResource07(objectPtr, ownerPtr)) {
+    uintptr_t ownerListPtr = 0;
+    DWORD ownerCount = 0;
+    Live07CleanupRejectReason rejectReason = LIVE07_CLEANUP_OK;
+
+    if (!IsSafeCleanupResource07(
+            objectPtr,
+            ownerPtr,
+            ownerListPtr,
+            ownerCount,
+            rejectReason))
+    {
         if (g_lockReady) {
             EnterCriticalSection(&g_consoleLock);
             PrintPrefix(
@@ -541,15 +632,20 @@ void __cdecl SafeReleaseResource07(void* resultPtr, void* resourceObject)
                 FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
 
             std::printf(
-                "SKIP stale cleanup resource object=%08lX owner=%08lX\n",
+                "SKIP stale cleanup resource reason=%s "
+                "object=%08lX owner=%08lX list=%08lX count=%08lX\n",
+                Live07CleanupRejectReasonName(rejectReason),
                 static_cast<unsigned long>(objectPtr),
-                static_cast<unsigned long>(ownerPtr));
+                static_cast<unsigned long>(ownerPtr),
+                static_cast<unsigned long>(ownerListPtr),
+                static_cast<unsigned long>(ownerCount));
 
             LeaveCriticalSection(&g_consoleLock);
         }
 
-        // The original cleanup loop clears its slot immediately after the
-        // call returns, so returning here safely discards the stale entry.
+        // 00689B70 clears the cleanup slot immediately after this call
+        // returns, so the rejected stale entry is discarded by the game's
+        // normal cleanup control flow.
         return;
     }
 
@@ -1164,6 +1260,12 @@ void __cdecl LogFileSystemOpenResolved(
         return;
     }
 
+    // CustomPaths uses this Win32-invalid sentinel to enter the engine's
+    // native failure path without touching the filesystem. It is internal
+    // filtering activity, not a real logical asset request.
+    if (fileName && std::strcmp(fileName, kFilteredAssetSentinel) == 0)
+        return;
+
     RememberAssetRequest(fileName, flags, caller, context);
 
     EnterCriticalSection(&g_consoleLock);
@@ -1355,10 +1457,11 @@ bool InstallFileSystemOpenResolvedHookForCurrentGame()
 
 
 // -------------------------------------------------------------------------
-// NBA Live 06/07/08 animation-bank pair debugger
+// NBA Live 2005/06/07/08 animation-bank pair debugger
 // -------------------------------------------------------------------------
 //
 // AnimationBankSystem_LoadPair:
+ //   05: 00637550
  //   06: 00645D10
  //   07: 006A3F00
  //   08: 006CB0F0
@@ -1373,7 +1476,7 @@ bool InstallFileSystemOpenResolvedHookForCurrentGame()
 //   <variantRecord.objectStem>.o
 //
 // AnimBankEntry layout established in Live 06 and confirmed structurally
-// identical in the Live 07/08 pair loaders:
+// identical in the Live 2005/07/08 pair loaders:
 //   +40 index
 //   +44 first variant
 //   +4C next-by-index
@@ -1525,6 +1628,37 @@ void __cdecl LogAnimBankPair(
     LeaveCriticalSection(&g_consoleLock);
 }
 
+__declspec(naked) void HookAnimBankPair2005()
+{
+    __asm {
+        // Live 2005 entry stack:
+        //   ESP+04 = anim bank index
+        //   ESP+08 = variant
+        //   ESP+0C = ABK stem / formatted bank string
+        // Preserve entry stack and original ECX before touching registers.
+        mov     eax, esp
+        pushfd
+        pushad
+
+        push    eax
+        push    ecx
+        call    LogAnimBankPair
+        add     esp, 8
+
+        popad
+        popfd
+
+        // Reproduce the exact five bytes overwritten at 00637550:
+        //   53                push ebx
+        //   8B 5C 24 08      mov ebx,[esp+08h]
+        // After push ebx, original ESP+08 (variant) is at ESP+0C.
+        push    ebx
+        mov     ebx, [esp+0Ch]
+
+        jmp     dword ptr [g_AnimBankPairContinue]
+    }
+}
+
 __declspec(naked) void HookAnimBankPair()
 {
     __asm {
@@ -1549,6 +1683,54 @@ __declspec(naked) void HookAnimBankPair()
 
         jmp     dword ptr [g_AnimBankPairContinue]
     }
+}
+
+bool InstallAnimBankPairHookAt2005(uintptr_t targetAddress)
+{
+    constexpr size_t patchLength = 5;
+
+    // NBA Live 2005 @ 00637550:
+    //   53                push ebx
+    //   8B 5C 24 08      mov ebx,[esp+08h]
+    const BYTE expected[patchLength] = {
+        0x53,
+        0x8B, 0x5C, 0x24, 0x08
+    };
+
+    BYTE* target = reinterpret_cast<BYTE*>(targetAddress);
+
+    __try {
+        if (std::memcmp(target, expected, patchLength) != 0)
+            return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    g_AnimBankPairContinue = targetAddress + patchLength;
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            target,
+            patchLength,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtect))
+    {
+        g_AnimBankPairContinue = 0;
+        return false;
+    }
+
+    target[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(target + 1) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&HookAnimBankPair2005) -
+            (targetAddress + 5));
+
+    DWORD ignored = 0;
+    VirtualProtect(target, patchLength, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
+
+    return true;
 }
 
 bool InstallAnimBankPairHookAt(uintptr_t targetAddress)
@@ -1612,8 +1794,9 @@ bool InstallAnimBankPairHookForCurrentGame()
     const uintptr_t ep = FM::GetEntryPoint();
 
     if (ep == 0xCD8005) {
-        // Live 2005 not mapped yet.
-        return false;
+        // NBA Live 2005
+        // Pair loader: 00637550
+        return InstallAnimBankPairHookAt2005(0x00637550);
     }
 
     if (ep == 0x40109F) {
@@ -3516,7 +3699,7 @@ void InitializeDebugConsole() {
                 cleanupGuard07 ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
                                : (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY));
             std::printf(
-                "NBA Live 07 stale-cleanup guard: %s\n",
+                "NBA Live 07 stale-cleanup guard v2: %s\n",
                 cleanupGuard07 ? "OK" : "MISS");
         }
     }
@@ -3599,4 +3782,3 @@ void InitializeDebugConsole() {
 
     std::printf("\n");
 }
-

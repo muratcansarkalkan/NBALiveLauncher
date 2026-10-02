@@ -37,7 +37,13 @@ struct Frame {
     const char* playCallValues[4];
     const char* introValues[15];
     const char* starting5Values[11];
+    const char* starting5PlayerFirstNames[5];
+    const char* starting5PlayerLastNames[5];
+    const char* starting5PlayerFullNames[5];
+    const char* starting5PlayerNumbers[5];
+    const char* starting5PlayerPositions[5];
     const char* starting5TeamName;
+    const char* starting5CityName;
     const char* starting5Side;
     D3DCOLOR starting5TeamColor;
     D3DCOLOR starting5PrimaryColor;
@@ -59,6 +65,18 @@ struct Frame {
     D3DCOLOR statSecondaryColor;
     IDirect3DTexture9* statTeamLogo;
     IDirect3DTexture9* playerPortrait;
+
+    // Team Leaders semantic bindings. Each row is resolved independently
+    // against the live 24-player cache; row order does not imply team side.
+    const char* player1Name;
+    const char* player1Value;
+    D3DCOLOR player1TeamColor;
+    IDirect3DTexture9* player1TeamLogo;
+    const char* player2Name;
+    const char* player2Value;
+    D3DCOLOR player2TeamColor;
+    IDirect3DTexture9* player2TeamLogo;
+
     const char* statValues[15];
     int statValueCount;
 };
