@@ -17,7 +17,6 @@ void InitializeCustomCamera();
 void InitializeArenaLighting();
 void InitializeAntiAliasing();
 void InitializeDebugLogging();
-void InitializeCourtTextureRendering();
 
 void NBAResolution0508() {
     switch (FM::GetEntryPoint()) {
@@ -55,7 +54,7 @@ public:
         // rendering device. Disabled unless [DISPLAY] ANTI_ALIASING=1.
         InitializeAntiAliasing();
         NBAResolution0508();
-		// InitializeCourtTextureRendering();
+
         // Keep initialization order explicit.
         EnableWindowed();
         InitializeShotClock();

@@ -107,7 +107,6 @@ xcopy /y "$(TargetDir)$(TargetName).pdb" "C:\Games\NBA LIVE 08\plugins" </Comman
     <ClCompile Include="AdjustWSUI.cpp" />
     <ClCompile Include="AntiAliasing.cpp" />
     <ClCompile Include="ArenaLighting.cpp" />
-    <ClCompile Include="CourtTextureRendering.cpp" />
     <ClCompile Include="CustomCamera.cpp" />
     <ClCompile Include="CustomPaths.cpp" />
     <ClCompile Include="DebugConsole.cpp" />

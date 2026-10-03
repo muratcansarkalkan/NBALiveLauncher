@@ -367,7 +367,7 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument(
         "--configuration",
-        default="Debug",
+        default="Release",
     )
 
     parser.add_argument(
