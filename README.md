@@ -5,8 +5,9 @@ Live 06, NBA Live 07, and NBA Live 08**.
 
 It combines modern resolution and widescreen support, windowed mode,
 enhanced anti-aliasing, custom broadcast graphics, a stadium server,
-dynamic stadium displays, screenshots, debugging tools, memory
-improvements, and game-specific fixes in a single plugin.
+dynamic stadium displays, configurable game setup and controllers,
+screenshots, debugging tools, memory improvements, and game-specific
+fixes in a single plugin.
 
 ## Features
 
@@ -31,7 +32,11 @@ improvements, and game-specific fixes in a single plugin.
 -   Playoffs, Conference Finals, and NBA Finals stadium asset overrides
 -   Dynamic stadium/jumbotron game data
 -   NBA Live 2005 stadium lighting controls
--   Custom startup home and away teams
+-   Custom startup teams, jerseys, starting lineups, and arena selection
+-   Keyboard/gamepad side, profile, and player-lock configuration
+-   Optional fast filesystem wait path to reduce game loading delays
+-   NBA Live 06 loading profiler and frontend input/navigation diagnostics
+-   Forced playoff-stage/series presentation context for testing and custom setups
 -   Additional `faces\` file-search path
 -   Increased game memory for larger custom assets
 -   Expanded debugger and crash diagnostics
@@ -262,6 +267,12 @@ data bindings, allowing themes to display more player and team
 information. Player jersey numbers can also be used by supported stat
 and foul graphics.
 
+Starting 5 packages can also use enriched live-player data, including
+first name, last name, full name, jersey number, position, player portrait,
+team name/city, side, team colors, and team logo. Two-team stat graphics
+(such as Team Leaders) can bind separate left/right team logos instead of
+assuming the first displayed player is always Home and the second is Away.
+
 Additional presentation support is game-specific:
 
 -   **NBA Live 07 and NBA Live 08:** custom Starting 5 graphics
@@ -436,7 +447,7 @@ https://github.com/muratcansarkalkan/EBOTools/
 
 ## Included Arenas
 
-The v0.3 release includes **four configured arenas** with Dorna,
+The release package includes **four configured arenas** with Dorna,
 backboard, and camera content for:
 
 -   NBA Live 2005
@@ -445,19 +456,160 @@ backboard, and camera content for:
 
 These provide ready-to-use examples of the Stadium Server functionality.
 
-## Startup Teams
+## Startup Game Configuration
 
-The initial matchup can be overridden through `main.ini`:
+The initial Play Now setup can be overridden through `main.ini`. These
+settings are available in NBA Live 2005, NBA Live 06, NBA Live 07, and
+NBA Live 08.
 
 ``` ini
 [STARTUP]
 HOME_TEAMNUM=-1
 AWAY_TEAMNUM=-1
+HOME_JERSEY_ID=-1
+AWAY_JERSEY_ID=-1
+HOME_STARTING5=
+AWAY_STARTING5=
+ARENA_TEAMNUM=-1
+ARENA_FORCE=0
 ```
 
-Set either value to a valid database `TEAMNUM`.
+`HOME_TEAMNUM` and `AWAY_TEAMNUM` use database `TEAMNUM` values. A value
+of `-1` leaves the game's original team selection unchanged.
 
-A value of `-1` leaves that team's original startup selection unchanged.
+`HOME_JERSEY_ID` and `AWAY_JERSEY_ID` select the initial jersey ID for
+each side. A value of `-1` leaves the normal jersey-selection path
+unchanged. The launcher only supplies the configured jersey when the
+team does not already have an explicit jersey choice, so a later manual
+frontend selection is not overwritten.
+
+`HOME_STARTING5` and `AWAY_STARTING5` accept five distinct comma-separated
+positions from `0` through `11`, for example:
+
+``` ini
+HOME_STARTING5=0,1,2,3,4
+AWAY_STARTING5=1,0,2,4,3
+```
+
+These values refer to positions in EA's native default 12-player lineup
+array. They are not guaranteed to be identical to DBF `ROSTERPOS` values
+for every custom roster. The selected five players are moved to the front
+of the active lineup while the remaining native order is preserved.
+
+`ARENA_TEAMNUM` selects the venue associated with a team. By default the
+launcher only supplies the arena when the native venue has not already
+been resolved. Set `ARENA_FORCE=1` to replace an already resolved venue.
+
+Optional diagnostics are available with `STARTING5_TRACE=1` and
+`ARENA_TRACE=1`. Starting-five diagnostics are written to
+`StartupTeams.log`.
+
+## Controller Setup
+
+NBA Live Launcher can preconfigure keyboard and gamepad assignment before
+gameplay, including side assignment, controller profile selection, and
+player lock. The feature uses the games' native controller/configuration
+paths rather than replacing gameplay input handling.
+
+Enable it in `main.ini`:
+
+``` ini
+[CONTROLLERS]
+ENABLED=1
+USE_DOCUMENTS_CONFIGS=1
+
+[KEYBOARD]
+ENABLED=1
+SIDE=HOME
+CONFIG=keyboard.kfg
+PLAYER_LOCK=-1
+
+[JOYSTICK_1]
+ENABLED=1
+NATIVE_SLOT=0
+SIDE=AWAY
+CONFIG=gamepad.jfg
+CONFIG_DEVICE_INDEX=AUTO
+PLAYER_LOCK=-1
+```
+
+`SIDE` accepts `HOME`, `AWAY`, `NEUTRAL`, or `UNCHANGED`.
+
+Keyboard configurations use `.kfg`; gamepad configurations use `.jfg`.
+With `USE_DOCUMENTS_CONFIGS=1`, profiles are resolved from the game's
+`Documents\<NBA LIVE game>\configs` directory. Set it to `0` to use
+`interface\configs` under the installation directory.
+
+For joystick side assignment, `NATIVE_SLOT` must identify a unique native
+user slot from `0` through `6`; slot `7` is reserved for the keyboard.
+`CONFIG_DEVICE_INDEX=AUTO` is recommended so the launcher can use the
+verified native loader mapping.
+
+`PLAYER_LOCK=-1` leaves player lock unchanged. Values `0` through `4`
+select a player-lock position for a controller assigned to Home or Away.
+
+Controller setup writes diagnostic information to `ControllerSetup.log`.
+
+### NBA Live 06 Frontend Device Navigation
+
+NBA Live 06 also includes an optional frontend input/navigation layer in
+`DeviceNavigation.ini`. It can bypass the two verified frontend input
+gates and optionally remap existing native frontend actions. This is
+primarily useful for controller-driven frontend experiments and custom
+launcher/menu workflows.
+
+Basic configuration:
+
+``` ini
+[DEVICE_NAVIGATION]
+ENABLE=1
+GATE_MODE=BYPASS
+REMAP_BUTTONS=0
+```
+
+Use `GATE_MODE=NATIVE` to leave the original checks untouched. Additional
+trace options in this file are intended for development and diagnostics.
+
+## Forced Game and Playoff Context
+
+For testing presentation packages and special-event behavior, the launcher
+can force a postseason stage independently of the normal season/playoff
+frontend flow.
+
+``` ini
+[PLAYOFF]
+FORCE_STAGE=OFF
+GLOBAL_GAME_MODE=0
+FORCE_SERIES_GAME=0
+FORCE_SERIES_LENGTH=7
+FORCE_HOME_WINS=-1
+FORCE_AWAY_WINS=-1
+LOG_STATE=0
+```
+
+`FORCE_STAGE` accepts `OFF`, `PLAYOFF`, `ECSF`, `WCSF`, `ECF`, `WCF`, or
+`FINALS`. When `GLOBAL_GAME_MODE=0`, the forced stage is limited to the
+stadium/event-asset context. `GLOBAL_GAME_MODE=1` also promotes the game
+into the corresponding playoff presentation context where supported.
+
+A forced series state is valid only when the requested wins add up to
+`FORCE_SERIES_GAME - 1`, neither side has already clinched the series,
+and the length is `1`, `3`, `5`, or `7`. Series forcing requires both a
+forced stage and `GLOBAL_GAME_MODE=1`.
+
+`LOG_STATE=1` enables additional playoff-state diagnostics in
+`logs\playoff_state.log`.
+
+The native special-event mode can also be selected for testing:
+
+``` ini
+[GAME_MODE]
+FORCE_MODE=OFF
+```
+
+Supported values are `OFF`, `ALLSTAR`, and `ROOKIE`
+(`ROOKIE_CHALLENGE` is also accepted). Native special-event forcing takes
+priority over forced playoff mode so the two contexts are not mixed.
 
 ## Custom Faces Folder
 
@@ -483,6 +635,46 @@ Live 06, NBA Live 07, and NBA Live 08.
 
 NBA Live 2005 also increases a known temporary resource-list capacity
 from **118 to 512 entries**.
+
+## Loading Performance and Profiling
+
+The launcher includes an optional filesystem wait optimization for all four
+supported games:
+
+``` ini
+[LOADING]
+FAST_FILE_WAIT=1
+```
+
+The optimization changes only the verified filesystem completion-wait path.
+It keeps the game's completion checks and callback pump intact and does not
+apply a global `Sleep`, timer-resolution, or FPS patch. If the required hook
+cannot be validated for the running executable, the launcher leaves the
+original path unchanged.
+
+NBA Live 06 also includes a detailed loading profiler for development work.
+It can capture native asset-entry order and intercepted file API timings to
+CSV/log files under `logs\`.
+
+``` ini
+[DEBUG]
+CONSOLE=0
+
+[LOADING_PROFILE]
+ENABLED=1
+AUTO_CAPTURE=1
+AUTO_START=0
+MAX_EVENTS=65536
+MAX_SECONDS=120
+```
+
+With automatic capture enabled, profiling starts at the verified 5-on-5
+loading boundary and stops at pregame intro setup. With automatic capture
+disabled, **F9** can start and stop a capture manually. `AUTO_START=1` starts
+a capture as soon as the profiler is initialized and F9 can still stop it.
+
+The profiler is currently a verified NBA Live 06 development feature;
+`FAST_FILE_WAIT` is implemented separately for NBA Live 2005–08.
 
 ## Debugger
 
@@ -524,6 +716,74 @@ CONSOLE=0
 for normal gameplay when debugging output is not needed.
 
 ## Changelog
+
+### v0.5
+
+#### Game Setup and Controllers
+
+-   Expanded startup configuration from team selection to full Play Now
+    setup across NBA Live 2005–08.
+-   Added configurable Home/Away jersey IDs without overriding later manual
+    frontend jersey selections.
+-   Added configurable Home/Away starting fives using five positions from
+    EA's native default lineup array.
+-   Added configurable arena selection and optional forced venue replacement.
+-   Added native keyboard/gamepad side assignment.
+-   Added `.kfg` / `.jfg` controller-profile loading and synchronization with
+    the games' native selected-profile state.
+-   Added per-controller player-lock configuration.
+-   Added NBA Live 06 frontend device-navigation gate control, native action
+    remapping, and diagnostic tracing.
+
+#### Loading and Frontend Timing
+
+-   Added `FAST_FILE_WAIT` for NBA Live 2005, NBA Live 06, NBA Live 07, and
+    NBA Live 08 to reduce unnecessary filesystem completion polling delay.
+-   Preserved native completion checks/callback handling; the optimization
+    does not globally alter `Sleep`, timer resolution, or gameplay FPS.
+-   Added an NBA Live 06 loading profiler with automatic/manual capture, F9
+    control, CSV event output, and detailed log/status files.
+-   Corrected frontend/APT timing paths that could advance menu animations too
+    quickly on very fast or uncapped frontend loops.
+
+#### Widescreen and Rendering
+
+-   Reworked perspective projection to use the actual viewport aspect ratio
+    while preserving vertical field of view and native near/far planes.
+-   Expanded conical-frustum culling for widescreen so objects visible at the
+    wider horizontal FOV are not incorrectly culled.
+-   Improved high-resolution frontend behavior and resolution handling in the
+    supported games, including logical resolution ordering where required.
+
+#### Broadcast Graphics
+
+-   Expanded Starting 5 runtime bindings with player first/last/full names,
+    jersey numbers, positions, portraits, team identity, side, colors, and
+    team logo.
+-   Added separate left/right team-logo bindings for two-team stat graphics
+    such as Team Leaders, so logo selection follows the actual displayed
+    players rather than a fixed Home/Away order.
+-   Preserved the existing raw Starting 5 and lineup payload bindings for
+    compatibility with older themes.
+
+#### Playoff and Special-Event Context
+
+-   Added forced postseason-stage selection for Playoffs, Conference
+    Semifinals, Conference Finals, and NBA Finals testing.
+-   Added optional global playoff game-mode promotion and forced series
+    game/score context with validation.
+-   Added playoff-state logging and additional presentation/commentary
+    diagnostics.
+-   Added optional native All-Star and Rookie Challenge mode forcing for
+    presentation testing.
+
+#### Stability and Diagnostics
+
+-   Expanded crash/resource diagnostics and validation around newly hooked
+    runtime paths.
+-   Added fail-closed validation for controller, loading, playoff, and frontend
+    hooks so unsupported/changing executable bytes leave the original path
+    intact.
 
 ### v0.3
 
