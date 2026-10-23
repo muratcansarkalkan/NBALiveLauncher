@@ -1,6 +1,13 @@
 #include "plugin-std.h"
 #include "Resolutions.h"
 #include "AdjustWSUI.h"
+#include <Windows.h>
+#include <cstdint>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <climits>
+#include <cwchar>
 
 using namespace plugin;
 
@@ -367,15 +374,1148 @@ namespace live06 {
         patch::Nop(0x7BE000, 0x11);
     }
 
+    // -------------------------------------------------------------------------
+    // NBA Live 06 APT runtime inspector
+    //
+    // Read-only first test of the native APT API.  The game itself uses
+    // sub_78B650(0) as the active level-0 object and resolves properties
+    // through AptExtObject::GetVariable.
+    // -------------------------------------------------------------------------
+    namespace apt06
+    {
+        struct AptValue;
+
+        struct EAStringC
+        {
+            void* data;
+        };
+
+        using GetLevelFn = AptValue* (__cdecl*)(int);
+        using MakeStringFn = void (__thiscall*)(EAStringC*, const char*);
+        using GetVariableFn = AptValue* (__cdecl*)(AptValue*, const EAStringC*);
+        using SetVariableFn = bool (__cdecl*)(AptValue*, const EAStringC*, AptValue*);
+        using CreateFloatFn = AptValue* (__cdecl*)(float);
+        using ToFloatFn = float (__thiscall*)(AptValue*);
+        using ToIntFn = int (__thiscall*)(AptValue*);
+
+        static AptValue* GetLevel(int level)
+        {
+            return reinterpret_cast<GetLevelFn>(0x0078B650)(level);
+        }
+
+        static void ReleaseString(EAStringC& value)
+        {
+            if (!value.data)
+                return;
+
+            auto* refCount = reinterpret_cast<unsigned short*>(value.data);
+            if (*refCount != 0)
+                --(*refCount);
+
+            if (*refCount == 0)
+            {
+                void* callbacks = *reinterpret_cast<void**>(0x00CE270C);
+                if (callbacks)
+                {
+                    using FreeFn = void (__cdecl*)(void*);
+                    FreeFn freeFn = *reinterpret_cast<FreeFn*>(
+                        reinterpret_cast<unsigned char*>(callbacks) + 4);
+                    if (freeFn)
+                        freeFn(value.data);
+                }
+            }
+
+            value.data = nullptr;
+        }
+
+        static AptValue* GetVariable(AptValue* object, const char* name)
+        {
+            if (!object || !name || !*name)
+                return nullptr;
+
+            EAStringC string{};
+            reinterpret_cast<MakeStringFn>(0x0077E750)(&string, name);
+            AptValue* result = reinterpret_cast<GetVariableFn>(0x007AB930)(object, &string);
+            ReleaseString(string);
+            return result;
+        }
+
+        static bool SetFloat(AptValue* object, const char* name, float value)
+        {
+            if (!object || !name || !*name)
+                return false;
+
+            EAStringC string{};
+            reinterpret_cast<MakeStringFn>(0x0077E750)(&string, name);
+
+            AptValue* aptValue =
+                reinterpret_cast<CreateFloatFn>(0x0078B390)(value);
+
+            bool result = false;
+            if (aptValue)
+            {
+                result = reinterpret_cast<SetVariableFn>(0x007AB960)(
+                    object, &string, aptValue);
+
+                // Deliberately do not release aptValue in this first write test.
+                // Only two AptFloat objects are created for the whole session
+                // (move + restore), avoiding any uncertainty about ownership.
+            }
+
+            ReleaseString(string);
+            return result;
+        }
+
+        static unsigned int Flags(AptValue* value)
+        {
+            if (!value)
+                return 0;
+            return *reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned char*>(value) + 4);
+        }
+
+        static unsigned int Type(AptValue* value)
+        {
+            return Flags(value) & 0x3F;
+        }
+
+        static float ToFloat(AptValue* value)
+        {
+            return value
+                ? reinterpret_cast<ToFloatFn>(0x0077D680)(value)
+                : 0.0f;
+        }
+
+        static int ToInt(AptValue* value)
+        {
+            return value
+                ? reinterpret_cast<ToIntFn>(0x0077D5B0)(value)
+                : 0;
+        }
+
+        static void Log(const char* format, ...)
+        {
+            char buffer[1024]{};
+            va_list args;
+            va_start(args, format);
+            _vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, format, args);
+            va_end(args);
+
+            OutputDebugStringA(buffer);
+
+            HANDLE file = CreateFileA(
+                ".\\APT06.log",
+                FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+
+            if (file != INVALID_HANDLE_VALUE)
+            {
+                DWORD written = 0;
+                WriteFile(file, buffer, static_cast<DWORD>(strlen(buffer)), &written, nullptr);
+                CloseHandle(file);
+            }
+        }
+
+        static void DumpProperty(AptValue* object, const char* name)
+        {
+            AptValue* value = GetVariable(object, name);
+            if (!value)
+            {
+                Log("[APT06] %-13s = NULL\n", name);
+                return;
+            }
+
+            Log(
+                "[APT06] %-13s = %08X type=%u flags=%08X int=%d float=%.4f\n",
+                name,
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(value)),
+                Type(value),
+                Flags(value),
+                ToInt(value),
+                ToFloat(value));
+        }
+
+        static void DumpRootOnce()
+        {
+            static bool dumped = false;
+            if (dumped)
+                return;
+
+            AptValue* root = GetLevel(0);
+            if (!root)
+                return;
+
+            dumped = true;
+
+            Log("\n============================================================\n");
+            Log("[APT06] ROOT INSPECTOR\n");
+            Log("[APT06] _level0=%08X type=%u flags=%08X\n",
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(root)),
+                Type(root),
+                Flags(root));
+
+            DumpProperty(root, "_x");
+            DumpProperty(root, "_y");
+            DumpProperty(root, "_xscale");
+            DumpProperty(root, "_yscale");
+            DumpProperty(root, "_width");
+            DumpProperty(root, "_height");
+            DumpProperty(root, "_rotation");
+            DumpProperty(root, "_alpha");
+            DumpProperty(root, "_visible");
+
+            Log("============================================================\n\n");
+        }
+
+        static const char* StringValueText(AptValue* value)
+        {
+            if (!value)
+                return nullptr;
+
+            unsigned int type = Type(value);
+
+            // AptValue::ToInt/ToFloat show string values as either a direct
+            // AptString (type 1) or a wrapper (type 42) whose underlying
+            // string value is at +0x1C.
+            if (type == 42)
+            {
+                value = *reinterpret_cast<AptValue**>(
+                    reinterpret_cast<unsigned char*>(value) + 0x1C);
+                if (!value)
+                    return nullptr;
+                type = Type(value);
+            }
+
+            if (type != 1)
+                return nullptr;
+
+            void* stringData = *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(value) + 8);
+            if (!stringData)
+                return nullptr;
+
+            return reinterpret_cast<const char*>(
+                reinterpret_cast<unsigned char*>(stringData) + 8);
+        }
+
+        static bool IsReadablePointer(const void* p, size_t size = sizeof(void*))
+        {
+            if (!p)
+                return false;
+
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi))
+                return false;
+
+            if (mbi.State != MEM_COMMIT ||
+                (mbi.Protect & PAGE_GUARD) ||
+                (mbi.Protect & PAGE_NOACCESS))
+                return false;
+
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(p);
+            const uintptr_t end = begin + size;
+            const uintptr_t regionEnd =
+                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+
+            return end >= begin && end <= regionEnd;
+        }
+
+        static AptValue* ReadPtr(const void* base, size_t offset)
+        {
+            const unsigned char* address =
+                reinterpret_cast<const unsigned char*>(base) + offset;
+
+            if (!IsReadablePointer(address, sizeof(void*)))
+                return nullptr;
+
+            return *reinterpret_cast<AptValue* const*>(address);
+        }
+
+        static void* ReadVoidPtr(const void* base, size_t offset)
+        {
+            const unsigned char* address =
+                reinterpret_cast<const unsigned char*>(base) + offset;
+
+            if (!IsReadablePointer(address, sizeof(void*)))
+                return nullptr;
+
+            return *reinterpret_cast<void* const*>(address);
+        }
+
+        static void DumpCIHLine(AptValue* object, unsigned int depth)
+        {
+            if (!object)
+                return;
+
+            AptValue* nameValue = GetVariable(object, "_name");
+            const char* objectName = StringValueText(nameValue);
+
+            AptValue* xValue = GetVariable(object, "_x");
+            AptValue* yValue = GetVariable(object, "_y");
+            AptValue* widthValue = GetVariable(object, "_width");
+            AptValue* heightValue = GetVariable(object, "_height");
+            AptValue* visibleValue = GetVariable(object, "_visible");
+
+            char indent[65]{};
+            const unsigned int spaces = (depth * 2 < 64) ? depth * 2 : 64;
+            memset(indent, ' ', spaces);
+            indent[spaces] = '\0';
+
+            Log(
+                "[APT06] %sobj=%08X type=%u name=\"%s\" "
+                "x=%.2f y=%.2f w=%.2f h=%.2f visible=%d\n",
+                indent,
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(object)),
+                Type(object),
+                (objectName && *objectName) ? objectName : "<unnamed>",
+                ToFloat(xValue),
+                ToFloat(yValue),
+                ToFloat(widthValue),
+                ToFloat(heightValue),
+                ToInt(visibleValue));
+        }
+
+        static unsigned int DumpDisplayListRecursive(
+            AptValue* parent,
+            unsigned int depth,
+            unsigned int& safety)
+        {
+            if (!parent || depth > 16 || safety >= 4096)
+                return 0;
+
+            // For display-container CIHs, +0x48 points at type-specific
+            // metadata.  The native child-management code repeatedly uses
+            // metadata+0x24 as the child-list object.  Its first dword is the
+            // first child CIH, and siblings are chained through CIH+0x50.
+            void* metadata = ReadVoidPtr(parent, 0x48);
+            if (!metadata || metadata == reinterpret_cast<void*>(0xBAADF00D))
+                return 0;
+
+            void* childList = ReadVoidPtr(metadata, 0x24);
+            if (!childList)
+                return 0;
+
+            AptValue* child = ReadPtr(childList, 0x00);
+            unsigned int count = 0;
+            unsigned int siblingSafety = 0;
+
+            while (child && safety < 4096 && siblingSafety++ < 1024)
+            {
+                if (!IsReadablePointer(child, 0x5C))
+                {
+                    Log("[APT06] %*sINVALID child pointer=%08X; stopping list.\n",
+                        static_cast<int>(depth * 2), "",
+                        static_cast<unsigned int>(reinterpret_cast<uintptr_t>(child)));
+                    break;
+                }
+
+                ++safety;
+                ++count;
+
+                DumpCIHLine(child, depth);
+
+                const unsigned int type = Type(child);
+                if (type >= 0x0C && type <= 0x13)
+                    count += DumpDisplayListRecursive(child, depth + 1, safety);
+
+                AptValue* next = ReadPtr(child, 0x50);
+                if (next == child)
+                {
+                    Log("[APT06] %*sself-linked sibling at %08X; stopping list.\n",
+                        static_cast<int>(depth * 2), "",
+                        static_cast<unsigned int>(reinterpret_cast<uintptr_t>(child)));
+                    break;
+                }
+
+                child = next;
+            }
+
+            return count;
+        }
+
+
+        static AptValue* FindNamedDisplayObjectRecursive(
+            AptValue* parent,
+            const char* wantedName,
+            unsigned int depth,
+            unsigned int& safety)
+        {
+            if (!parent || !wantedName || !*wantedName || depth > 16 || safety >= 4096)
+                return nullptr;
+
+            void* metadata = ReadVoidPtr(parent, 0x48);
+            if (!metadata || metadata == reinterpret_cast<void*>(0xBAADF00D))
+                return nullptr;
+
+            void* childList = ReadVoidPtr(metadata, 0x24);
+            if (!childList)
+                return nullptr;
+
+            AptValue* child = ReadPtr(childList, 0x00);
+            unsigned int siblingSafety = 0;
+
+            while (child && safety < 4096 && siblingSafety++ < 1024)
+            {
+                if (!IsReadablePointer(child, 0x5C))
+                    return nullptr;
+
+                ++safety;
+
+                AptValue* nameValue = GetVariable(child, "_name");
+                const char* objectName = StringValueText(nameValue);
+
+                if (objectName && _stricmp(objectName, wantedName) == 0)
+                    return child;
+
+                const unsigned int type = Type(child);
+                if (type >= 0x0C && type <= 0x13)
+                {
+                    AptValue* found = FindNamedDisplayObjectRecursive(
+                        child, wantedName, depth + 1, safety);
+
+                    if (found)
+                        return found;
+                }
+
+                AptValue* next = ReadPtr(child, 0x50);
+                if (next == child)
+                    break;
+
+                child = next;
+            }
+
+            return nullptr;
+        }
+
+        static AptValue* FindNamedDisplayObject(const char* wantedName)
+        {
+            AptValue* root = GetLevel(0);
+            if (!root)
+                return nullptr;
+
+            unsigned int safety = 0;
+            return FindNamedDisplayObjectRecursive(root, wantedName, 0, safety);
+        }
+
+        static void PersistentNamedWriteTest()
+        {
+            static unsigned int delay = 0;
+            static bool attempted = false;
+
+            if (attempted)
+                return;
+
+            // Wait until the screen tree is fully instantiated.
+            if (++delay < 150)
+                return;
+
+            AptValue* target = FindNamedDisplayObject("gBackground");
+            if (!target)
+                return;
+
+            attempted = true;
+
+            AptValue* beforeValue = GetVariable(target, "_x");
+            const float before = ToFloat(beforeValue);
+            const float requested = before + 40.0f;
+
+            const bool ok = SetFloat(target, "_x", requested);
+
+            AptValue* afterValue = GetVariable(target, "_x");
+            const float after = ToFloat(afterValue);
+
+            Log("\n============================================================\n");
+            Log("[APT06] PERSISTENT NAMED WRITE TEST\n");
+            Log("[APT06] target=gBackground obj=%08X oldX=%.2f requestedX=%.2f ok=%d readbackX=%.2f\n",
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(target)),
+                before,
+                requested,
+                ok ? 1 : 0,
+                after);
+            Log("[APT06] This write is intentionally NOT restored.\n");
+            Log("============================================================\n\n");
+        }
+
+
+        struct ResolutionTextRemap
+        {
+            const char* oldText;
+            const char* newText;
+        };
+
+        static const ResolutionTextRemap kResolutionTextRemaps[] =
+        {
+            { "640x480x16",   "640x480"   },
+            { "640x480x32",   "800x600"   },
+            { "800x600x16",   "1024x768"  },
+            { "800x600x32",   "1280x720"  },
+            { "1024x768x16",  "1280x1024" },
+            { "1024x768x32",  "1366x768"  },
+            { "1280x1024x16", "1440x900"  },
+            { "1280x1024x32", "1600x900"  },
+            { "1600x1200x16", "1920x1080" },
+            { "1600x1200x32", "2560x1440" },
+        };
+
+        static void ReleaseEAStringData(void* data)
+        {
+            if (!data)
+                return;
+
+            // Never attempt to free the runtime's static empty-string object.
+            if (data == reinterpret_cast<void*>(0x00C65BD8))
+                return;
+
+            auto* refCount = reinterpret_cast<unsigned short*>(data);
+
+            if (*refCount != 0)
+                --(*refCount);
+
+            if (*refCount == 0)
+            {
+                void* callbacks = *reinterpret_cast<void**>(0x00CE270C);
+                if (callbacks)
+                {
+                    using FreeFn = void (__cdecl*)(void*);
+                    FreeFn freeFn = *reinterpret_cast<FreeFn*>(
+                        reinterpret_cast<unsigned char*>(callbacks) + 4);
+
+                    if (freeFn)
+                        freeFn(data);
+                }
+            }
+        }
+
+        static bool SetText(AptValue* object, const char* newText)
+        {
+            if (!object || !newText)
+                return false;
+
+            // Ask EA for the object's current TextField.text value.  This gives
+            // us a correctly constructed AptString value that can be passed
+            // straight back through AptExtObject::SetVariable.
+            AptValue* value = GetVariable(object, "text");
+            if (!value)
+                return false;
+
+            AptValue* stringValue = value;
+
+            // Some APT getters can return a wrapper whose underlying AptValue
+            // lives at +0x1C.
+            if (Type(stringValue) == 42)
+            {
+                stringValue = *reinterpret_cast<AptValue**>(
+                    reinterpret_cast<unsigned char*>(stringValue) + 0x1C);
+
+                if (!stringValue)
+                    return false;
+            }
+
+            if (Type(stringValue) != 1)
+                return false;
+
+            EAStringC replacement{};
+            reinterpret_cast<MakeStringFn>(0x0077E750)(
+                &replacement,
+                newText);
+
+            if (!replacement.data)
+                return false;
+
+            // AptString stores its EAStringC backing pointer at +8. Transfer
+            // the newly-created string into the already-valid AptString value.
+            void*& stringSlot = *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(stringValue) + 8);
+
+            void* oldData = stringSlot;
+            stringSlot = replacement.data;
+            replacement.data = nullptr; // ownership transferred to AptString
+
+            ReleaseEAStringData(oldData);
+
+            EAStringC property{};
+            reinterpret_cast<MakeStringFn>(0x0077E750)(
+                &property,
+                "text");
+
+            const bool ok =
+                property.data &&
+                reinterpret_cast<SetVariableFn>(0x007AB960)(
+                    object,
+                    &property,
+                    stringValue);
+
+            ReleaseString(property);
+            return ok;
+        }
+
+        static bool NormalizeResolutionText(
+            const char* input,
+            char* output,
+            size_t outputSize)
+        {
+            if (!input || !output || outputSize == 0)
+                return false;
+
+            size_t out = 0;
+            bool sawDigit = false;
+            bool sawX = false;
+
+            for (const unsigned char* p =
+                     reinterpret_cast<const unsigned char*>(input);
+                 *p;
+                 ++p)
+            {
+                const unsigned char c = *p;
+
+                if (c >= '0' && c <= '9')
+                {
+                    if (out + 1 >= outputSize)
+                        return false;
+
+                    output[out++] = static_cast<char>(c);
+                    sawDigit = true;
+                    continue;
+                }
+
+                if (c == 'x' || c == 'X')
+                {
+                    if (out + 1 >= outputSize)
+                        return false;
+
+                    output[out++] = 'x';
+                    sawX = true;
+                    continue;
+                }
+
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+                    continue;
+
+                // Not a plain resolution/depth label.
+                return false;
+            }
+
+            output[out] = '\0';
+            return sawDigit && sawX;
+        }
+
+        static const ResolutionTextRemap* FindResolutionTextRemap(
+            const char* textValue)
+        {
+            if (!textValue || !*textValue)
+                return nullptr;
+
+            char normalized[64]{};
+            if (!NormalizeResolutionText(
+                    textValue,
+                    normalized,
+                    sizeof(normalized)))
+                return nullptr;
+
+            for (const auto& remap : kResolutionTextRemaps)
+            {
+                if (strcmp(normalized, remap.oldText) == 0)
+                    return &remap;
+            }
+
+            return nullptr;
+        }
+
+        static unsigned int PatchResolutionTextRecursive(
+            AptValue* parent,
+            unsigned int depth,
+            unsigned int& safety)
+        {
+            if (!parent || depth > 16 || safety >= 4096)
+                return 0;
+
+            void* metadata = ReadVoidPtr(parent, 0x48);
+            if (!metadata || metadata == reinterpret_cast<void*>(0xBAADF00D))
+                return 0;
+
+            void* childList = ReadVoidPtr(metadata, 0x24);
+            if (!childList)
+                return 0;
+
+            AptValue* child = ReadPtr(childList, 0x00);
+            unsigned int siblingSafety = 0;
+            unsigned int patched = 0;
+
+            while (child && safety < 4096 && siblingSafety++ < 1024)
+            {
+                if (!IsReadablePointer(child, 0x5C))
+                    break;
+
+                ++safety;
+
+                const unsigned int type = Type(child);
+
+                if (type == 0x0F)
+                {
+                    AptValue* textValue = GetVariable(child, "text");
+                    const char* currentText = StringValueText(textValue);
+
+                    if (const ResolutionTextRemap* remap =
+                            FindResolutionTextRemap(currentText))
+                    {
+                        char before[64]{};
+                        strcpy_s(before, currentText);
+
+                        const bool ok = SetText(child, remap->newText);
+
+                        AptValue* readbackValue = GetVariable(child, "text");
+                        const char* readback = StringValueText(readbackValue);
+
+                        Log(
+                            "[APT06] RESOLUTION TEXT \"%s\" -> \"%s\" "
+                            "obj=%08X ok=%d readback=\"%s\"\n",
+                            before,
+                            remap->newText,
+                            static_cast<unsigned int>(
+                                reinterpret_cast<uintptr_t>(child)),
+                            ok ? 1 : 0,
+                            readback ? readback : "<null>");
+
+                        if (ok)
+                            ++patched;
+                    }
+                }
+
+                if (type >= 0x0C && type <= 0x13)
+                    patched += PatchResolutionTextRecursive(
+                        child, depth + 1, safety);
+
+                AptValue* next = ReadPtr(child, 0x50);
+                if (next == child)
+                    break;
+
+                child = next;
+            }
+
+            return patched;
+        }
+
+
+        using TextPropertyLookupFn = void* (__cdecl*)(const char*, unsigned int);
+
+        static int TextPropertyId(const char* name)
+        {
+            if (!name)
+                return 0;
+
+            auto fn = reinterpret_cast<TextPropertyLookupFn>(0x00775BB0);
+            void* record = fn(name, static_cast<unsigned int>(strlen(name)));
+            if (!record)
+                return 0;
+
+            return *reinterpret_cast<int*>(
+                reinterpret_cast<unsigned char*>(record) + 4);
+        }
+
+        static const char* RawTextMetadataString(AptValue* object)
+        {
+            if (!object || Type(object) != 0x0F)
+                return nullptr;
+
+            void* metadata = ReadVoidPtr(object, 0x48);
+            if (!metadata || metadata == reinterpret_cast<void*>(0xBAADF00D))
+                return nullptr;
+
+            void* str = ReadVoidPtr(metadata, 0x18);
+            if (!str || !IsReadablePointer(str, 8))
+                return nullptr;
+
+            const unsigned short len =
+                *reinterpret_cast<unsigned short*>(
+                    reinterpret_cast<unsigned char*>(str) + 2);
+
+            if (len > 1024 || !IsReadablePointer(
+                    reinterpret_cast<unsigned char*>(str) + 8,
+                    static_cast<size_t>(len) + 1))
+                return nullptr;
+
+            return reinterpret_cast<const char*>(
+                reinterpret_cast<unsigned char*>(str) + 8);
+        }
+
+        static unsigned int ProbeResolutionCandidatesRecursive(
+            AptValue* parent,
+            unsigned int depth,
+            unsigned int& safety,
+            unsigned int& candidates)
+        {
+            if (!parent || depth > 16 || safety >= 4096)
+                return candidates;
+
+            void* metadata = ReadVoidPtr(parent, 0x48);
+            if (!metadata || metadata == reinterpret_cast<void*>(0xBAADF00D))
+                return candidates;
+
+            void* childList = ReadVoidPtr(metadata, 0x24);
+            if (!childList)
+                return candidates;
+
+            AptValue* child = ReadPtr(childList, 0x00);
+            unsigned int siblingSafety = 0;
+
+            while (child && safety < 4096 && siblingSafety++ < 1024)
+            {
+                if (!IsReadablePointer(child, 0x5C))
+                    break;
+
+                ++safety;
+
+                const unsigned int type = Type(child);
+
+                if (type == 0x0F)
+                {
+                    AptValue* textValue = GetVariable(child, "text");
+                    const char* currentText = StringValueText(textValue);
+
+                    char normalized[64]{};
+                    if (currentText &&
+                        NormalizeResolutionText(
+                            currentText,
+                            normalized,
+                            sizeof(normalized)))
+                    {
+                        AptValue* nameValue = GetVariable(child, "_name");
+                        const char* objectName = StringValueText(nameValue);
+
+                        Log(
+                            "[APT06] RESOLUTION CANDIDATE obj=%08X "
+                            "name=\"%s\" text=\"%s\" normalized=\"%s\"\n",
+                            static_cast<unsigned int>(
+                                reinterpret_cast<uintptr_t>(child)),
+                            objectName ? objectName : "",
+                            currentText,
+                            normalized);
+
+                        ++candidates;
+                    }
+                }
+
+                if (type >= 0x0C && type <= 0x13)
+                    ProbeResolutionCandidatesRecursive(
+                        child, depth + 1, safety, candidates);
+
+                AptValue* next = ReadPtr(child, 0x50);
+                if (next == child)
+                    break;
+
+                child = next;
+            }
+
+            return candidates;
+        }
+
+        static void ProbeTextFieldsAPT()
+        {
+            static unsigned int frameCounter = 0;
+            static unsigned int snapshot = 0;
+
+            // Keep running. The previous probe stopped after eight snapshots
+            // even though _level0 remained the same while menus changed.
+            if ((++frameCounter % 60) != 0)
+                return;
+
+            AptValue* root = GetLevel(0);
+            if (!root)
+                return;
+
+            ++snapshot;
+
+            if (snapshot == 1)
+            {
+                Log("\n============================================================\n");
+                Log("[APT06] TEXT PROPERTY MAP\n");
+
+                const char* candidates[] =
+                {
+                    "text", "htmlText", "variable", "textColor",
+                    "background", "border", "autoSize",
+                    "multiline", "wordWrap", "selectable",
+                    "maxChars", "scroll", "hscroll"
+                };
+
+                for (const char* candidate : candidates)
+                {
+                    Log("[APT06] property-map \"%s\" -> id=%d\n",
+                        candidate, TextPropertyId(candidate));
+                }
+
+                Log("============================================================\n\n");
+            }
+
+            unsigned int safety = 0;
+            unsigned int found = 0;
+            ProbeResolutionCandidatesRecursive(root, 0, safety, found);
+
+            if (found)
+            {
+                Log(
+                    "[APT06] RESOLUTION CANDIDATE SNAPSHOT=%u "
+                    "found=%u visited=%u\n",
+                    snapshot,
+                    found,
+                    safety);
+            }
+        }
+
+        static void PatchResolutionTextsAPT()
+        {
+            static unsigned int frameCounter = 0;
+
+            // The resolution screen is created on demand. Keep this lightweight
+            // patch alive and check periodically so returning to the menu also
+            // patches newly-created text fields.
+            if ((++frameCounter % 10) != 0)
+                return;
+
+            AptValue* root = GetLevel(0);
+            if (!root)
+                return;
+
+            unsigned int safety = 0;
+            PatchResolutionTextRecursive(root, 0, safety);
+        }
+
+        static void DumpDisplayObjectsOnce()
+        {
+            static unsigned int delay = 0;
+            static bool dumped = false;
+            if (dumped)
+                return;
+
+            // Give the current frontend screen time to instantiate its clips.
+            if (++delay < 120)
+                return;
+
+            AptValue* root = GetLevel(0);
+            if (!root)
+                return;
+
+            dumped = true;
+
+            Log("\n============================================================\n");
+            Log("[APT06] LIVE DISPLAY TREE\n");
+            Log("[APT06] root=%08X type=%u\n",
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(root)),
+                Type(root));
+
+            void* metadata = ReadVoidPtr(root, 0x48);
+            void* childList = metadata ? ReadVoidPtr(metadata, 0x24) : nullptr;
+            AptValue* firstChild = childList ? ReadPtr(childList, 0x00) : nullptr;
+
+            Log("[APT06] root metadata=%08X childList=%08X firstChild=%08X\n",
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(metadata)),
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(childList)),
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(firstChild)));
+
+            unsigned int safety = 0;
+            const unsigned int total = DumpDisplayListRecursive(root, 0, safety);
+
+            Log("[APT06] tree_objects=%u safety=%u\n", total, safety);
+            Log("============================================================\n\n");
+        }
+
+    }
+
+    // -------------------------------------------------------------------------
+    // NBA Live 06 localized resolution-label override
+    //
+    // Proven path:
+    //   sub_555890("$TOKEN")
+    //      -> sub_41B710(out BBallWString*, token)
+    //      -> Localization singleton @ 0x00CAEB14
+    //      -> sub_41A430(this, out, token)
+    //
+    // sub_41A430 returns the localized UTF-16 string in the BBallWString
+    // wrapper passed as arg0.  We preserve the native lookup completely and
+    // only replace the ten stock resolution labels after localization.
+    //
+    // This avoids:
+    //   - process-wide memory scanning
+    //   - APT TextField traversal
+    //   - editing locale.eng on disk
+    // -------------------------------------------------------------------------
+
+    struct LocalizedResolutionRemap06
+    {
+        const wchar_t* oldText;
+        const char* newText;
+    };
+
+    static const LocalizedResolutionRemap06 kLocalizedResolutionRemaps06[] =
+    {
+        { L"640x480x16",   "640x480"   },
+        { L"640x480x32",   "800x600"   },
+        { L"800x600x16",   "1024x768"  },
+        { L"800x600x32",   "1280x720"  },
+        { L"1024x768x16",  "1280x1024" },
+        { L"1024x768x32",  "1366x768"  },
+        { L"1280x1024x16", "1440x900"  },
+        { L"1280x1024x32", "1600x900"  },
+        { L"1600x1200x16", "1920x1080" },
+        { L"1600x1200x32", "2560x1440" },
+    };
+
+    static void* __cdecl LocalizeStringHook06(void* outString, const char* token)
+    {
+        // Reproduce sub_41B710 exactly first.
+        void* localization =
+            *reinterpret_cast<void**>(0x00CAEB14);
+
+        using NativeLookupFn =
+            void* (__thiscall*)(void*, void*, const char*);
+
+        reinterpret_cast<NativeLookupFn>(0x0041A430)(
+            localization,
+            outString,
+            token);
+
+        if (!outString)
+            return outString;
+
+        const wchar_t* localized =
+            *reinterpret_cast<const wchar_t**>(outString);
+
+        if (!localized)
+            return outString;
+
+        for (const auto& remap : kLocalizedResolutionRemaps06)
+        {
+            if (std::wcscmp(localized, remap.oldText) != 0)
+                continue;
+
+            // sub_41A020 is the native BBallWString UTF-8 assignment helper.
+            // It replaces the wrapper's current shared UTF-16 string and
+            // preserves the game's own allocation/refcount behavior.
+            using AssignUtf8Fn =
+                void (__thiscall*)(void*, const char*);
+
+            reinterpret_cast<AssignUtf8Fn>(0x0041A020)(
+                outString,
+                remap.newText);
+
+            apt06::Log(
+                "[LOC06] resolution label token=\"%s\" -> \"%s\"\n",
+                token ? token : "<null>",
+                remap.newText);
+
+            break;
+        }
+
+        return outString;
+    }
+
+    // -------------------------------------------------------------------------
+    // APT frontend timing probe
+    //
+    // 0x7BA230 is a public one-argument thunk that jumps directly to 0x7BA130.
+    // Static analysis proves 0x7BA130 forwards arg0 through EAX to 0x7B9D40,
+    // where it is accumulated against the movie/timeline step threshold.
+    //
+    // This probe preserves the native update exactly, but records the incoming
+    // delta/tick values and call frequency once per wall-clock second.
+    // -------------------------------------------------------------------------
+
+    static void __cdecl APT_UpdateNormalized06(int delta)
+    {
+        // The FE loop can run at thousands of iterations/sec when presentation
+        // is uncapped.  APT receives delta=1 on every iteration, so its movie
+        // timeline advances thousands of logical ticks/sec.
+        //
+        // Keep explicit multi-tick advances (>1) intact, but rate-limit the
+        // ordinary delta=1 timeline tick to a fixed real-time cadence.
+        //
+        // 60 is the first test target.  If stock-feel animation is still too
+        // fast, change this to 30 and compare.
+        static constexpr double kFrontendTimelineHz = 60.0;
+
+        using NativeAptUpdateFn = void (__cdecl*)(int);
+        auto NativeUpdate =
+            reinterpret_cast<NativeAptUpdateFn>(0x007BA130);
+
+        if (delta != 1)
+        {
+            NativeUpdate(delta);
+            return;
+        }
+
+        static LARGE_INTEGER frequency{};
+        static LARGE_INTEGER lastTick{};
+        static bool initialized = false;
+
+        LARGE_INTEGER now{};
+
+        if (!initialized)
+        {
+            QueryPerformanceFrequency(&frequency);
+            QueryPerformanceCounter(&lastTick);
+            initialized = true;
+
+            // Preserve the first logical tick immediately.
+            NativeUpdate(1);
+            return;
+        }
+
+        QueryPerformanceCounter(&now);
+
+        if (frequency.QuadPart <= 0)
+        {
+            NativeUpdate(1);
+            lastTick = now;
+            return;
+        }
+
+        const double elapsedSeconds =
+            static_cast<double>(now.QuadPart - lastTick.QuadPart) /
+            static_cast<double>(frequency.QuadPart);
+
+        const double intervalSeconds = 1.0 / kFrontendTimelineHz;
+
+        if (elapsedSeconds < intervalSeconds)
+            return;
+
+        // Advance exactly one APT logical tick.  Do not "catch up" thousands
+        // of calls: the runaway input itself is what made the FE too fast.
+        NativeUpdate(1);
+
+        // Move forward by the ideal interval rather than snapping to now.
+        // If the process stalls badly, reset instead of generating a burst.
+        const LONGLONG intervalCounts =
+            static_cast<LONGLONG>(
+                static_cast<double>(frequency.QuadPart) /
+                kFrontendTimelineHz);
+
+        if (intervalCounts > 0 &&
+            (now.QuadPart - lastTick.QuadPart) <
+                (intervalCounts * 4))
+        {
+            lastTick.QuadPart += intervalCounts;
+        }
+        else
+        {
+            lastTick = now;
+        }
+    }
+
     static void PatchResolutionMenuStrings06();
-	
+
     // Function that scales UI components properly for widescreen
     DWORD METHOD FEAptInterface_Render(DWORD* t, DUMMY_ARG, char a1, int a2)
     {
-        // The frontend has created its runtime copies of the stock resolution
-        // labels by the time this render path is active. Retry until all ten
-        // strings are patched, then this becomes a no-op.
-        PatchResolutionMenuStrings06();
+        // Native APT inspection. The previous +80 render-space proof has
+        // been removed; rendering is back at its normal position.
+
+        // Resolution labels are sourced through localization. Do not scan
+        // process memory and do not patch APT TextFields here.
+        // PatchResolutionMenuStrings06();
 
         int v3;
         float v4[17];
@@ -511,15 +1651,19 @@ namespace live06 {
     // -------------------------------------------------------------------------
     // NBA Live 06 runtime resolution-menu labels
     //
-    // The real mode table at 0xC4CF38 is patched separately below. The
-    // frontend later creates plain ANSI copies of the stock mode labels in
-    // writable FE memory. These strings are not generated by the
-    // $TXT_DTL_INGAME_RESOLUTION localization token; that token is only the
-    // menu caption.
+    // EA's frontend copies the stock labels into transient allocations. The
+    // old implementation walked *all* writable private memory and called
+    // memcmp() directly on those regions every render frame. VirtualQuery
+    // is only a point-in-time observation: allocations can be freed between
+    // the query and the compare. This caused the ASI memcmp access violation.
     //
-    // Replace only exact stock video-mode strings in writable MEM_PRIVATE
-    // regions. Every replacement is shorter than or equal to the original,
-    // so no allocation or FEString layout changes are required.
+    // This compatibility implementation does not directly dereference any
+    // inspected game address. ReadProcessMemory takes a bounded snapshot;
+    // WriteProcessMemory performs the conditional replacement. Both can fail
+    // without an access violation in our scanner. Each pass checks all ten
+    // labels once, at a throttled interval, and remembers individual matches.
+    //
+    // This remains a heuristic scan, not a targeted frontend string hook.
     // -------------------------------------------------------------------------
 
     struct ResolutionStringRemap06
@@ -542,139 +1686,163 @@ namespace live06 {
         { "1600x1200x32", "2560x1440" },
     };
 
+    static constexpr size_t kResolutionRemapCount06 =
+        sizeof(kResolutionStringRemaps06) / sizeof(kResolutionStringRemaps06[0]);
+    static constexpr size_t kResolutionScanChunk06 = 64 * 1024;
+    static constexpr size_t kResolutionScanOverlap06 = 32;
+
     static bool IsWritableFrontendMemory06(DWORD protect)
     {
-        if (protect & PAGE_GUARD)
+        if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
             return false;
 
-        if (protect & PAGE_NOACCESS)
+        switch (protect & 0xFF)
+        {
+        case PAGE_READWRITE:
+        case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
             return false;
-
-        protect &= 0xFF;
-
-        return
-            protect == PAGE_READWRITE ||
-            protect == PAGE_WRITECOPY ||
-            protect == PAGE_EXECUTE_READWRITE ||
-            protect == PAGE_EXECUTE_WRITECOPY;
+        }
     }
 
-    static int ReplaceResolutionStringInRegion06(
-        unsigned char* base,
-        size_t size,
-        const char* oldText,
-        const char* newText)
+    static bool TryReplaceResolutionString06(
+        HANDLE process, uintptr_t address,
+        const ResolutionStringRemap06& remap,
+        size_t oldLen, size_t newLen)
     {
-        if (!base || !oldText || !newText)
-            return 0;
+        // Re-read immediately before writing. The scanned snapshot may be
+        // stale, and the original allocation might no longer exist.
+        char current[32] = {};
+        SIZE_T bytesRead = 0;
+        if (oldLen + 1 > sizeof(current) ||
+            !ReadProcessMemory(process,
+                reinterpret_cast<LPCVOID>(address),
+                current, oldLen + 1, &bytesRead) ||
+            bytesRead != oldLen + 1 ||
+            memcmp(current, remap.oldText, oldLen) != 0 ||
+            current[oldLen] != '\0')
+            return false;
 
-        const size_t oldLen = strlen(oldText);
-        const size_t newLen = strlen(newText);
+        char replacement[32] = {};
+        memcpy(replacement, remap.newText, newLen);
+        SIZE_T bytesWritten = 0;
+        return WriteProcessMemory(process,
+            reinterpret_cast<LPVOID>(address),
+            replacement, oldLen + 1, &bytesWritten) != FALSE &&
+            bytesWritten == oldLen + 1;
+    }
 
-        if (oldLen == 0 || newLen > oldLen || size < oldLen + 1)
-            return 0;
+    static void ScanResolutionMenuStrings06(unsigned int& foundMask)
+    {
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        const uintptr_t maximum =
+            reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
+        uintptr_t address =
+            reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress);
+        HANDLE process = GetCurrentProcess();
 
-        int hits = 0;
-
-        for (size_t i = 0; i + oldLen < size; ++i)
+        // Static scratch buffer avoids large per-frame stack allocations.
+        static unsigned char snapshot[kResolutionScanChunk06];
+        size_t oldLengths[kResolutionRemapCount06] = {};
+        size_t newLengths[kResolutionRemapCount06] = {};
+        for (size_t i = 0; i < kResolutionRemapCount06; ++i)
         {
-            // Match the complete C string only.
-            if (memcmp(base + i, oldText, oldLen) != 0)
-                continue;
-
-            if (base[i + oldLen] != '\0')
-                continue;
-
-            memset(base + i, 0, oldLen + 1);
-            memcpy(base + i, newText, newLen);
-
-            ++hits;
-            i += oldLen;
+            oldLengths[i] = strlen(kResolutionStringRemaps06[i].oldText);
+            newLengths[i] = strlen(kResolutionStringRemaps06[i].newText);
         }
 
-        return hits;
-    }
-
-    static int ReplaceResolutionStringEverywhere06(
-        const char* oldText,
-        const char* newText)
-    {
-        SYSTEM_INFO systemInfo{};
-        GetSystemInfo(&systemInfo);
-
-        uintptr_t address =
-            reinterpret_cast<uintptr_t>(
-                systemInfo.lpMinimumApplicationAddress);
-
-        const uintptr_t maximumAddress =
-            reinterpret_cast<uintptr_t>(
-                systemInfo.lpMaximumApplicationAddress);
-
-        int hits = 0;
-
-        while (address < maximumAddress)
+        while (address < maximum)
         {
             MEMORY_BASIC_INFORMATION mbi{};
-
-            if (VirtualQuery(
-                    reinterpret_cast<const void*>(address),
-                    &mbi,
-                    sizeof(mbi)) != sizeof(mbi))
-            {
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(address),
+                &mbi, sizeof(mbi)) != sizeof(mbi))
                 break;
-            }
 
-            if (mbi.State == MEM_COMMIT &&
-                mbi.Type == MEM_PRIVATE &&
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            const SIZE_T regionSize = mbi.RegionSize;
+            if (regionSize == 0 || base > UINTPTR_MAX - regionSize)
+                break;
+            const uintptr_t next = base + regionSize;
+            if (next <= address)
+                break;
+
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
                 IsWritableFrontendMemory06(mbi.Protect))
             {
-                hits += ReplaceResolutionStringInRegion06(
-                    static_cast<unsigned char*>(mbi.BaseAddress),
-                    static_cast<size_t>(mbi.RegionSize),
-                    oldText,
-                    newText);
+                uintptr_t cursor = base;
+                while (cursor < next)
+                {
+                    const size_t bytesToRead = static_cast<size_t>(
+                        (next - cursor < kResolutionScanChunk06) ?
+                        next - cursor : kResolutionScanChunk06);
+                    SIZE_T bytesRead = 0;
+                    if (ReadProcessMemory(process,
+                        reinterpret_cast<LPCVOID>(cursor),
+                        snapshot, bytesToRead, &bytesRead) &&
+                        bytesRead == bytesToRead)
+                    {
+                        for (size_t offset = 0; offset < bytesRead; ++offset)
+                        {
+                            // Every old string begins with a digit.
+                            if (snapshot[offset] < '0' || snapshot[offset] > '9')
+                                continue;
+
+                            for (size_t i = 0; i < kResolutionRemapCount06; ++i)
+                            {
+                                const size_t oldLen = oldLengths[i];
+                                if (oldLen == 0 || newLengths[i] > oldLen ||
+                                    oldLen + 1 > bytesRead - offset)
+                                    continue;
+                                const auto& remap = kResolutionStringRemaps06[i];
+                                if (snapshot[offset + oldLen] != 0 ||
+                                    memcmp(snapshot + offset, remap.oldText, oldLen) != 0)
+                                    continue;
+                                if (TryReplaceResolutionString06(process,
+                                    cursor + offset, remap, oldLen, newLengths[i]))
+                                    foundMask |= (1u << i);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Overlap catches strings crossing a chunk boundary.
+                    if (bytesToRead == next - cursor)
+                        break;
+                    cursor += bytesToRead - kResolutionScanOverlap06;
+                }
             }
-
-            const uintptr_t nextAddress =
-                reinterpret_cast<uintptr_t>(mbi.BaseAddress) +
-                static_cast<uintptr_t>(mbi.RegionSize);
-
-            if (nextAddress <= address)
-                break;
-
-            address = nextAddress;
+            address = next;
         }
-
-        return hits;
     }
 
     static void PatchResolutionMenuStrings06()
     {
+        static unsigned int foundMask = 0;
+        static unsigned int frameCounter = 0;
         static bool completed = false;
-
         if (completed)
             return;
 
-        int totalHits = 0;
+        // Do not scan during the earliest frontend frames. Scanning every
+        // render call was costly and increased startup/focus race exposure.
+        // Once started, retry approximately every 120 render calls.
+        if (++frameCounter < 120)
+            return;
+        frameCounter = 0;
 
-        for (const auto& remap : kResolutionStringRemaps06)
-        {
-            totalHits += ReplaceResolutionStringEverywhere06(
-                remap.oldText,
-                remap.newText);
-        }
-
-        // The frontend creates all ten stock entries together. Do not stop
-        // retrying until all ten have been found at least once in the same
-        // scan; this prevents an early startup call from permanently marking
-        // the patch complete.
-        if (totalHits >= 10)
+        ScanResolutionMenuStrings06(foundMask);
+        const unsigned int completeMask =
+            (1u << kResolutionRemapCount06) - 1u;
+        if ((foundMask & completeMask) == completeMask)
             completed = true;
     }
 
-    // Run the string replacement from a function that already executes every
-    // frontend frame. This avoids startup-order assumptions and requires no
-    // extra game hook solely for the labels.
+    // Legacy compatibility scanner retained below for reference only.
+    // Production resolution labels now use LocalizeStringHook06.
 
 }
 
@@ -685,6 +1853,13 @@ void Install_LIVE06() {
     patch::RedirectJump(0x73E3C0, SetTestInConicalFrustum06);
     // High-resolution APT/RealFont rendering
     InstallHighResolutionAptFonts06();
+
+    // Localized resolution labels. Hook the native localization wrapper
+    // instead of scanning process memory or patching APT TextFields.
+    patch::RedirectJump(0x0041B710, LocalizeStringHook06);
+
+    // Normalize the APT logical timeline when the FE loop is uncapped.
+    patch::RedirectJump(0x007BA230, APT_UpdateNormalized06);
     // Sets resolutions
     for (const auto& resolution : ids) {
         patch::SetUInt(0xC4CF38 + 20 * resolution.id + 4, resolution.width);

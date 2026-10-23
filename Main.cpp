@@ -6,9 +6,15 @@
 
 using namespace plugin;
 
+namespace NBALiveTurnoverFix {
+    bool Install() noexcept;
+}
+
 void EnableWindowed();
 void InitializeShotClock();
 void InitializeStartupTeams();
+void InitializeControllerSetup();
+void InitializeDeviceNavigation();
 void InitializeMemoryUpgrader();
 void InitializeStadiumDornaConfig();
 void InitializeJumbotronRuntime();
@@ -55,10 +61,20 @@ public:
         InitializeAntiAliasing();
         NBAResolution0508();
 
+        if (NBALiveTurnoverFix::Install()) {
+            OutputDebugStringA("[NBALiveTurnoverFix] Installed.\n");
+        }
+        else if (FM::GetEntryPoint() == 0x40109F &&
+                 patch::GetFloat(0xBD832C) == 1.3333334f) {
+            OutputDebugStringA("[NBALiveTurnoverFix] Not installed: check executable and original bytes.\n");
+        }
+
         // Keep initialization order explicit.
         EnableWindowed();
         InitializeShotClock();
         InitializeStartupTeams();
+        InitializeControllerSetup();
+        InitializeDeviceNavigation();
         InitializeStadiumDornaConfig();
         InitializeJumbotronRuntime();
         InitializeAntiAliasing();

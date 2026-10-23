@@ -4,6 +4,8 @@
 
 namespace scoreboard {
 
+void SetRenderTargetScale(float scale);
+
 struct Frame {
     unsigned int gameClockRaw;
     unsigned int clockUnitsPerSecond;

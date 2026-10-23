@@ -38,6 +38,7 @@ struct Element {
     TextTransform textTransform;
     float smallCapsScale;
     float fontHeight;
+    float fontVerticalScale;
     D3DCOLOR textColor;
     bool strokeEnabled;
     D3DCOLOR strokeColor;
@@ -90,6 +91,8 @@ struct Config {
     ShotClockVisibility shotClockVisibility;
     unsigned int shotClockThreshold;
     unsigned int urgentShotClockThreshold;
+    char shotClockPrefix[8];
+    bool shotClockTwoDigits;
     D3DCOLOR shotClockNormalColor;
     D3DCOLOR shotClockUrgentColor;
 

@@ -49,17 +49,18 @@ all
 
 ### 1. Install the NBA Live ASI Loader
 
-NBA Live Launcher requires the **NBA Live ASI Loader**.
+Download the NO-CD fixed executable for the game you would prefer windowed mode. You need the NO-CD fixed executable as the plugin is designed for a certain version of an executable. NO-CD is also advised as original CD's of NBA Live 2005-08 series unfortunately do not run in Windows 10 and further.
 
-Install the ASI Loader into the main directory of the NBA Live game you
-want to use before installing NBA Live Launcher.
+Download ASI Loader and follow instructions in Installation section at its Readme file (Here: https://forums.nba-live.com/downloads.php?view=detail&df_id=13583).
 
-Follow the installation instructions provided with the ASI Loader.
+Make sure you have the latest release from Releases.
+
+Copy "d3d9.dll", "oledlg.dll" and "plugins" folders from the archive to your game's root folder. Otherwise, this plugin will not work.
 
 ### 2. Remove Previous Plugins
 
 If you previously used the standalone Windowed Mode or Resolution
-plugins, remove these files:
+plugins, remove these files in "plugins" folder:
 
 ``` text
 NBAWindowedMode.asi

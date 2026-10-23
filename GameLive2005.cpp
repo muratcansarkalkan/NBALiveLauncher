@@ -527,6 +527,102 @@ namespace live2005 {
     int czWidth = (int)((225.0f * (RES_Y / 480.0f)));
     int czHeight = (int)((303.0f * (RES_Y / 480.0f)));
 
+    // -------------------------------------------------------------------------
+    // NBA Live 2005 APT frontend timing normalization
+    //
+    // Proven native path:
+    //   FESystem::Update / FEAptInterface::Update
+    //       -> AptUpdate(uint) @ 0x007677B0
+    //       -> implementation @ 0x007676B0
+    //       -> timeline accumulator @ 0x00766A70
+    //
+    // The outer FE loop clamps its computed delta to at least 1. When that
+    // loop is effectively uncapped, delta=1 can be submitted thousands of
+    // times per real second. APT interprets the argument as elapsed timeline
+    // time, so animations run far too quickly.
+    //
+    // Preserve normal multi-millisecond native deltas. Only replace the
+    // pathological repeated delta=1 case with a QPC-derived real-time delta,
+    // delivered at about 60 logical updates per second.
+    // -------------------------------------------------------------------------
+
+    static void __cdecl AptUpdateNormalized05(unsigned int nativeDelta)
+    {
+        using NativeAptUpdateFn = void (__cdecl*)(unsigned int);
+        auto NativeAptUpdate =
+            reinterpret_cast<NativeAptUpdateFn>(0x007676B0);
+
+        static LARGE_INTEGER frequency{};
+        static LARGE_INTEGER lastCounter{};
+        static double pendingMilliseconds = 0.0;
+        static bool initialized = false;
+
+        LARGE_INTEGER now{};
+
+        if (!initialized)
+        {
+            if (!QueryPerformanceFrequency(&frequency) ||
+                frequency.QuadPart <= 0 ||
+                !QueryPerformanceCounter(&lastCounter))
+            {
+                // QPC unavailable: keep stock behavior.
+                NativeAptUpdate(nativeDelta);
+                return;
+            }
+
+            initialized = true;
+            NativeAptUpdate(nativeDelta);
+            return;
+        }
+
+        QueryPerformanceCounter(&now);
+
+        const LONGLONG elapsedCounts =
+            now.QuadPart - lastCounter.QuadPart;
+
+        lastCounter = now;
+
+        // A genuine native delta (>1) already represents useful elapsed time.
+        // Trust it and discard any fractional QPC accumulation so the two time
+        // sources do not double-count the same interval.
+        if (nativeDelta > 1)
+        {
+            pendingMilliseconds = 0.0;
+            NativeAptUpdate(nativeDelta);
+            return;
+        }
+
+        if (elapsedCounts <= 0)
+            return;
+
+        pendingMilliseconds +=
+            (static_cast<double>(elapsedCounts) * 1000.0) /
+            static_cast<double>(frequency.QuadPart);
+
+        // Keep the APT/script update cadence near 60 Hz while passing actual
+        // elapsed milliseconds. This preserves animation speed without tying
+        // APT progression to the uncapped FE loop frequency.
+        static constexpr double kDispatchIntervalMs = 1000.0 / 60.0;
+
+        if (pendingMilliseconds < kDispatchIntervalMs)
+            return;
+
+        unsigned int elapsedMs =
+            static_cast<unsigned int>(pendingMilliseconds);
+
+        // The stock FESystem path caps its APT delta to 0x20 (32), so retain
+        // that safety bound here as well. Large stalls are consumed over later
+        // updates instead of producing one huge timeline jump.
+        if (elapsedMs > 0x20)
+            elapsedMs = 0x20;
+
+        if (elapsedMs == 0)
+            return;
+
+        pendingMilliseconds -= static_cast<double>(elapsedMs);
+        NativeAptUpdate(elapsedMs);
+    }
+
 }
 
 void Install_LIVE2005() {
@@ -535,6 +631,11 @@ void Install_LIVE2005() {
     patch::RedirectJump(0x6EC921, SetPerspectiveProjection05);
     patch::RedirectJump(0x728050, SetTestInConicalFrustum);
     InstallHighResolutionAptFonts05();
+
+    // Decouple APT timeline progression from the uncapped frontend loop.
+    // AptUpdate__FUi is a one-instruction public thunk, so redirecting it
+    // leaves the native implementation available at 0x007676B0.
+    patch::RedirectJump(0x007677B0, AptUpdateNormalized05);
     // Changes size of buffer.
     patch::SetUInt(0x41E8A0 + 1, RES_Y);
     patch::SetUInt(0x41E865 + 1, RES_X);
@@ -549,19 +650,24 @@ void Install_LIVE2005() {
     patch::SetUInt(0x5F85DA + 1, RES_X);
     patch::SetUInt(0x5F2BA6 + 1, RES_Y);
     patch::SetUInt(0x5F2BAB + 1, RES_X);
-    // Capture the stock labels before overwriting the original mode table.
+    // Keep the normal ten-entry Detail Settings resolution list visible.
+    // The menu labels and native mode table use the same list, exactly as in
+    // the previous working implementation.
     gResolutionMenuStrings05.Initialize(
         0xBDF758,
         ids,
         sizeof(ids) / sizeof(ids[0])
     );
 
-    // modify resolution addresses
     for (const auto& resolution : ids) {
         patch::SetUInt(0xBDF758 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xBDF758 + 20 * resolution.id + 8, resolution.height);
         patch::SetUInt(0xBDF758 + 20 * resolution.id + 12, resolution.depth);
-    };
+    }
+
+    // RES_X / RES_Y still remain the launch/runtime resolution used by the
+    // existing window, buffer, menu and post-game patches elsewhere in this
+    // file.  Do not collapse the Detail Settings list to a single mode.
     // UI adjustment
     patch::RedirectJump(0x4C5560, FEAptInterface_Render);
     patch::RedirectJump(0x617660, BroadcastMouseInput);

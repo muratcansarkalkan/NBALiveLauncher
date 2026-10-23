@@ -8,7 +8,30 @@
 #include <io.h>
 #include <fcntl.h>
 #include <intrin.h>
+#include <algorithm>
+#include <map>
+#include <string>
+#include <vector>
 #pragma intrinsic(_ReturnAddress)
+
+// NBA Live 06 loading capture (optional, console must be disabled):
+//   [DEBUG] CONSOLE=0
+//   [LOADING_PROFILE] ENABLED=1, AUTO_START=0, MAX_EVENTS=65536
+// AUTO_CAPTURE=1 (default) captures 5on5.scn entry through pregame intro setup.
+// MAX_SECONDS=120 saves a labeled partial capture if the intro is not reached.
+// AUTO_CAPTURE=0 restores optional F9 start/stop (AUTO_START also available).
+// Use separate INI lines for each key. Reports go beside the EXE in logs/.
+// loading_profile_06_status.log reports READY/CAPTURING/WRITING and hook coverage.
+// Each completed capture produces loading_06_*.csv and loading_06_*.log.
+// The CSV records native asset entry order plus intercepted file API timings;
+// it does not time native asset completion, parsing, decompression or GPU work.
+// AUTO_START=1 captures from profiler startup until F9. ENABLED=0 is the default.
+// Optional 2005/06/07/08 optimization: [LOADING] FAST_FILE_WAIT=1. Default 0.
+// Changes only the verified filesystem completion-poll delay call. Keeps its
+// callback pump and completion checks; uses a separate auto-reset event signaled
+// by native file-worker completion, with an alertable 1-ms timeout. If the
+// completion hook cannot install, falls back to 63 yields then a 1-ms sleep.
+// No global Sleep/FPS/timer-resolution changes; native events stay untouched.
 
 namespace {
 
@@ -386,6 +409,750 @@ bool PatchIAT(const char* dllName, const char* procName, void* replacement, void
 }
 
 
+
+// Optional, bounded, quiet loading capture. This block lives in DebugConsole's
+// anonymous namespace and needs no additional project files or dependencies.
+namespace loadingprofile06 {
+enum Operation { ASSET, OPEN_A, OPEN_W, READ, FILE_WAIT, OP_COUNT };
+struct Event {
+    LONGLONG begin, end;
+    DWORD generation, thread, operation, error, flags, requested, completed;
+    DWORD bytesKnown, asynchronous, kind;
+    uintptr_t caller, context, handle;
+    char path[260];
+};
+struct FileHandle { HANDLE handle; char path[260]; };
+typedef BOOL (WINAPI *ReadFileFn)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+CreateFileA_t originalOpenA = nullptr;
+CreateFileW_t originalOpenW = nullptr;
+CloseHandle_t originalClose = nullptr;
+ReadFileFn originalRead = nullptr;
+CRITICAL_SECTION lock;
+Event* events = nullptr;
+FileHandle handles[2048] = {};
+size_t count = 0, capacity = 65536;
+DWORD generation = 0, dropped = 0, handleDrops = 0;
+volatile LONG capturing = 0;
+bool ready = false, assetHook = false, openAHook = false;
+bool openWHook = false, readHook = false, closeHook = false;
+bool fileWaitHook = false, fastFileWait = false;
+HANDLE fileCompletionEvent = nullptr;
+bool completionSignalHook = false;
+typedef BOOL (WINAPI *SetEventFn)(HANDLE);
+SetEventFn nativeSetEvent = nullptr;
+struct FileWaitBuild {
+    const char* name;
+    uintptr_t waitPush, delayHelper, sleepExIat, signalCall, setEventIat;
+};
+const FileWaitBuild fileWaitBuilds[] = {
+    { "2005", 0x006C5B01, 0x004292B3, 0x00CCED6C, 0x006C574C, 0x00CCED84 },
+    { "06",   0x006DC59B, 0x00429642, 0x00D30D88, 0x006DC196, 0x00D30DAC },
+    { "07",   0x007FF170, 0x00428E82, 0x00D49D90, 0x007FED6B, 0x00D49DB4 },
+    { "08",   0x0082E18F, 0x0042B6B2, 0x00E07D9C, 0x0082DD8A, 0x00E07DC0 }
+};
+const FileWaitBuild* waitBuild = nullptr;
+uintptr_t nativeDelayHelper = 0x00429642;
+
+// Shared signature validation is separate from memory access and patching.
+// This also lets the offline check use the actual bytes from all four EXEs.
+bool ValidateWaitBytes(const FileWaitBuild& build, const BYTE* wait, const BYTE* helper) {
+    BYTE expectedWait[] = { 0x6A, 0x01, 0xE8, 0, 0, 0, 0, 0x59 };
+    const int32_t relative = static_cast<int32_t>(build.delayHelper - (build.waitPush + 7));
+    std::memcpy(expectedWait + 3, &relative, 4);
+    BYTE expectedHelper[] = { 0x55, 0x8B, 0xEC, 0x6A, 0x01, 0xFF, 0x75, 0x08,
+        0xFF, 0x15, 0, 0, 0, 0, 0x5D, 0xC3 };
+    const DWORD iat = static_cast<DWORD>(build.sleepExIat);
+    std::memcpy(expectedHelper + 10, &iat, 4);
+    return !std::memcmp(wait, expectedWait, sizeof(expectedWait)) &&
+        !std::memcmp(helper, expectedHelper, sizeof(expectedHelper));
+}
+bool ValidateSignalBytes(const FileWaitBuild& build, const BYTE* bytes) {
+    BYTE expected[] = { 0xFF, 0x76, 0x78, 0xFF, 0x15, 0, 0, 0, 0,
+        0x83, 0x7E, 0x08, 0x00 };
+    const DWORD iat = static_cast<DWORD>(build.setEventIat);
+    std::memcpy(expected + 5, &iat, 4);
+    return !std::memcmp(bytes, expected, sizeof(expected));
+}
+const FileWaitBuild* DetectFileWaitBuild() {
+#if defined(_M_IX86)
+    const uintptr_t ep = FM::GetEntryPoint();
+    if (ep == 0xCD8005) return &fileWaitBuilds[0];
+    if (ep == 0x40109F) {
+        if (plugin::patch::GetFloat(0xBD832C) == 1.3333334f) return &fileWaitBuilds[1];
+        if (plugin::patch::GetFloat(0xBBBC3C) == 1.3333334f) return &fileWaitBuilds[2];
+        if (plugin::patch::GetFloat(0xC3DF84) == 1.3333334f) return &fileWaitBuilds[3];
+    }
+#endif
+    return nullptr;
+}
+bool autoCapture = true, introHook = false;
+DWORD maxCaptureSeconds = 120;
+volatile LONG pendingSave = 0, pendingStatus = 0;
+const char* startReason = "manual";
+const char* stopReason = "manual";
+struct WaitSummary {
+    unsigned long long calls, zeroMs, oneMs, otherMs;
+    unsigned long long notified, timedOut, alertable, waitFailed;
+    LONGLONG ticks, maximum;
+};
+WaitSummary waitTotal = {}, waitSeconds[601] = {};
+struct WaitSample { DWORD generation; LONGLONG begin; bool active; };
+__declspec(thread) unsigned int shortWaitCount = 0;
+LARGE_INTEGER frequency = {}, captureBegin = {}, captureEnd = {};
+char logDirectory[MAX_PATH] = {};
+char captureStem[MAX_PATH] = {};
+__declspec(thread) bool internal = false;
+
+void CopyPath(char* out, const char* path) {
+    size_t i = 0;
+    __try {
+        if (path) for (; i < 259 && path[i]; ++i) out[i] = path[i];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        const char invalid[] = "<invalid-path>";
+        std::memcpy(out, invalid, sizeof(invalid));
+        return;
+    }
+    out[i] = 0;
+}
+
+// Open-addressed table: null is empty, INVALID_HANDLE_VALUE is a tombstone.
+// Tracking continues between captures so archives opened earlier retain names.
+size_t HandleBucket(HANDLE h) {
+    return (reinterpret_cast<uintptr_t>(h) >> 2) & 2047;
+}
+void Remember(HANDLE h, const char* path) {
+    if (!h || h == INVALID_HANDLE_VALUE) return;
+    EnterCriticalSection(&lock);
+    size_t firstFree = 2048;
+    for (size_t n = 0; n < 2048; ++n) {
+        const size_t i = (HandleBucket(h) + n) & 2047;
+        if (handles[i].handle == h) { firstFree = i; break; }
+        if (handles[i].handle == INVALID_HANDLE_VALUE && firstFree == 2048)
+            firstFree = i;
+        if (!handles[i].handle) {
+            if (firstFree == 2048) firstFree = i;
+            break;
+        }
+    }
+    if (firstFree < 2048) {
+        handles[firstFree].handle = h;
+        CopyPath(handles[firstFree].path, path);
+    } else ++handleDrops;
+    LeaveCriticalSection(&lock);
+}
+void Lookup(HANDLE h, char* path, bool erase) {
+    CopyPath(path, "<untracked-handle>");
+    EnterCriticalSection(&lock);
+    for (size_t n = 0; n < 2048; ++n) {
+        const size_t i = (HandleBucket(h) + n) & 2047;
+        if (!handles[i].handle) break;
+        if (handles[i].handle == h) {
+            CopyPath(path, handles[i].path);
+            if (erase) handles[i].handle = INVALID_HANDLE_VALUE;
+            break;
+        }
+    }
+    LeaveCriticalSection(&lock);
+}
+
+bool Begin(Event& e, Operation op, uintptr_t caller) {
+    if (!capturing || internal) return false;
+    EnterCriticalSection(&lock);
+    const bool active = capturing != 0;
+    if (active) e.generation = generation;
+    LeaveCriticalSection(&lock);
+    if (!active) return false;
+    e.operation = op;
+    e.caller = caller;
+    e.thread = GetCurrentThreadId();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    e.begin = now.QuadPart;
+    return true;
+}
+void Append(Event& e) {
+    EnterCriticalSection(&lock);
+    // Calls crossing a stop/restart boundary belong to neither capture.
+    if (capturing && e.generation == generation) {
+        if (count < capacity) events[count++] = e;
+        else ++dropped;
+    }
+    LeaveCriticalSection(&lock);
+}
+void End(Event& e) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    e.end = now.QuadPart;
+}
+
+WaitSample BeginWait() {
+    WaitSample sample = {};
+    if (!ready || !capturing || internal) return sample;
+    EnterCriticalSection(&lock);
+    if (capturing) {
+        sample.active = true; sample.generation = generation;
+        LARGE_INTEGER now; QueryPerformanceCounter(&now); sample.begin = now.QuadPart;
+    }
+    LeaveCriticalSection(&lock);
+    return sample;
+}
+void AddWait(WaitSummary& sum, DWORD delay, LONGLONG ticks, bool eventWait, DWORD result) {
+    ++sum.calls;
+    if (!delay) ++sum.zeroMs;
+    else if (delay == 1) ++sum.oneMs;
+    else ++sum.otherMs;
+    if (eventWait) {
+        if (result == WAIT_OBJECT_0) ++sum.notified;
+        else if (result == WAIT_TIMEOUT) ++sum.timedOut;
+        else if (result == WAIT_IO_COMPLETION) ++sum.alertable;
+        else ++sum.waitFailed;
+    }
+    sum.ticks += ticks;
+    if (ticks > sum.maximum) sum.maximum = ticks;
+}
+void FinishWait(const WaitSample& sample, DWORD actual, bool eventWait = false, DWORD result = 0) {
+    if (!sample.active) return;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    EnterCriticalSection(&lock);
+    if (capturing && generation == sample.generation) {
+        const LONGLONG ticks = now.QuadPart - sample.begin;
+        size_t second = static_cast<size_t>((sample.begin - captureBegin.QuadPart) / frequency.QuadPart);
+        if (second > 600) second = 600;
+        AddWait(waitTotal, actual, ticks, eventWait, result);
+        AddWait(waitSeconds[second], actual, ticks, eventWait, result);
+    }
+    LeaveCriticalSection(&lock);
+}
+bool StartCore(const char* reason);
+void StopCore(const char* reason);
+
+void __cdecl OnPregameIntro() {
+    if (ready && autoCapture && capturing) StopCore("pregame-intro-entry:00461B69");
+}
+#if defined(_M_IX86)
+uintptr_t introDestination = 0x0045D240;
+__declspec(naked) void IntroBoundary() {
+    __asm {
+        pushfd
+        pushad
+        mov ebx, esp
+        sub esp, 528
+        and esp, -16
+        fxsave [esp]
+        call GetLastError
+        mov [esp + 512], eax
+        call OnPregameIntro
+        push dword ptr [esp + 512]
+        call SetLastError
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        // Tail-jump to the original entry (including its existing CustomPaths
+        // hook). The original return address and arguments remain untouched.
+        jmp dword ptr [introDestination]
+    }
+}
+#endif
+bool InstallIntroBoundary() {
+#if defined(_M_IX86)
+    const BYTE expected[] = { 0xE8, 0xD2, 0xB6, 0xFF, 0xFF };
+    BYTE* call = reinterpret_cast<BYTE*>(0x00461B69);
+    __try {
+        if (std::memcmp(call, expected, sizeof(expected))) return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    DWORD protect = 0;
+    if (!VirtualProtect(call, 5, PAGE_EXECUTE_READWRITE, &protect)) return false;
+    *reinterpret_cast<int32_t*>(call + 1) = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(&IntroBoundary) - 0x00461B6E);
+    DWORD ignored = 0;
+    VirtualProtect(call, 5, protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), call, 5);
+    introHook = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+BOOL WINAPI SignalFileCompletion(HANDLE nativeEvent) {
+    // Invoke the original SetEvent first and preserve its result/LastError.
+    // The plugin event has independent state; never reset the engine's event.
+    const BOOL result = nativeSetEvent(nativeEvent);
+    const DWORD error = GetLastError();
+    if (fileCompletionEvent) SetEvent(fileCompletionEvent);
+    SetLastError(error);
+    return result;
+}
+
+bool InstallCompletionSignal() {
+#if defined(_M_IX86)
+    if (completionSignalHook) return true;
+    // Each verified worker moves the request to its completion list, invokes
+    // its callback, then signals context+78 at the selected signalCall.
+    // The existing HANDLE argument and stdcall cleanup are unchanged.
+    if (!waitBuild) return false;
+    BYTE* site = reinterpret_cast<BYTE*>(waitBuild->signalCall);
+    __try {
+        if (!ValidateSignalBytes(*waitBuild, site - 3)) return false;
+        nativeSetEvent = *reinterpret_cast<SetEventFn*>(waitBuild->setEventIat);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!nativeSetEvent) return false;
+    HANDLE event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return false;
+    DWORD protect = 0;
+    if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &protect)) {
+        CloseHandle(event); return false;
+    }
+    fileCompletionEvent = event;
+    site[0] = 0xE8;
+    *reinterpret_cast<int32_t*>(site + 1) = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(&SignalFileCompletion) - (waitBuild->signalCall + 5));
+    site[5] = 0x90;
+    DWORD ignored = 0;
+    VirtualProtect(site, 6, protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), site, 6);
+    completionSignalHook = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void __cdecl FileCompletionDelay(DWORD milliseconds) {
+    DWORD actual = milliseconds;
+    const bool eventWait = fastFileWait && completionSignalHook && milliseconds == 1;
+    if (fastFileWait && !eventWait && milliseconds == 1) {
+        // A bounded yield sequence: never replace long waits with a busy loop.
+        // TLS avoids cross-thread interference. The original native loop still
+        // checks the queue and pumps callbacks between every call here.
+        shortWaitCount = (shortWaitCount + 1) & 63;
+        actual = shortWaitCount ? 0 : 1;
+    }
+    const DWORD incomingError = GetLastError();
+    const WaitSample sample = BeginWait();
+    SetLastError(incomingError);
+    DWORD waitResult = 0;
+    if (eventWait) {
+        // Auto-reset retains a completion arriving just before this wait.
+        // A completion for a different request is only a wakeup: the native
+        // loop rechecks its own request before deciding that it has finished.
+        waitResult = WaitForSingleObjectEx(fileCompletionEvent, 1, TRUE);
+    }
+    if (!eventWait || waitResult == WAIT_FAILED) {
+        if (eventWait) SetLastError(incomingError);
+        // Original helper remains the OFF/installation-failure fallback.
+        reinterpret_cast<void (__cdecl *)(DWORD)>(nativeDelayHelper)(actual);
+    }
+    const DWORD error = GetLastError();
+    FinishWait(sample, actual, eventWait, waitResult);
+    SetLastError(error);
+}
+
+bool InstallFileCompletionDelay(bool fast) {
+#if defined(_M_IX86)
+    if (fileWaitHook) return true;
+    waitBuild = DetectFileWaitBuild();
+    if (!waitBuild) return false;
+    // Verify push 1 / call delayHelper / pop ecx plus the complete helper.
+    // No instruction relocation, return-address rewriting, or global API hook.
+    BYTE* site = reinterpret_cast<BYTE*>(waitBuild->waitPush);
+    __try {
+        if (!ValidateWaitBytes(*waitBuild, site, reinterpret_cast<const BYTE*>(waitBuild->delayHelper)))
+            return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    DWORD protect = 0;
+    if (!VirtualProtect(site + 2, 5, PAGE_EXECUTE_READWRITE, &protect)) return false;
+    fastFileWait = fast;
+    nativeDelayHelper = waitBuild->delayHelper;
+    if (fast) InstallCompletionSignal();
+    *reinterpret_cast<int32_t*>(site + 3) = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(&FileCompletionDelay) - (waitBuild->waitPush + 7));
+    DWORD ignored = 0;
+    VirtualProtect(site + 2, 5, protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), site + 2, 5);
+    fileWaitHook = true;
+    OutputDebugStringA(fast ? "[Loading] FAST_FILE_WAIT installed.\n" :
+        "[Loading] Native file-completion wait timing installed (delay unchanged).\n");
+    return true;
+#else
+    return false;
+#endif
+}
+
+void WriteFileWaitInstallStatus(bool installed) {
+    // One small startup report; does not enable console/file tracing or run
+    // during individual file operations. FAST_FILE_WAIT works without profiling.
+    char directory[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameA(nullptr, directory, MAX_PATH);
+    if (!length || length >= MAX_PATH) return;
+    char* slash = std::strrchr(directory, '\\');
+    if (!slash) return;
+    *slash = 0;
+    if (std::strlen(directory) > 190) return;
+    strcat_s(directory, "\\logs");
+    if (!CreateDirectoryA(directory, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return;
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\loading_wait_%s.log", directory, waitBuild ? waitBuild->name : "unsupported");
+    FILE* out = nullptr;
+    if (!fopen_s(&out, path, "w") && out) {
+        SYSTEMTIME t; GetLocalTime(&t);
+        std::fprintf(out, "File-wait initialization %04u-%02u-%02u %02u:%02u:%02u\n",
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        std::fprintf(out, "game=%s requested_FAST_FILE_WAIT=1 installed=%d strategy=%s completion-signal-hook=%d\n",
+            waitBuild ? waitBuild->name : "unsupported", installed,
+            !installed ? "skipped" : completionSignalHook ? "completion-event" : "bounded-yields", completionSignalHook);
+        if (waitBuild) std::fprintf(out, "wait_call=%08lX helper=%08lX signal_call=%08lX\n",
+            static_cast<unsigned long>(waitBuild->waitPush + 2),
+            static_cast<unsigned long>(waitBuild->delayHelper), static_cast<unsigned long>(waitBuild->signalCall));
+        std::fprintf(out, "Startup status only; not a loading-duration capture. Native callbacks, completion checks and events remain in place.\n");
+        std::fclose(out);
+    }
+}
+
+void RecordAsset(const uintptr_t* stack) {
+    if (!ready || internal || !stack) return;
+    const DWORD previousError = GetLastError();
+    Event e = {};
+    __try {
+        // Trigger before recording the scene request, so it is the first marker.
+        // No disk output or heap allocation runs on this loader entry path.
+        if (autoCapture && !capturing && !pendingSave &&
+            !_stricmp(BaseNameOf(reinterpret_cast<const char*>(stack[2])), "5on5.scn"))
+            StartCore("asset-entry:5on5.scn");
+        if (Begin(e, ASSET, stack[0])) {
+            e.flags = static_cast<DWORD>(stack[3]);
+            e.context = stack[4];
+            e.kind = ClassifyAssetRequest(reinterpret_cast<void*>(stack[0]));
+            CopyPath(e.path, reinterpret_cast<const char*>(stack[2]));
+            e.end = e.begin; // ENTRY ONLY: never label this as a load duration.
+            Append(e);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    SetLastError(previousError);
+}
+
+HANDLE WINAPI OpenA(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
+                    DWORD creation, DWORD attributes, HANDLE templateFile) {
+    const DWORD incomingError = GetLastError();
+    Event e = {};
+    const bool active = Begin(e, OPEN_A, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    if (active) { CopyPath(e.path, path); e.flags = access; }
+    // Time only the original API, excluding name copying and bookkeeping.
+    if (active) { LARGE_INTEGER t; QueryPerformanceCounter(&t); e.begin = t.QuadPart; }
+    SetLastError(incomingError);
+    HANDLE h = originalOpenA(path, access, share, sa, creation, attributes, templateFile);
+    const DWORD error = GetLastError();
+    if (active) End(e);
+    if (!internal && closeHook) Remember(h, path);
+    if (active) {
+        e.handle = reinterpret_cast<uintptr_t>(h);
+        e.error = h == INVALID_HANDLE_VALUE ? error : 0;
+        Append(e);
+    }
+    SetLastError(error);
+    return h;
+}
+HANDLE WINAPI OpenW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
+                    DWORD creation, DWORD attributes, HANDLE templateFile) {
+    const DWORD incomingError = GetLastError();
+    Event e = {};
+    const bool active = Begin(e, OPEN_W, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    char text[260] = {};
+    if (!internal) {
+        __try {
+            if (path && !WideCharToMultiByte(CP_UTF8, 0, path, -1, text, 260, nullptr, nullptr))
+                CopyPath(text, "<wide-path-too-long>");
+        } __except (EXCEPTION_EXECUTE_HANDLER) { CopyPath(text, "<invalid-path>"); }
+    }
+    if (active) {
+        CopyPath(e.path, text); e.flags = access;
+        LARGE_INTEGER t; QueryPerformanceCounter(&t); e.begin = t.QuadPart;
+    }
+    SetLastError(incomingError);
+    HANDLE h = originalOpenW(path, access, share, sa, creation, attributes, templateFile);
+    const DWORD error = GetLastError();
+    if (active) End(e);
+    if (!internal && closeHook) Remember(h, text);
+    if (active) {
+        e.handle = reinterpret_cast<uintptr_t>(h);
+        e.error = h == INVALID_HANDLE_VALUE ? error : 0;
+        Append(e);
+    }
+    SetLastError(error);
+    return h;
+}
+BOOL WINAPI Read(HANDLE h, LPVOID buffer, DWORD bytes, LPDWORD completed, LPOVERLAPPED overlap) {
+    const DWORD incomingError = GetLastError();
+    Event e = {};
+    const bool active = Begin(e, READ, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    if (active) {
+        Lookup(h, e.path, false);
+        e.handle = reinterpret_cast<uintptr_t>(h);
+        e.requested = bytes; e.asynchronous = overlap ? 1 : 0;
+        LARGE_INTEGER t; QueryPerformanceCounter(&t); e.begin = t.QuadPart;
+    }
+    SetLastError(incomingError);
+    BOOL result = originalRead(h, buffer, bytes, completed, overlap);
+    const DWORD error = GetLastError();
+    if (active) {
+        End(e);
+        e.error = result ? 0 : error;
+        // Async calls measure submission only, never completion or throughput.
+        if (result && !overlap && completed) {
+            __try { e.completed = *completed; e.bytesKnown = 1; }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        Append(e);
+    }
+    SetLastError(error);
+    return result;
+}
+BOOL WINAPI Close(HANDLE h) {
+    const DWORD incomingError = GetLastError();
+    // Remove before closing to avoid erasing a newly reused handle afterwards.
+    if (!internal) { char path[260]; Lookup(h, path, true); }
+    SetLastError(incomingError);
+    BOOL result = originalClose(h);
+    return result; // No API calls after originalClose: preserve its LastError.
+}
+
+const char* OperationName(DWORD op) {
+    const char* names[] = { "asset-entry", "CreateFileA", "CreateFileW", "ReadFile", "file-wait" };
+    return op < OP_COUNT ? names[op] : "unknown";
+}
+const char* Category(const char* path) {
+    const char* dot = std::strrchr(path, '.');
+    if (!dot) return "other";
+    if (!_stricmp(dot, ".viv") || !_stricmp(dot, ".big")) return "archive";
+    if (!_stricmp(dot, ".ebo")) return "model";
+    if (!_stricmp(dot, ".fsh")) return "texture";
+    if (!_stricmp(dot, ".ubb") || !_stricmp(dot, ".ubi") || !_stricmp(dot, ".o")) return "script-or-bank";
+    if (!_stricmp(dot, ".mgd") || !_stricmp(dot, ".scn")) return "scene-or-camera";
+    if (!_stricmp(dot, ".apt") || !_stricmp(dot, ".const")) return "frontend";
+    if (!_stricmp(dot, ".dbf") || !_stricmp(dot, ".dat")) return "data";
+    return "other";
+}
+void CsvText(FILE* out, const char* value) {
+    std::fputc('"', out);
+    for (const char* p = value; *p; ++p) {
+        if (*p == '"') std::fputc('"', out);
+        std::fputc(*p, out);
+    }
+    std::fputc('"', out);
+}
+std::string Key(const char* text) {
+    std::string key(text);
+    for (size_t i = 0; i < key.size(); ++i) {
+        if (key[i] >= 'A' && key[i] <= 'Z') key[i] += 'a' - 'A';
+        if (key[i] == '/') key[i] = '\\';
+    }
+    return key;
+}
+struct Aggregate {
+    unsigned long long calls = 0, failed = 0, bytes = 0, asyncCalls = 0;
+    double ms = 0;
+};
+double Milliseconds(LONGLONG ticks) {
+    return static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency.QuadPart);
+}
+void Status(const char* message) {
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\loading_profile_06_status.log", logDirectory);
+    FILE* out = nullptr;
+    if (!fopen_s(&out, path, "w") && out) {
+        std::fprintf(out, "%s\nasset-entry=%d CreateFileA=%d CreateFileW=%d ReadFile=%d CloseHandle=%d\n",
+            message, assetHook, openAHook, openWHook, readHook, closeHook);
+        std::fprintf(out, "file-wait=%d FAST_FILE_WAIT=%d\n", fileWaitHook, fastFileWait);
+        std::fprintf(out, "file-wait-strategy=%s completion-signal-hook=%d\n",
+            !fastFileWait ? "native" : completionSignalHook ? "completion-event" : "bounded-yields", completionSignalHook);
+        std::fprintf(out, "AUTO_CAPTURE=%d intro-boundary-hook=%d MAX_SECONDS=%lu\n",
+            autoCapture, introHook, static_cast<unsigned long>(maxCaptureSeconds));
+        std::fclose(out);
+    }
+}
+bool StartCore(const char* reason) {
+    SYSTEMTIME t; GetLocalTime(&t);
+    EnterCriticalSection(&lock);
+    if (capturing || pendingSave) { LeaveCriticalSection(&lock); return false; }
+    ++generation; count = 0; dropped = 0;
+    waitTotal = {};
+    std::memset(waitSeconds, 0, sizeof(waitSeconds));
+    startReason = reason; stopReason = "not-stopped";
+    sprintf_s(captureStem, "%s\\loading_06_%04u%02u%02u_%02u%02u%02u_%lu_%lu",
+        logDirectory, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
+        static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(generation));
+    QueryPerformanceCounter(&captureBegin);
+    capturing = 1;
+    pendingStatus = 1;
+    LeaveCriticalSection(&lock);
+    return true;
+}
+void Start() { StartCore("manual-or-startup"); }
+void StopCore(const char* reason) {
+    EnterCriticalSection(&lock);
+    if (capturing) {
+        capturing = 0; QueryPerformanceCounter(&captureEnd);
+        stopReason = reason; pendingSave = 1;
+    }
+    LeaveCriticalSection(&lock);
+}
+bool WriteCapture() {
+    // Only the worker calls this; capture is stopped before sorting/writing.
+    std::stable_sort(events, events + count, [](const Event& a, const Event& b) {
+        return a.begin < b.begin;
+    });
+    char path[MAX_PATH];
+    sprintf_s(path, "%s.csv", captureStem);
+    FILE* csv = nullptr;
+    if (fopen_s(&csv, path, "w") || !csv) return false;
+    std::fprintf(csv, "sequence,start_ms,duration_ms,thread,operation,category,kind,caller,context,handle,error,flags,requested_bytes,completed_bytes,bytes_known,async_submission,requested_wait_ms,actual_wait_ms,path\n");
+    Aggregate totals[OP_COUNT];
+    std::map<std::string, Aggregate> files;
+    std::map<std::string, unsigned long long> requests;
+    for (size_t i = 0; i < count; ++i) {
+        const Event& e = events[i];
+        const double duration = Milliseconds(e.end - e.begin);
+        const char* kind = e.operation == ASSET ?
+            (e.kind == ASSET_REQUEST_PROBE ? "probe" : e.kind == ASSET_REQUEST_ACQUIRE ? "acquire" : "other") : "";
+        std::fprintf(csv, "%lu,%.6f,", static_cast<unsigned long>(i + 1), Milliseconds(e.begin - captureBegin.QuadPart));
+        if (e.operation != ASSET) std::fprintf(csv, "%.6f", duration);
+        std::fprintf(csv, ",%lu,%s,%s,%s,%08lX,%08lX,%08lX,%lu,%08lX,%lu,%lu,%lu,%lu,",
+            static_cast<unsigned long>(e.thread), OperationName(e.operation), Category(e.path), kind,
+            static_cast<unsigned long>(e.caller), static_cast<unsigned long>(e.context),
+            static_cast<unsigned long>(e.handle), static_cast<unsigned long>(e.error),
+            static_cast<unsigned long>(e.flags), static_cast<unsigned long>(e.operation == FILE_WAIT ? 0 : e.requested),
+            static_cast<unsigned long>(e.completed), static_cast<unsigned long>(e.bytesKnown),
+            static_cast<unsigned long>(e.asynchronous));
+        std::fprintf(csv, "%lu,%lu,", static_cast<unsigned long>(e.operation == FILE_WAIT ? e.flags : 0),
+            static_cast<unsigned long>(e.operation == FILE_WAIT ? e.requested : 0));
+        CsvText(csv, e.path); std::fputc('\n', csv);
+        Aggregate& total = totals[e.operation];
+        ++total.calls;
+        if (e.error && e.error != ERROR_IO_PENDING) ++total.failed;
+        total.ms += duration;
+        if (e.bytesKnown) total.bytes += e.completed;
+        total.asyncCalls += e.asynchronous;
+        if (e.operation == ASSET) ++requests[Key(e.path) + " [" + kind + "]"];
+        else if (e.operation != FILE_WAIT) {
+            Aggregate& file = files[Key(e.path)];
+            ++file.calls; file.ms += duration;
+            if (e.bytesKnown) file.bytes += e.completed;
+            if (e.error && e.error != ERROR_IO_PENDING) ++file.failed;
+            file.asyncCalls += e.asynchronous;
+        }
+    }
+    const bool csvError = std::ferror(csv) != 0;
+    const int csvCloseError = std::fclose(csv);
+    sprintf_s(path, "%s.log", captureStem);
+    FILE* out = nullptr;
+    if (fopen_s(&out, path, "w") || !out) return false;
+    std::fprintf(out, "NBA Live 06 quiet loading capture\nWall interval: %.3f ms\nEvents: %lu / %lu; dropped=%lu\n",
+        Milliseconds(captureEnd.QuadPart - captureBegin.QuadPart), static_cast<unsigned long>(count),
+        static_cast<unsigned long>(capacity), static_cast<unsigned long>(dropped));
+    std::fprintf(out, "Coverage: asset-entry=%d CreateFileA=%d CreateFileW=%d ReadFile=%d CloseHandle=%d\n",
+        assetHook, openAHook, openWHook, readHook, closeHook);
+    std::fprintf(out, "File completion delay: hook=%d FAST_FILE_WAIT=%d\n",
+        fileWaitHook, fastFileWait);
+    std::fprintf(out, "File wait strategy: %s completion-signal-hook=%d\n",
+        !fastFileWait ? "native" : completionSignalHook ? "completion-event" : "bounded-yields", completionSignalHook);
+    std::fprintf(out, "Completion-event waits wake on worker notification or alertable callback, with a 1-ms timeout.\n"
+        "Bounded-yields fallback uses 63 zero-ms yields, then one 1-ms wait. Native events are unchanged.\n");
+    std::fprintf(out, "Capture boundaries: start=%s stop=%s intro-hook=%d\n", startReason, stopReason, introHook);
+    std::fprintf(out, "Automatic window measures scene request through pregame intro setup, not the full intro video.\n");
+    EnterCriticalSection(&lock); const DWORD lostHandles = handleDrops; LeaveCriticalSection(&lock);
+    std::fprintf(out, "Handle-map insertions lost since initialization: %lu\n", static_cast<unsigned long>(lostHandles));
+    std::fprintf(out, "\nScope: main EXE imports only. DLL, mapped-file, unhooked I/O and parsing/GPU time are unmeasured.\n"
+        "Native assets are entry markers, without success/failure or duration. Categories are filename hints, not engine phases.\n"
+        "API time excludes profiler bookkeeping; it is not disk latency. Concurrent API times can overlap.\n"
+        "Async ReadFile durations measure submission only; completed bytes are unknown.\n"
+        "Calls crossing capture boundaries are omitted. Paths truncate at 259 bytes.\n"
+        "Repeated requests do not prove redundant disk reads. First/repeat loads reflect both OS and game caching.\n\n");
+    totals[FILE_WAIT].calls = waitTotal.calls;
+    totals[FILE_WAIT].ms = Milliseconds(waitTotal.ticks);
+    std::fprintf(out, "\nFile waits are aggregated for the entire capture, independently of CSV event capacity.\n"
+        "No per-yield CSV rows are stored. Other totals below cover stored CSV events only.\n");
+    for (DWORD op = 0; op < OP_COUNT; ++op) {
+        const Aggregate& a = totals[op];
+        std::fprintf(out, "%s calls=%llu failed=%llu summed_api_ms=%.3f completed_sync_bytes=%llu async=%llu\n",
+            OperationName(op), a.calls, a.failed, a.ms, a.bytes, a.asyncCalls);
+    }
+    std::fprintf(out, "file-wait detail: zero_ms=%llu one_ms=%llu other_ms=%llu max_ms=%.6f\n",
+        waitTotal.zeroMs, waitTotal.oneMs, waitTotal.otherMs, Milliseconds(waitTotal.maximum));
+    std::fprintf(out, "file-wait events: notified=%llu timeout=%llu alertable=%llu failed=%llu\n",
+        waitTotal.notified, waitTotal.timedOut, waitTotal.alertable, waitTotal.waitFailed);
+    std::fprintf(out, "\nFile waits by capture second (bucket 600 includes later calls):\n");
+    for (size_t i = 0; i < 601; ++i) {
+        const WaitSummary& w = waitSeconds[i];
+        if (w.calls) std::fprintf(out, "second=%lu calls=%llu zero_ms=%llu one_ms=%llu other_ms=%llu total_ms=%.6f max_ms=%.6f notified=%llu timeout=%llu alertable=%llu failed=%llu\n",
+            static_cast<unsigned long>(i), w.calls, w.zeroMs, w.oneMs, w.otherMs,
+            Milliseconds(w.ticks), Milliseconds(w.maximum), w.notified, w.timedOut, w.alertable, w.waitFailed);
+    }
+    typedef std::pair<std::string, Aggregate> RankedFile;
+    std::vector<RankedFile> ranked(files.begin(), files.end());
+    std::sort(ranked.begin(), ranked.end(), [](const RankedFile& a, const RankedFile& b) {
+        return a.second.ms > b.second.ms;
+    });
+    std::fprintf(out, "\nTop files by summed intercepted API time (up to 40):\n");
+    for (size_t i = 0; i < ranked.size() && i < 40; ++i) {
+        const Aggregate& a = ranked[i].second;
+        std::fprintf(out, "%.3f ms calls=%llu failed=%llu bytes=%llu async=%llu %s\n",
+            a.ms, a.calls, a.failed, a.bytes, a.asyncCalls, ranked[i].first.c_str());
+    }
+    typedef std::pair<std::string, unsigned long long> RankedRequest;
+    std::vector<RankedRequest> repeated(requests.begin(), requests.end());
+    std::sort(repeated.begin(), repeated.end(), [](const RankedRequest& a, const RankedRequest& b) {
+        return a.second > b.second;
+    });
+    std::fprintf(out, "\nRepeated native request names by kind (up to 40):\n");
+    for (size_t i = 0; i < repeated.size() && i < 40 && repeated[i].second > 1; ++i)
+        std::fprintf(out, "%llu %s\n", repeated[i].second, repeated[i].first.c_str());
+    const bool logError = std::ferror(out) != 0;
+    const int logCloseError = std::fclose(out);
+    return !csvError && !csvCloseError && !logError && !logCloseError;
+}
+DWORD WINAPI Worker(LPVOID autoStart) {
+    internal = true;
+    if (!autoCapture && autoStart) Start();
+    else Status(autoCapture ? "ARMED. Captures 5on5.scn through pregame intro setup automatically." :
+        "READY. F9 in the game starts capture; F9 again stops and saves it.");
+    bool held = false;
+    for (;;) {
+        Sleep(50);
+        if (pendingStatus) {
+            pendingStatus = 0;
+            Status("CAPTURING. Automatic mode stops at pregame intro setup; F9 can also stop manually.");
+        }
+        EnterCriticalSection(&lock);
+        if (capturing) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            if (now.QuadPart - captureBegin.QuadPart >= frequency.QuadPart * maxCaptureSeconds)
+                StopCore("timeout-partial-intro-boundary-not-reached");
+        }
+        LeaveCriticalSection(&lock);
+        if (pendingSave) {
+            Status("WRITING. Saving capture, then rearming.");
+            bool saved = false;
+            try { saved = WriteCapture(); } catch (...) {}
+            EnterCriticalSection(&lock); pendingSave = 0; LeaveCriticalSection(&lock);
+            Status(saved ? (autoCapture ? "ARMED. Capture saved; ready for the next 5on5.scn request." :
+                "READY. Capture saved. F9 starts another capture.") :
+                "SAVE FAILED. Check logs directory permissions/free space.");
+        }
+        DWORD process = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &process);
+        const bool down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        if (down && !held && process == GetCurrentProcessId()) {
+            if (capturing) {
+                StopCore("manual-F9");
+            } else Start();
+        }
+        held = down;
+    }
+}
+// Defined after the native asset-entry installer below.
+bool Initialize();
+} // namespace loadingprofile06
 
 #if defined(_M_IX86)
 
@@ -1239,7 +2006,11 @@ void __cdecl LogFileSystemOpenResolved(
     void* registerContext,
     const uintptr_t* entryStack)
 {
-    if (!entryStack || !g_lockReady)
+    if (!entryStack)
+        return;
+
+    loadingprofile06::RecordAsset(entryStack);
+    if (!g_enabled || !g_assetFiles || !g_lockReady)
         return;
 
     void* caller = reinterpret_cast<void*>(entryStack[0]);
@@ -1296,19 +2067,29 @@ __declspec(naked) void HookFileSystemOpenResolved()
         pushfd
         pushad
 
-        // Entry ESP was 36 bytes above current ESP:
-        //   pushfd = 4
-        //   pushad = 32
-        lea     edx, [esp + 36]
+        // Preserve floating point/SSE state as well as GPRs and flags.
+        // EBX is already saved by pushad; use it to restore the exact stack.
+        mov     ebx, esp
+        sub     esp, 528
+        and     esp, -16
+        fxsave  [esp]
+        call    GetLastError
+        mov     [esp + 512], eax
+        lea     edx, [ebx + 36]
 
         // EAX saved by pushad is at [esp + 28].
         // For Live 2005 this is the original register context.
-        mov     eax, [esp + 28]
+        mov     eax, [ebx + 28]
 
         push    edx
         push    eax
         call    LogFileSystemOpenResolved
         add     esp, 8
+
+        push    dword ptr [esp + 512]
+        call    SetLastError
+        fxrstor [esp]
+        mov     esp, ebx
 
         // Restore the caller's exact original register state.
         popad
@@ -1323,6 +2104,8 @@ bool InstallFileSystemOpenResolvedHook(
     DWORD localStackSize,
     AssetOpenLayout layout)
 {
+    if (g_FileSystemOpenResolvedInstalled)
+        return true;
     constexpr size_t kPatchLength = 9;
 
     BYTE expected[kPatchLength] = {
@@ -1337,14 +2120,21 @@ bool InstallFileSystemOpenResolvedHook(
 
     BYTE* target = reinterpret_cast<BYTE*>(targetAddress);
 
+    bool chained = false;
     __try {
-        if (std::memcmp(target, expected, kPatchLength) != 0) {
-            PrintPrefix(
-                "DEBUG",
-                FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-            std::printf(
-                "FileSystem::OpenResolved hook skipped: unexpected bytes at %08lX\n",
-                static_cast<unsigned long>(targetAddress));
+        // CustomPaths can initialize first. Its entry gate leaves four NOPs
+        // after a relative JMP; chain without replacing its trampoline.
+        chained = target[0] == 0xE9 && target[5] == 0x90 &&
+            target[6] == 0x90 && target[7] == 0x90 && target[8] == 0x90;
+        if (!chained && std::memcmp(target, expected, kPatchLength) != 0) {
+            if (g_enabled) {
+                PrintPrefix(
+                    "DEBUG",
+                    FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+                std::printf(
+                    "FileSystem::OpenResolved hook skipped: unexpected bytes at %08lX\n",
+                    static_cast<unsigned long>(targetAddress));
+            }
             return false;
         }
     }
@@ -1352,26 +2142,29 @@ bool InstallFileSystemOpenResolvedHook(
         return false;
     }
 
-    BYTE* trampoline = reinterpret_cast<BYTE*>(
+    BYTE* trampoline = chained ? nullptr : reinterpret_cast<BYTE*>(
         VirtualAlloc(
             nullptr,
             32,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE));
 
-    if (!trampoline)
+    if (!chained && !trampoline)
         return false;
 
-    std::memcpy(trampoline, target, kPatchLength);
+    if (!chained) {
+        std::memcpy(trampoline, target, kPatchLength);
 
-    trampoline[kPatchLength] = 0xE9;
-    *reinterpret_cast<int32_t*>(trampoline + kPatchLength + 1) =
-        static_cast<int32_t>(
-            (targetAddress + kPatchLength) -
-            reinterpret_cast<uintptr_t>(trampoline + kPatchLength + 5));
+        trampoline[kPatchLength] = 0xE9;
+        *reinterpret_cast<int32_t*>(trampoline + kPatchLength + 1) =
+            static_cast<int32_t>(
+                (targetAddress + kPatchLength) -
+                reinterpret_cast<uintptr_t>(trampoline + kPatchLength + 5));
+    }
 
     g_FileSystemOpenResolvedTrampoline =
-        reinterpret_cast<uintptr_t>(trampoline);
+        chained ? targetAddress + 5 + *reinterpret_cast<int32_t*>(target + 1) :
+            reinterpret_cast<uintptr_t>(trampoline);
     g_assetOpenLayout = layout;
 
     DWORD oldProtect = 0;
@@ -1381,7 +2174,7 @@ bool InstallFileSystemOpenResolvedHook(
             PAGE_EXECUTE_READWRITE,
             &oldProtect))
     {
-        VirtualFree(trampoline, 0, MEM_RELEASE);
+        if (trampoline) VirtualFree(trampoline, 0, MEM_RELEASE);
         g_FileSystemOpenResolvedTrampoline = 0;
         g_assetOpenLayout = ASSET_LAYOUT_NONE;
         return false;
@@ -1981,21 +2774,109 @@ const char* ExceptionName(DWORD code) {
     }
 }
 
+
+struct ModuleAddressInfo {
+    bool valid;
+    uintptr_t base;
+    uintptr_t rva;
+    char modulePath[MAX_PATH];
+    char moduleName[MAX_PATH];
+};
+
+ModuleAddressInfo ResolveModuleAddress(uintptr_t address)
+{
+    ModuleAddressInfo info = {};
+
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(address),
+            &module) ||
+        !module)
+    {
+        return info;
+    }
+
+    const DWORD chars = GetModuleFileNameA(
+        module,
+        info.modulePath,
+        static_cast<DWORD>(sizeof(info.modulePath)));
+
+    if (!chars || chars >= sizeof(info.modulePath))
+        return info;
+
+    info.modulePath[sizeof(info.modulePath) - 1] = '\0';
+
+    const char* baseName = BaseNameOf(info.modulePath);
+    std::strncpy(
+        info.moduleName,
+        (baseName && *baseName) ? baseName : "<unknown>",
+        sizeof(info.moduleName) - 1);
+    info.moduleName[sizeof(info.moduleName) - 1] = '\0';
+
+    info.base = reinterpret_cast<uintptr_t>(module);
+    info.rva = address >= info.base ? address - info.base : 0;
+    info.valid = true;
+    return info;
+}
+
 void PrintStack32(CONTEXT* c) {
 #if defined(_M_IX86)
+    if (!c)
+        return;
+
     std::printf("\nCall stack (EBP chain):\n");
-    std::printf("  #0  %08lX  <faulting instruction>\n", c->Eip);
+
+    {
+        const ModuleAddressInfo m = ResolveModuleAddress(c->Eip);
+        if (m.valid) {
+            std::printf(
+                "  #0  %08lX  %-24s +%08lX  <faulting instruction>\n",
+                c->Eip,
+                m.moduleName,
+                static_cast<unsigned long>(m.rva));
+        }
+        else {
+            std::printf(
+                "  #0  %08lX  %-24s  <faulting instruction>\n",
+                c->Eip,
+                "<module unresolved>");
+        }
+    }
+
     DWORD ebp = c->Ebp;
     for (int i = 1; i < 24 && ebp; ++i) {
         __try {
             DWORD* frame = reinterpret_cast<DWORD*>(ebp);
             DWORD next = frame[0];
             DWORD ret = frame[1];
-            if (!ret || next <= ebp || next - ebp > 0x100000) break;
-            std::printf("  #%d  %08lX\n", i, ret);
+
+            if (!ret || next <= ebp || next - ebp > 0x100000)
+                break;
+
+            const ModuleAddressInfo m = ResolveModuleAddress(ret);
+            if (m.valid) {
+                std::printf(
+                    "  #%d  %08lX  %-24s +%08lX\n",
+                    i,
+                    ret,
+                    m.moduleName,
+                    static_cast<unsigned long>(m.rva));
+            }
+            else {
+                std::printf(
+                    "  #%d  %08lX  %s\n",
+                    i,
+                    ret,
+                    "<module unresolved>");
+            }
+
             ebp = next;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
     }
 #endif
 }
@@ -3544,6 +4425,24 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     std::printf("Exception : %s (0x%08lX)\n", ExceptionName(er->ExceptionCode), er->ExceptionCode);
     std::printf("Address   : %p\n", er->ExceptionAddress);
 
+    {
+        const uintptr_t faultAddress =
+            reinterpret_cast<uintptr_t>(er->ExceptionAddress);
+        const ModuleAddressInfo m = ResolveModuleAddress(faultAddress);
+
+        if (m.valid) {
+            std::printf("Module    : %s\n", m.moduleName);
+            std::printf("ModuleBase: %08lX\n",
+                static_cast<unsigned long>(m.base));
+            std::printf("ModuleRVA : %08lX\n",
+                static_cast<unsigned long>(m.rva));
+            std::printf("ModulePath: %s\n", m.modulePath);
+        }
+        else {
+            std::printf("Module    : <unresolved>\n");
+        }
+    }
+
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
         const char* operation = er->ExceptionInformation[0] == 0 ? "READ" :
                                 er->ExceptionInformation[0] == 1 ? "WRITE" : "EXECUTE";
@@ -3583,11 +4482,62 @@ void OpenConsole() {
     std::printf("==============================================================\n\n");
 }
 
+bool loadingprofile06::Initialize() {
+#if defined(_M_IX86)
+    if (FM::GetEntryPoint() != 0x40109F ||
+        plugin::patch::GetFloat(0xBD832C) != 1.3333334f)
+        return false; // First version intentionally supports only verified 06.
+    const DWORD length = GetModuleFileNameA(nullptr, logDirectory, MAX_PATH);
+    if (!length || length >= MAX_PATH) return false;
+    char* slash = std::strrchr(logDirectory, '\\');
+    if (!slash) return false;
+    *slash = 0;
+    // Leave room for unique capture filenames, not just the directory itself.
+    if (std::strlen(logDirectory) > 170) return false;
+    strcat_s(logDirectory, "\\logs");
+    if (!CreateDirectoryA(logDirectory, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+        return false;
+    const int requested = GetPrivateProfileIntA("LOADING_PROFILE", "MAX_EVENTS", 65536, ".\\main.ini");
+    if (requested >= 4096 && requested <= 262144) capacity = static_cast<size_t>(requested);
+    events = static_cast<Event*>(VirtualAlloc(nullptr, sizeof(Event) * capacity,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!events) { Status("INITIALIZATION FAILED: cannot allocate capture buffer."); return false; }
+    InitializeCriticalSection(&lock);
+    autoCapture = GetPrivateProfileIntA("LOADING_PROFILE", "AUTO_CAPTURE", 1, ".\\main.ini") != 0;
+    const int maxSeconds = GetPrivateProfileIntA("LOADING_PROFILE", "MAX_SECONDS", 120, ".\\main.ini");
+    if (maxSeconds >= 10 && maxSeconds <= 600) maxCaptureSeconds = static_cast<DWORD>(maxSeconds);
+    ready = true;
+    if (autoCapture) InstallIntroBoundary();
+    const bool fastWait = GetPrivateProfileIntA("LOADING", "FAST_FILE_WAIT", 0, ".\\main.ini") != 0;
+    InstallFileCompletionDelay(fastWait);
+    assetHook = InstallFileSystemOpenResolvedHookForCurrentGame();
+    closeHook = PatchIAT("KERNEL32.dll", "CloseHandle", reinterpret_cast<void*>(&Close), reinterpret_cast<void**>(&originalClose));
+    openAHook = PatchIAT("KERNEL32.dll", "CreateFileA", reinterpret_cast<void*>(&OpenA), reinterpret_cast<void**>(&originalOpenA));
+    openWHook = PatchIAT("KERNEL32.dll", "CreateFileW", reinterpret_cast<void*>(&OpenW), reinterpret_cast<void**>(&originalOpenW));
+    readHook = PatchIAT("KERNEL32.dll", "ReadFile", reinterpret_cast<void*>(&Read), reinterpret_cast<void**>(&originalRead));
+    if (!assetHook && !openAHook && !openWHook && !readHook) {
+        Status("INITIALIZATION FAILED: no verified hooks installed."); return false;
+    }
+    const bool autoStart = GetPrivateProfileIntA("LOADING_PROFILE", "AUTO_START", 0, ".\\main.ini") != 0;
+    HANDLE worker = CreateThread(nullptr, 0, Worker,
+        autoStart ? reinterpret_cast<void*>(1) : nullptr, 0, nullptr);
+    if (!worker) { Status("INITIALIZATION FAILED: cannot start capture worker."); return false; }
+    CloseHandle(worker);
+    return true;
+#else
+    return false;
+#endif
+}
+
 } // namespace
 
 void InitializeDebugConsole() {
     g_enabled = GetPrivateProfileIntA("DEBUG", "CONSOLE", 0, ".\\main.ini") != 0;
-    if (!g_enabled) return;
+    const bool loadingProfile = GetPrivateProfileIntA("LOADING_PROFILE", "ENABLED", 0, ".\\main.ini") != 0;
+    const bool fastFileWait = GetPrivateProfileIntA("LOADING", "FAST_FILE_WAIT", 0, ".\\main.ini") != 0;
+    if (!g_enabled && !loadingProfile && !fastFileWait) return;
 
     // The IAT hooks must be installed exactly once. If initialization runs
     // twice and PatchIAT records HookCreateFileA/HookCloseHandle as the
@@ -3595,6 +4545,22 @@ void InitializeDebugConsole() {
     // stack is exhausted.
     if (InterlockedCompareExchange(&g_debugConsoleInitState, 1, 0) != 0)
         return;
+
+    if (fastFileWait) {
+        const bool installed = loadingprofile06::InstallFileCompletionDelay(true);
+        loadingprofile06::WriteFileWaitInstallStatus(installed);
+        if (!installed)
+            OutputDebugStringA("[Loading] FAST_FILE_WAIT skipped: unsupported build or changed instruction bytes.\n");
+    }
+    if (!g_enabled && !loadingProfile) return;
+
+    if (!g_enabled) {
+        if (!loadingprofile06::Initialize())
+            OutputDebugStringA("[LoadingProfile06] Initialization failed (requires supported NBA Live 06 x86).\n");
+        return;
+    }
+    if (loadingProfile)
+        OutputDebugStringA("[LoadingProfile06] Quiet capture requires [DEBUG] CONSOLE=0; profiler skipped.\n");
 
     g_files = GetPrivateProfileIntA("DEBUG", "FILES", 1, ".\\main.ini") != 0;
     g_failedFiles = GetPrivateProfileIntA("DEBUG", "FAILED_FILES", 1, ".\\main.ini") != 0;

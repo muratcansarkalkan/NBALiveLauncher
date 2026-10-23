@@ -16,6 +16,7 @@
 #include "PopupFont.h"
 #include "ScoreboardConfig.h"
 #include "StatOverlayTypes.h"
+#include "AntiAliasing.h"
 
 #pragma comment(lib, "d3d9.lib")
 
@@ -3439,6 +3440,105 @@ bool StateChanged(const ExtendedState& current,
     return std::memcmp(&current, &previous, sizeof(current)) != 0;
 }
 
+// Live 06 read-only turnover monitor. Stat field 0x0D is established by
+// FillLiveRuntimePlayerData06; it is not a known in-memory struct offset.
+struct TurnoverWatch06 {
+    DWORD nativeId;
+    int turnovers;
+    int steals;
+    bool valid;
+};
+TurnoverWatch06 g_turnoverWatch06[2][12] = {};
+bool g_turnoverWatch06Active = false;
+int g_turnoverWatch06LastQuarter = INT_MIN;
+unsigned int g_turnoverWatch06LastClock = UINT_MAX;
+
+void LogTurnoverWatch06(const char* format, ...)
+{
+    if (!g_debugConsoleEnabled || !g_logReady) return;
+    char path[MAX_PATH] = {};
+    BuildLogPath(path, sizeof(path), "turnover_watch_06.log");
+    if (!path[0]) return;
+    EnterCriticalSection(&g_logLock);
+    FILE* file = std::fopen(path, "a");
+    if (file) {
+        va_list args;
+        va_start(args, format);
+        std::vfprintf(file, format, args);
+        va_end(args);
+        std::fclose(file);
+    }
+    LeaveCriticalSection(&g_logLock);
+}
+
+void TrackTurnoverChanges06(const ExtendedState& state)
+{
+    if (!g_liveGame06.valid) {
+        g_turnoverWatch06Active = false;
+        std::memset(g_turnoverWatch06, 0, sizeof(g_turnoverWatch06));
+        return;
+    }
+    // Quarter/clock reset means the previous baseline may belong to a game
+    // that has ended; do not report the new game's initial values as changes.
+    const bool reset = !g_turnoverWatch06Active ||
+        (g_turnoverWatch06LastQuarter != INT_MIN &&
+         state.quarter < g_turnoverWatch06LastQuarter) ||
+        (g_turnoverWatch06LastClock != UINT_MAX &&
+         state.quarter == g_turnoverWatch06LastQuarter &&
+         state.gameRaw > g_turnoverWatch06LastClock + 600u);
+    if (reset) {
+        std::memset(g_turnoverWatch06, 0, sizeof(g_turnoverWatch06));
+        LogTurnoverWatch06("--- BASELINE tick=%lu quarter=%d game_raw=%u ---\n",
+            static_cast<unsigned long>(GetTickCount()), state.quarter, state.gameRaw);
+    }
+    g_turnoverWatch06Active = true;
+    g_turnoverWatch06LastQuarter = state.quarter;
+    g_turnoverWatch06LastClock = state.gameRaw;
+
+    for (int side = 0; side < 2; ++side) {
+        const int teamIndex = side == 0 ? g_liveGame06.homeTeamIndex : g_liveGame06.awayTeamIndex;
+        if (teamIndex < 0 || teamIndex > 1) continue;
+        const LiveTeamData08& team = g_liveGame06.teams[teamIndex];
+        for (int slot = 0; slot < 12; ++slot) {
+            const LivePlayerData08& p = team.players[slot];
+            TurnoverWatch06& prior = g_turnoverWatch06[side][slot];
+            if (!p.valid || p.nativePlayerId <= 0) { prior.valid = false; continue; }
+            const DWORD id = static_cast<DWORD>(p.nativePlayerId);
+            if (!prior.valid || prior.nativeId != id || reset) {
+                prior.nativeId = id;
+                prior.turnovers = p.turnovers;
+                prior.steals = p.steals;
+                prior.valid = true;
+                continue;
+            }
+            if (p.turnovers != prior.turnovers) {
+                void* runtimeObject = nullptr;
+                DWORD resolverScratch = 0;
+                if (g_resolveRuntimePlayer06) {
+                    __try { runtimeObject = g_resolveRuntimePlayer06(&id, &resolverScratch); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { runtimeObject = nullptr; }
+                }
+                LogTurnoverWatch06(
+                    "CHANGE tick=%lu side=%s team_dbid=%d slot=%d "
+                    "player_dbid=%d native=%u object=%p resolver_type=%u "
+                    "name=\"%s %s\" turnovers=%d->%d delta=%+d "
+                    "steals=%d->%d quarter=%d game_raw=%u "
+                    "clock_units=%u shot_raw=%u\n",
+                    static_cast<unsigned long>(GetTickCount()),
+                    side == 0 ? "home" : "away", team.teamId, slot,
+                    p.databasePlayerId, static_cast<unsigned int>(id),
+                    runtimeObject, static_cast<unsigned int>(resolverScratch),
+                    p.firstName, p.lastName,
+                    prior.turnovers, p.turnovers, p.turnovers - prior.turnovers,
+                    prior.steals, p.steals, state.quarter, state.gameRaw,
+                    state.clockUnitsPerSecond, state.shotRaw);
+            }
+            prior.turnovers = p.turnovers;
+            prior.steals = p.steals;
+        }
+    }
+}
+
 void PollState()
 {
     if (g_polling || g_gettersDisabled || !g_game) return;
@@ -3460,6 +3560,9 @@ void PollState()
         RefreshLiveGameData07(state);
     else if (g_game->version == GameVersion::Live2008)
         RefreshLiveGameData08(state);
+
+    if (g_game->version == GameVersion::Live2006)
+        TrackTurnoverChanges06(state);
 
     // Team fouls reset between periods. The game's foul getters can retain
     // the previous period's values for a very short time after the quarter
@@ -4778,10 +4881,28 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* device, const RECT* sourceRect,
             device, viewport.Width, viewport.Height);
     }
     CheckPopupHotReload(device);
+
+    // SSAA optimization: resolve the completed high-resolution game frame
+    // before custom overlays, then draw the scoreboard/popups once at the
+    // native output resolution. When SSAA is disabled this is a no-op and the
+    // existing rendering path is unchanged.
+    const bool nativeOverlayPass =
+        BeginAntiAliasingNativeOverlayPass(device);
+
+    const float overlayRenderScale = nativeOverlayPass ?
+        GetAntiAliasingNativeOverlayScale() : 1.0f;
+    scoreboard::SetRenderTargetScale(overlayRenderScale);
+
     if (SUCCEEDED(device->BeginScene())) {
         RenderConfiguredOverlays(device);
         device->EndScene();
     }
+
+    scoreboard::SetRenderTargetScale(1.0f);
+
+    if (nativeOverlayPass)
+        EndAntiAliasingNativeOverlayPass(device);
+
     return g_originalPresent(device, sourceRect, destinationRect,
         destinationWindow, dirtyRegion);
 }

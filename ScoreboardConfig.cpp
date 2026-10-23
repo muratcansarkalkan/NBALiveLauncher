@@ -69,6 +69,8 @@ void SetDefaults(Config* c)
     c->shotClockVisibility = ShotClockVisibility::Always;
     c->shotClockThreshold = 10;
     c->urgentShotClockThreshold = 10;
+    c->shotClockPrefix[0] = '\0';
+    c->shotClockTwoDigits = false;
     c->shotClockNormalColor = D3DCOLOR_XRGB(255, 210, 64);
     c->shotClockUrgentColor = D3DCOLOR_XRGB(255, 48, 48);
     c->showTeamNames = false;
@@ -414,6 +416,9 @@ void ParseElements(const std::string& json, Config* c)
         if (e.smallCapsScale <= 0.0f) e.smallCapsScale = 0.82f;
         if (e.smallCapsScale > 1.0f) e.smallCapsScale = 1.0f;
         e.fontHeight = Number(object, "fontHeight", 0.0f);
+        e.fontVerticalScale = Number(object, "fontVerticalScale", 1.0f);
+        if (e.fontVerticalScale < 0.25f) e.fontVerticalScale = 0.25f;
+        if (e.fontVerticalScale > 4.0f) e.fontVerticalScale = 4.0f;
         e.textColor = Color(object, "textColor", D3DCOLOR_XRGB(255, 255, 255));
         const std::string stroke = ObjectValue(object, "stroke");
         e.strokeEnabled = Boolean(stroke, "enabled", false);
@@ -492,6 +497,10 @@ void Parse(const std::string& json, Config* c)
         "shotClockThreshold", c->shotClockThreshold);
     c->urgentShotClockThreshold = Integer(json,
         "urgentShotClockThreshold", c->urgentShotClockThreshold);
+    String(json, "shotClockPrefix", c->shotClockPrefix,
+        sizeof(c->shotClockPrefix), "");
+    c->shotClockTwoDigits = Boolean(json,
+        "shotClockTwoDigits", c->shotClockTwoDigits);
     c->shotClockNormalColor = Color(json,
         "shotClockNormalColor", c->shotClockNormalColor);
     c->shotClockUrgentColor = Color(json,

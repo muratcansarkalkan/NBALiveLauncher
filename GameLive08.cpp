@@ -1,6 +1,5 @@
 #include "plugin-std.h"
 #include "Resolutions.h"
-#include "ResolutionMenuStrings.h"
 
 using namespace plugin;
 
@@ -12,9 +11,6 @@ const float ASPECT_DIFF = ASPECT_RATIO / 1.33333f;
 static float gAspectScale08 = 1.0f;
 
 namespace live08 {
-
-    static ResolutionMenuStringPatcher gResolutionMenuStrings08;
-
     // Logical menu order. NBA Live 08, like 07, uses physical
     // resolution-table slot 1 as the startup/current mode.
     //
@@ -129,6 +125,204 @@ namespace live08 {
             add edi, 4
             jmp dword ptr [gResolutionMenuAppendReturn08]
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // NBA Live 08 localized resolution labels
+    // ---------------------------------------------------------------------
+    //
+    // 08's locale lookup is index based:
+    //
+    //   0041B710(outString, localeIndex)
+    //       -> D84710 localization object
+    //       -> 0041A3D0
+    //       -> E1A762
+    //
+    // E1A762 proves the loaded locale representation:
+    //   [localization]      -> locale table object
+    //   [table + 0x08]      = entry count
+    //   [table + 0x10]      = char ** source-string array A
+    //   [table + 0x14]      = char ** source-string array B
+    //
+    // Instead of intercepting every localized lookup, patch the source-string
+    // pointers after locale.eng/gameloc.eng have been loaded. This is
+    // independent of locale IDs: we identify the stock resolution captions by
+    // their actual source text, then replace only those entries.
+    //
+    // This also fixes the 08 ordering problem. The replacement text for native
+    // physical slot N is generated from ids[N] AFTER PrepareResolutionSlots08()
+    // has performed the required slot-1 swap.
+    static const char* kNativeResolutionTexts08[16] =
+    {
+        "640x480x16",
+        "640x480x32",
+        "800x600x16",
+        "800x600x32",
+        "1024x768x16",
+        "1024x768x32",
+        "1280x720x16",
+        "1280x720x32",
+        "1280x1024x16",
+        "1280x1024x32",
+        "1440x900x16",
+        "1440x900x32",
+        "1600x1200x16",
+        "1600x1200x32",
+        "1680x1050x16",
+        "1680x1050x32",
+    };
+
+    static char gResolutionLocaleText08[16][32] = {};
+
+    static bool IsReadable08(const void* p, size_t bytes = sizeof(void*))
+    {
+        if (!p || bytes == 0)
+            return false;
+
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+            return false;
+
+        if (mbi.State != MEM_COMMIT)
+            return false;
+
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+            return false;
+
+        const uintptr_t begin =
+            reinterpret_cast<uintptr_t>(p);
+        const uintptr_t end =
+            begin + bytes;
+        const uintptr_t regionEnd =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+
+        return end >= begin && end <= regionEnd;
+    }
+
+    static void BuildResolutionLocaleText08()
+    {
+        for (int physicalSlot = 0; physicalSlot < 16; ++physicalSlot)
+        {
+            sprintf_s(
+                gResolutionLocaleText08[physicalSlot],
+                sizeof(gResolutionLocaleText08[physicalSlot]),
+                "%ux%u",
+                ids[physicalSlot].width,
+                ids[physicalSlot].height);
+        }
+    }
+
+    static bool PatchLocaleArray08(char** entries, unsigned int count)
+    {
+        if (!entries || !IsReadable08(entries, sizeof(char*) * count))
+            return false;
+
+        bool touched = false;
+
+        for (unsigned int entry = 0; entry < count; ++entry)
+        {
+            const char* text = entries[entry];
+
+            if (!text || !IsReadable08(text, 1))
+                continue;
+
+            for (int physicalSlot = 0; physicalSlot < 16; ++physicalSlot)
+            {
+                const char* stock = kNativeResolutionTexts08[physicalSlot];
+
+                // Resolution strings are tiny, so compare only after validating
+                // enough readable bytes for the stock text plus its terminator.
+                const size_t stockLen = strlen(stock);
+                if (!IsReadable08(text, stockLen + 1))
+                    continue;
+
+                if (strcmp(text, stock) != 0)
+                    continue;
+
+                entries[entry] =
+                    gResolutionLocaleText08[physicalSlot];
+
+                touched = true;
+                break;
+            }
+        }
+
+        return touched;
+    }
+
+    static bool PatchLoadedResolutionLocale08()
+    {
+        void* localization =
+            *reinterpret_cast<void**>(0x00D84710);
+
+        if (!IsReadable08(localization))
+            return false;
+
+        void* table =
+            *reinterpret_cast<void**>(localization);
+
+        if (!IsReadable08(
+                reinterpret_cast<unsigned char*>(table) + 0x14,
+                sizeof(void*)))
+            return false;
+
+        const unsigned int count =
+            *reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned char*>(table) + 0x08);
+
+        if (count == 0 || count > 100000)
+            return false;
+
+        char** entriesA =
+            *reinterpret_cast<char***>(
+                reinterpret_cast<unsigned char*>(table) + 0x10);
+
+        char** entriesB =
+            *reinterpret_cast<char***>(
+                reinterpret_cast<unsigned char*>(table) + 0x14);
+
+        const bool patchedA =
+            PatchLocaleArray08(entriesA, count);
+
+        const bool patchedB =
+            PatchLocaleArray08(entriesB, count);
+
+        return patchedA || patchedB;
+    }
+
+    static DWORD WINAPI ResolutionLocaleWatcher08(LPVOID)
+    {
+        // The ASI can initialize before locale.eng is loaded. Wait for the
+        // localization table, patch it once, then exit.
+        for (int attempt = 0; attempt < 600; ++attempt)
+        {
+            if (PatchLoadedResolutionLocale08())
+                return 0;
+
+            Sleep(50);
+        }
+
+        return 0;
+    }
+
+    static void InstallResolutionLocalePatch08()
+    {
+        BuildResolutionLocaleText08();
+
+        // Handle both cases: locale already loaded, or locale loading later.
+        if (PatchLoadedResolutionLocale08())
+            return;
+
+        HANDLE thread = CreateThread(
+            nullptr,
+            0,
+            ResolutionLocaleWatcher08,
+            nullptr,
+            0,
+            nullptr);
+
+        if (thread)
+            CloseHandle(thread);
     }
 
     // NBA Live 08
@@ -429,21 +623,36 @@ void Install_LIVE08() {
     patch::RedirectJump(0x69F780, SetTestInConicalFrustum08);
     InstallHighResolutionAptFonts08();
 
+    // ---------------------------------------------------------------------
+    // APT / frontend timing
+    // ---------------------------------------------------------------------
+    // GameDirector's frontend loop clamps its timer-derived delta:
+    //
+    //   00669974 cmp edi, 80h
+    //   00669980 mov edi, 80h
+    //   00669987 cmp edi, 1
+    //   0066998A jge ...
+    //   0066998C mov edi, 1
+    //
+    // With an uncapped frontend, elapsed time below one unit gets promoted to
+    // 1 every render iteration, making APT/menu animation run too quickly.
+    // Permit a zero delta instead. The separate intentional preload loop at
+    // 00669ADF (1000 x FESystem::Update(1)) is left untouched.
+    patch::SetUChar(0x66998C, 0x31); // xor edi, edi
+    patch::SetUChar(0x66998D, 0xFF);
+    patch::Nop(0x66998E, 3);
+
     // Keep physical slot 1 as the configured startup/current mode, but make
     // the Display Settings menu enumerate modes in logical resolution order.
     PrepareResolutionSlots08();
 
+    // Patch the loaded locale source arrays after the physical slot map is
+    // finalized. This replaces the failed post-lookup hook.
+    InstallResolutionLocalePatch08();
+
     // 55B840: mov [edi], esi / add edi, 4
     patch::RedirectJump(0x55B840, AppendResolutionInLogicalOrder08);
-
-    // Capture the stock resolution labels before overwriting the mode table.
-    gResolutionMenuStrings08.Initialize(
-        0xD21F60,
-        ids,
-        sizeof(ids) / sizeof(ids[0])
-    );
-
-    for (const auto& resolution : ids) {
+for (const auto& resolution : ids) {
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 8, resolution.height);
         patch::SetUInt(0xD21F60 + 20 * resolution.id + 12, resolution.depth);

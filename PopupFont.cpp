@@ -22,6 +22,7 @@ constexpr int ATLAS_ROWS =
     (CHARACTER_COUNT + ATLAS_COLUMNS - 1) / ATLAS_COLUMNS;
 constexpr int ATLAS_HEIGHT = ATLAS_ROWS * CELL_HEIGHT;
 constexpr int MAX_FONT_ATLASES = 16;
+constexpr int MAX_FONT_CONTEXTS = 16;
 
 struct Glyph {
     float u0, v0, u1, v1;
@@ -45,27 +46,41 @@ struct AtlasState {
     char privateFontPath[MAX_PATH];
 };
 
-AtlasState g_atlases[MAX_FONT_ATLASES] = {};
-int g_atlasCount = 0;
-AtlasState* g_activeAtlas = nullptr;
-IDirect3DDevice9* g_device = nullptr;
-bool g_attempted = false;
-char g_theme[64] = {};
+Style DefaultStyle()
+{
+    Style style = {
+        34.0f, 28.0f, 17.0f,
+        15.0f, 18.0f, 15.0f, 15.0f, 13.0f,
+        1.0f,
+        D3DCOLOR_XRGB(255, 255, 255),
+        D3DCOLOR_XRGB(255, 255, 255),
+        D3DCOLOR_XRGB(255, 210, 64)
+    };
+    return style;
+}
 
+struct FontContext {
+    char key[128];
+    IDirect3DDevice9* device;
+    AtlasState atlases[MAX_FONT_ATLASES];
+    int atlasCount;
+    AtlasState* activeAtlas;
+    Style style;
+};
+
+FontContext g_contexts[MAX_FONT_CONTEXTS] = {};
+int g_contextCount = 0;
+FontContext* g_activeContext = nullptr;
+
+#define g_atlases (g_activeContext->atlases)
+#define g_atlasCount (g_activeContext->atlasCount)
+#define g_activeAtlas (g_activeContext->activeAtlas)
 #define g_atlas (g_activeAtlas->texture)
 #define g_glyphs (g_activeAtlas->glyphs)
 #define g_sourceHeight (g_activeAtlas->sourceHeight)
 #define g_spacing (g_activeAtlas->spacing)
 #define g_privateFontPath (g_activeAtlas->privateFontPath)
-
-Style g_style = {
-    34.0f, 28.0f, 17.0f,
-    15.0f, 18.0f, 15.0f, 15.0f, 13.0f,
-    1.0f,
-    D3DCOLOR_XRGB(255, 255, 255),
-    D3DCOLOR_XRGB(255, 255, 255),
-    D3DCOLOR_XRGB(255, 210, 64)
-};
+#define g_style (g_activeContext->style)
 
 std::string GetGameDirectory()
 {
@@ -198,18 +213,67 @@ D3DCOLOR ReadJsonColor(const std::string& json, const char* key,
     return 0xFF000000u | static_cast<D3DCOLOR>(value);
 }
 
-void ReleaseAtlases()
+void ReleaseContext(FontContext* context)
 {
-    for (int i = 0; i < g_atlasCount; ++i) {
-        if (g_atlases[i].texture) g_atlases[i].texture->Release();
-        if (g_atlases[i].privateFontPath[0])
-            RemoveFontResourceExA(g_atlases[i].privateFontPath,
-                FR_PRIVATE, nullptr);
+    if (!context)
+        return;
+
+    for (int i = 0; i < context->atlasCount; ++i) {
+        if (context->atlases[i].texture) {
+            context->atlases[i].texture->Release();
+            context->atlases[i].texture = nullptr;
+        }
+        if (context->atlases[i].privateFontPath[0]) {
+            RemoveFontResourceExA(
+                context->atlases[i].privateFontPath,
+                FR_PRIVATE,
+                nullptr);
+        }
     }
-    std::memset(g_atlases, 0, sizeof(g_atlases));
-    g_atlasCount = 0;
-    g_activeAtlas = nullptr;
-    g_device = nullptr;
+
+    std::memset(context, 0, sizeof(*context));
+}
+
+void ReleaseAllContexts()
+{
+    for (int i = 0; i < g_contextCount; ++i)
+        ReleaseContext(&g_contexts[i]);
+
+    std::memset(g_contexts, 0, sizeof(g_contexts));
+    g_contextCount = 0;
+    g_activeContext = nullptr;
+}
+
+FontContext* FindContext(
+    IDirect3DDevice9* device,
+    const char* key)
+{
+    for (int i = 0; i < g_contextCount; ++i) {
+        if (g_contexts[i].device == device &&
+            std::strcmp(g_contexts[i].key, key) == 0)
+        {
+            return &g_contexts[i];
+        }
+    }
+    return nullptr;
+}
+
+FontContext* CreateContext(
+    IDirect3DDevice9* device,
+    const char* key)
+{
+    if (g_contextCount >= MAX_FONT_CONTEXTS)
+        return nullptr;
+
+    FontContext* context = &g_contexts[g_contextCount++];
+    std::memset(context, 0, sizeof(*context));
+    std::strncpy(context->key, key, sizeof(context->key) - 1);
+    context->device = device;
+    context->style = DefaultStyle();
+    context->atlasCount = 1;
+    context->activeAtlas = &context->atlases[0];
+    std::strcpy(context->activeAtlas->id, "default");
+    return context;
 }
 
 bool BuildAtlas(IDirect3DDevice9* device, const char* themeName,
@@ -391,25 +455,40 @@ bool Begin(IDirect3DDevice9* device, const char* themeName,
            const char* overlayDirectory)
 {
     if (!device || !themeName || !*themeName || !overlayDirectory ||
-        !*overlayDirectory) return false;
-    char themeKey[sizeof(g_theme)] = {};
-    std::snprintf(themeKey, sizeof(themeKey), "%s|%s",
-        themeName, overlayDirectory);
-    if (g_device != device || std::strcmp(g_theme, themeKey) != 0) {
-        Shutdown();
-        g_attempted = true;
-        std::strncpy(g_theme, themeKey, sizeof(g_theme) - 1);
-        g_activeAtlas = &g_atlases[0];
-        g_atlasCount = 1;
-        std::strcpy(g_activeAtlas->id, "default");
+        !*overlayDirectory)
+        return false;
+
+    char themeKey[128] = {};
+    std::snprintf(
+        themeKey,
+        sizeof(themeKey),
+        "%s|%s",
+        themeName,
+        overlayDirectory);
+
+    FontContext* context = FindContext(device, themeKey);
+    if (!context) {
+        context = CreateContext(device, themeKey);
+        if (!context)
+            return false;
+
+        g_activeContext = context;
+
         if (!BuildAtlas(device, themeName, "default", overlayDirectory)) {
-            ReleaseAtlases();
+            --g_contextCount;
+            ReleaseContext(context);
+            g_activeContext = nullptr;
             return false;
         }
-        g_device = device;
+    } else {
+        g_activeContext = context;
     }
-    g_activeAtlas = g_atlasCount > 0 ? &g_atlases[0] : nullptr;
-    return g_atlas != nullptr;
+
+    g_activeAtlas =
+        g_atlasCount > 0 ? &g_atlases[0] : nullptr;
+
+    return g_activeAtlas &&
+        g_activeAtlas->texture != nullptr;
 }
 
 bool SelectFont(IDirect3DDevice9* device, const char* themeName,
@@ -446,19 +525,50 @@ bool SelectFont(IDirect3DDevice9* device, const char* themeName,
 bool Reload(IDirect3DDevice9* device, const char* themeName,
             const char* overlayDirectory)
 {
-    Shutdown();
+    if (!device || !themeName || !*themeName || !overlayDirectory ||
+        !*overlayDirectory)
+        return false;
+
+    char themeKey[128] = {};
+    std::snprintf(
+        themeKey,
+        sizeof(themeKey),
+        "%s|%s",
+        themeName,
+        overlayDirectory);
+
+    for (int i = 0; i < g_contextCount; ++i) {
+        if (g_contexts[i].device == device &&
+            std::strcmp(g_contexts[i].key, themeKey) == 0)
+        {
+            ReleaseContext(&g_contexts[i]);
+
+            for (int j = i; j + 1 < g_contextCount; ++j)
+                g_contexts[j] = g_contexts[j + 1];
+
+            --g_contextCount;
+            std::memset(
+                &g_contexts[g_contextCount],
+                0,
+                sizeof(g_contexts[g_contextCount]));
+            g_activeContext = nullptr;
+            break;
+        }
+    }
+
     return Begin(device, themeName, overlayDirectory);
 }
 
 const Style& GetStyle()
 {
-    return g_style;
+    static const Style fallback = DefaultStyle();
+    return g_activeContext ? g_style : fallback;
 }
 
 float Measure(const char* text, float height)
 {
-    if (!text || !*text || !g_activeAtlas || !g_atlas ||
-        g_sourceHeight <= 0.0f)
+    if (!text || !*text || !g_activeContext ||
+        !g_activeAtlas || !g_atlas || g_sourceHeight <= 0.0f)
         return 0.0f;
     const float scale = height / g_sourceHeight;
     float width = 0.0f;
@@ -477,8 +587,8 @@ void DrawLeft(IDirect3DDevice9* device, const char* text,
               float x, float y, float height, D3DCOLOR color,
               float horizontalScale)
 {
-    if (!device || !text || !g_activeAtlas || !g_atlas ||
-        g_sourceHeight <= 0.0f) return;
+    if (!device || !text || !g_activeContext ||
+        !g_activeAtlas || !g_atlas || g_sourceHeight <= 0.0f) return;
     const float scale = height / g_sourceHeight;
     if (horizontalScale <= 0.0f) return;
     device->SetTexture(0, g_atlas);
@@ -521,9 +631,7 @@ void DrawRight(IDirect3DDevice9* device, const char* text,
 
 void Shutdown()
 {
-    ReleaseAtlases();
-    g_attempted = false;
-    g_theme[0] = '\0';
+    ReleaseAllContexts();
 }
 
 } // namespace popupfont

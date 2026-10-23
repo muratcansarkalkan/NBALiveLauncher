@@ -36,7 +36,7 @@ unsigned int gRequestedSamples = 4;
 unsigned int gCreateDeviceCount = 0;
 unsigned int gResetCount = 0;
 
-// NBA Live 2005/06/07/08 supersampling v31.
+// NBA Live 2005/06/07/08 supersampling v33 + custom-overlay SSAA.
 //
 // The swap chain remains at the normal game resolution. The game therefore
 // continues to report its native logical dimensions to UI/mouse code.
@@ -57,13 +57,22 @@ IDirect3DSurface9* gSsDepth = nullptr;
 IDirect3DSurface9* gSsRealBackBuffer = nullptr;
 IDirect3DSurface9* gSsRealDepth = nullptr;
 
+// Transparent supersampled custom-overlay target.
+IDirect3DTexture9* gSsOverlayTexture = nullptr;
+IDirect3DSurface9* gSsOverlaySurface = nullptr;
+IDirect3DStateBlock9* gSsOverlaySavedState = nullptr;
+
 UINT gSsLogicalWidth = 0;
 UINT gSsLogicalHeight = 0;
 UINT gSsPhysicalWidth = 0;
 UINT gSsPhysicalHeight = 0;
 
 bool gSsInternalOperation = false;
+bool gSsNativeOverlayPass = false;
+bool gSsOverlaySupersampledActive = false;
+bool gSsResolvedThisFrame = false;
 unsigned int gSsPresentCount = 0;
+unsigned int gSsNativeOverlayResolveCount = 0;
 
 bool gDebugLoggingEnabled = false;
 
@@ -83,8 +92,15 @@ void InitializeDebugLogging()
     char iniPath[MAX_PATH] = {};
     std::snprintf(iniPath, sizeof(iniPath), "%smain.ini", exePath);
 
+    // Anti-aliasing / supersampling logging has its own switch so normal
+    // DEBUG/CONSOLE output can stay enabled without flooding the log with
+    // per-frame D3D9 diagnostics.
     gDebugLoggingEnabled =
-        GetPrivateProfileIntA("DEBUG", "CONSOLE", 0, iniPath) != 0;
+        GetPrivateProfileIntA(
+            "DISPLAY",
+            "ANTI_ALIAS_DEBUGGING",
+            0,
+            iniPath) != 0;
 
     if (!gDebugLoggingEnabled)
         return;
@@ -1049,6 +1065,19 @@ DWORD ScaleSsCoordUnsigned(DWORD value)
 
 void ReleaseSupersamplingResources()
 {
+    if (gSsOverlaySavedState) {
+        gSsOverlaySavedState->Release();
+        gSsOverlaySavedState = nullptr;
+    }
+    if (gSsOverlaySurface) {
+        gSsOverlaySurface->Release();
+        gSsOverlaySurface = nullptr;
+    }
+    if (gSsOverlayTexture) {
+        gSsOverlayTexture->Release();
+        gSsOverlayTexture = nullptr;
+    }
+
     if (gSsColor) {
         gSsColor->Release();
         gSsColor = nullptr;
@@ -1074,6 +1103,9 @@ void ReleaseSupersamplingResources()
     gSsPhysicalWidth = 0;
     gSsPhysicalHeight = 0;
     gSsInternalOperation = false;
+    gSsNativeOverlayPass = false;
+    gSsOverlaySupersampledActive = false;
+    gSsResolvedThisFrame = false;
 }
 
 bool IsSameSurface(
@@ -1222,6 +1254,39 @@ bool CreateSupersamplingResources(IDirect3DDevice9* device)
         return false;
     }
 
+    // Optional custom-overlay SSAA texture. The main scene is resolved first;
+    // overlays render here with transparent alpha and are then linearly
+    // downsampled/composited over the native backbuffer.
+    hr = device->CreateTexture(
+        gSsPhysicalWidth,
+        gSsPhysicalHeight,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+        &gSsOverlayTexture,
+        nullptr);
+
+    if (SUCCEEDED(hr) && gSsOverlayTexture)
+        hr = gSsOverlayTexture->GetSurfaceLevel(0, &gSsOverlaySurface);
+
+    if (FAILED(hr) || !gSsOverlayTexture || !gSsOverlaySurface) {
+        if (gSsOverlaySurface) {
+            gSsOverlaySurface->Release();
+            gSsOverlaySurface = nullptr;
+        }
+        if (gSsOverlayTexture) {
+            gSsOverlayTexture->Release();
+            gSsOverlayTexture = nullptr;
+        }
+        Log("SSAA: overlay target unavailable hr=0x%08lX; "
+            "falling back to native custom overlays.",
+            (unsigned long)hr);
+    } else {
+        Log("SSAA: overlay target ready: %ux%u.",
+            gSsPhysicalWidth, gSsPhysicalHeight);
+    }
+
     hr = device->GetDepthStencilSurface(&gSsRealDepth);
     if (SUCCEEDED(hr) && gSsRealDepth) {
         D3DSURFACE_DESC depthDesc = {};
@@ -1266,6 +1331,7 @@ HRESULT STDMETHODCALLTYPE HookSetViewportSSAA(
         return D3DERR_INVALIDCALL;
 
     if (gSsInternalOperation ||
+        gSsNativeOverlayPass ||
         !gSupersamplingEnabled ||
         !viewport ||
         gSsLogicalWidth == 0 ||
@@ -1298,6 +1364,7 @@ HRESULT STDMETHODCALLTYPE HookSetScissorRectSSAA(
         return D3DERR_INVALIDCALL;
 
     if (gSsInternalOperation ||
+        gSsNativeOverlayPass ||
         !gSupersamplingEnabled ||
         !rect ||
         gSsLogicalWidth == 0 ||
@@ -1335,7 +1402,8 @@ HRESULT STDMETHODCALLTYPE HookPresentSSAA(
 
     if (gSupersamplingEnabled &&
         gSsColor &&
-        gSsRealBackBuffer)
+        gSsRealBackBuffer &&
+        !gSsResolvedThisFrame)
     {
         // Bypass our SetRenderTarget substitution while doing the resolve.
         gSsInternalOperation = true;
@@ -1406,6 +1474,10 @@ HRESULT STDMETHODCALLTYPE HookPresentSSAA(
     {
         BindSupersamplingTargets(self);
     }
+
+    // The early resolve/native-overlay state is valid for one presented frame.
+    gSsResolvedThisFrame = false;
+    gSsNativeOverlayPass = false;
 
     return hr;
 }
@@ -1611,6 +1683,7 @@ HRESULT STDMETHODCALLTYPE HookSetRenderTarget(
     }
 
     if (!gSsInternalOperation &&
+        !gSsNativeOverlayPass &&
         gSupersamplingEnabled &&
         index == 0 &&
         IsSameSurface(surface, gSsRealBackBuffer) &&
@@ -1639,6 +1712,7 @@ HRESULT STDMETHODCALLTYPE HookSetDepthStencilSurface(
     }
 
     if (!gSsInternalOperation &&
+        !gSsNativeOverlayPass &&
         gSupersamplingEnabled &&
         IsSameSurface(surface, gSsRealDepth) &&
         gSsDepth)
@@ -3397,6 +3471,307 @@ const char* GameName()
 
 } // namespace
 
+bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
+{
+    if (!device ||
+        !gSupersamplingEnabled ||
+        !gSsColor ||
+        !gSsRealBackBuffer ||
+        gSsLogicalWidth == 0 ||
+        gSsLogicalHeight == 0)
+    {
+        return false;
+    }
+
+    if (gSsResolvedThisFrame) {
+        gSsNativeOverlayPass = true;
+        return true;
+    }
+
+    gSsInternalOperation = true;
+    gSsNativeOverlayPass = true;
+    gSsOverlaySupersampledActive = false;
+
+    if (gSsOverlaySavedState) {
+        gSsOverlaySavedState->Release();
+        gSsOverlaySavedState = nullptr;
+    }
+    if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &gSsOverlaySavedState)) &&
+        gSsOverlaySavedState)
+    {
+        gSsOverlaySavedState->Capture();
+    }
+
+    // Resolve the completed high-resolution game frame first.
+    HRESULT rtHr = gOriginalSetRenderTarget
+        ? gOriginalSetRenderTarget(device, 0, gSsRealBackBuffer)
+        : device->SetRenderTarget(0, gSsRealBackBuffer);
+
+    HRESULT depthHr = D3D_OK;
+    if (gSsRealDepth) {
+        depthHr = gOriginalSetDepthStencilSurface
+            ? gOriginalSetDepthStencilSurface(device, gSsRealDepth)
+            : device->SetDepthStencilSurface(gSsRealDepth);
+    }
+
+    D3DVIEWPORT9 logicalVp = {};
+    logicalVp.Width = gSsLogicalWidth;
+    logicalVp.Height = gSsLogicalHeight;
+    logicalVp.MinZ = 0.0f;
+    logicalVp.MaxZ = 1.0f;
+
+    HRESULT viewportHr = gOriginalSetViewport
+        ? gOriginalSetViewport(device, &logicalVp)
+        : device->SetViewport(&logicalVp);
+
+    HRESULT stretchHr = gOriginalStretchRect
+        ? gOriginalStretchRect(
+            device, gSsColor, nullptr,
+            gSsRealBackBuffer, nullptr, D3DTEXF_LINEAR)
+        : device->StretchRect(
+            gSsColor, nullptr,
+            gSsRealBackBuffer, nullptr, D3DTEXF_LINEAR);
+
+    if (FAILED(rtHr) || FAILED(depthHr) ||
+        FAILED(viewportHr) || FAILED(stretchHr))
+    {
+        Log("SSAA overlay begin FAILED: rt=0x%08lX depth=0x%08lX "
+            "viewport=0x%08lX resolve=0x%08lX.",
+            (unsigned long)rtHr,
+            (unsigned long)depthHr,
+            (unsigned long)viewportHr,
+            (unsigned long)stretchHr);
+
+        if (gSsOverlaySavedState) {
+            gSsOverlaySavedState->Apply();
+            gSsOverlaySavedState->Release();
+            gSsOverlaySavedState = nullptr;
+        }
+
+        gSsInternalOperation = false;
+        gSsNativeOverlayPass = false;
+        gSsResolvedThisFrame = false;
+        BindSupersamplingTargets(device);
+        return false;
+    }
+
+    gSsResolvedThisFrame = true;
+
+    if (gSsOverlaySurface && gSsOverlayTexture) {
+        HRESULT overlayRtHr = gOriginalSetRenderTarget
+            ? gOriginalSetRenderTarget(device, 0, gSsOverlaySurface)
+            : device->SetRenderTarget(0, gSsOverlaySurface);
+
+        HRESULT noDepthHr = gOriginalSetDepthStencilSurface
+            ? gOriginalSetDepthStencilSurface(device, nullptr)
+            : device->SetDepthStencilSurface(nullptr);
+
+        D3DVIEWPORT9 overlayVp = {};
+        overlayVp.Width = gSsPhysicalWidth;
+        overlayVp.Height = gSsPhysicalHeight;
+        overlayVp.MinZ = 0.0f;
+        overlayVp.MaxZ = 1.0f;
+
+        HRESULT overlayVpHr = gOriginalSetViewport
+            ? gOriginalSetViewport(device, &overlayVp)
+            : device->SetViewport(&overlayVp);
+
+        RECT overlayScissor = {
+            0, 0,
+            static_cast<LONG>(gSsPhysicalWidth),
+            static_cast<LONG>(gSsPhysicalHeight)
+        };
+
+        HRESULT scissorHr = gOriginalSetScissorRect
+            ? gOriginalSetScissorRect(device, &overlayScissor)
+            : device->SetScissorRect(&overlayScissor);
+
+        HRESULT clearHr = device->Clear(
+            0, nullptr, D3DCLEAR_TARGET,
+            0x00000000u, 1.0f, 0);
+
+        if (SUCCEEDED(overlayRtHr) &&
+            SUCCEEDED(noDepthHr) &&
+            SUCCEEDED(overlayVpHr) &&
+            SUCCEEDED(scissorHr) &&
+            SUCCEEDED(clearHr))
+        {
+            // Existing popup drawing uses straight-alpha RGB blending.
+            // Accumulate destination alpha separately so the final texture can
+            // be composited as premultiplied RGB + normal coverage alpha.
+            device->SetRenderState(
+                D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+            device->SetRenderState(
+                D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+            device->SetRenderState(
+                D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
+            device->SetRenderState(
+                D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD);
+
+            gSsOverlaySupersampledActive = true;
+        } else {
+            Log("SSAA overlay RT setup failed: rt=0x%08lX depth=0x%08lX "
+                "viewport=0x%08lX scissor=0x%08lX clear=0x%08lX; "
+                "using native custom overlays.",
+                (unsigned long)overlayRtHr,
+                (unsigned long)noDepthHr,
+                (unsigned long)overlayVpHr,
+                (unsigned long)scissorHr,
+                (unsigned long)clearHr);
+
+            if (gOriginalSetRenderTarget)
+                gOriginalSetRenderTarget(device, 0, gSsRealBackBuffer);
+            if (gSsRealDepth && gOriginalSetDepthStencilSurface)
+                gOriginalSetDepthStencilSurface(device, gSsRealDepth);
+            if (gOriginalSetViewport)
+                gOriginalSetViewport(device, &logicalVp);
+        }
+    }
+
+    gSsInternalOperation = false;
+    ++gSsNativeOverlayResolveCount;
+
+    if (gSsNativeOverlayResolveCount <= 10) {
+        Log("SSAA overlay pass #%u: %ux%u -> %ux%u; custom=%s.",
+            gSsNativeOverlayResolveCount,
+            gSsPhysicalWidth,
+            gSsPhysicalHeight,
+            gSsLogicalWidth,
+            gSsLogicalHeight,
+            gSsOverlaySupersampledActive ? "supersampled" : "native");
+    }
+
+    return true;
+}
+
+void EndAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
+{
+    if (!device || !gSsNativeOverlayPass)
+        return;
+
+    if (gSsOverlaySupersampledActive &&
+        gSsOverlayTexture &&
+        gSsRealBackBuffer)
+    {
+        gSsInternalOperation = true;
+
+        if (gOriginalSetRenderTarget)
+            gOriginalSetRenderTarget(device, 0, gSsRealBackBuffer);
+        else
+            device->SetRenderTarget(0, gSsRealBackBuffer);
+
+        if (gSsRealDepth) {
+            if (gOriginalSetDepthStencilSurface)
+                gOriginalSetDepthStencilSurface(device, gSsRealDepth);
+            else
+                device->SetDepthStencilSurface(gSsRealDepth);
+        }
+
+        D3DVIEWPORT9 vp = {};
+        vp.Width = gSsLogicalWidth;
+        vp.Height = gSsLogicalHeight;
+        vp.MinZ = 0.0f;
+        vp.MaxZ = 1.0f;
+
+        if (gOriginalSetViewport)
+            gOriginalSetViewport(device, &vp);
+        else
+            device->SetViewport(&vp);
+
+        struct OverlayVertex {
+            float x, y, z, rhw;
+            D3DCOLOR color;
+            float u, v;
+        };
+
+        const float left = -0.5f;
+        const float top = -0.5f;
+        const float right =
+            static_cast<float>(gSsLogicalWidth) - 0.5f;
+        const float bottom =
+            static_cast<float>(gSsLogicalHeight) - 0.5f;
+
+        const OverlayVertex vertices[4] = {
+            { left,  top,    0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+            { right, top,    0.0f, 1.0f, 0xFFFFFFFFu, 1.0f, 0.0f },
+            { left,  bottom, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 1.0f },
+            { right, bottom, 0.0f, 1.0f, 0xFFFFFFFFu, 1.0f, 1.0f }
+        };
+
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+        device->SetRenderState(
+            D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        device->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+        device->SetRenderState(
+            D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetTexture(0, gSsOverlayTexture);
+        device->SetFVF(
+            D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+
+        device->SetSamplerState(
+            0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(
+            0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(
+            0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        device->SetSamplerState(
+            0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(
+            0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+        device->SetTextureStageState(
+            0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        device->SetTextureStageState(
+            0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(
+            0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        device->SetTextureStageState(
+            0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+        device->SetTextureStageState(
+            0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(
+            0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+
+        device->DrawPrimitiveUP(
+            D3DPT_TRIANGLESTRIP,
+            2,
+            vertices,
+            sizeof(OverlayVertex));
+
+        device->SetTexture(0, nullptr);
+        gSsInternalOperation = false;
+    }
+
+    if (gSsOverlaySavedState) {
+        gSsOverlaySavedState->Apply();
+        gSsOverlaySavedState->Release();
+        gSsOverlaySavedState = nullptr;
+    }
+
+    gSsOverlaySupersampledActive = false;
+    gSsNativeOverlayPass = false;
+}
+
+float GetAntiAliasingNativeOverlayScale()
+{
+    if (!gSsOverlaySupersampledActive ||
+        !gSsLogicalWidth ||
+        !gSsPhysicalWidth)
+    {
+        return 1.0f;
+    }
+
+    return static_cast<float>(gSsPhysicalWidth) /
+        static_cast<float>(gSsLogicalWidth);
+}
+
 void InitializeAntiAliasing()
 {
     InitializeDebugLogging();
@@ -3407,7 +3782,7 @@ void InitializeAntiAliasing()
             std::remove(logPath);
     }
 
-    Log("InitializeAntiAliasing v31 + Live05/06/07/08 Present-time supersampling entered.");
+    Log("InitializeAntiAliasing v33-overlay-ssaa entered.");
     Log("Executable entry point = %08lX.",
         (unsigned long)FM::GetEntryPoint());
 
@@ -3507,12 +3882,12 @@ void InitializeAntiAliasing()
         supersampling,
         gSupersamplingPercent);
 
-    // v31 deliberately tests SSAA without the old MSAA swap chain. This keeps
+    // v32 deliberately tests SSAA without the old MSAA swap chain. This keeps
     // the final downsample legal and isolates whether spatial supersampling
     // actually solves the court texture edge.
     if (gSupersamplingEnabled) {
         if (enabled == 1) {
-            Log("SSAA v31: ANTI_ALIASING=1 requested too; disabling MSAA for this run. Test SSAA independently.");
+            Log("SSAA v32: ANTI_ALIASING=1 requested too; disabling MSAA for this run. Test SSAA independently.");
         }
         gEnabled = false;
     }

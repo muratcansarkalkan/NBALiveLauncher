@@ -243,6 +243,13 @@ void __fastcall GameCourtSetupHook(
         arg5,
         arg6,
         arg7);
+
+    // GameCourt::Setup can populate the playoff schedule service and can
+    // rewrite OptionsSettings after the pre-call context pass. Apply the
+    // context again so forced mode, round, series game, and clinching flags
+    // are committed to the final native state. The CustomPaths cache keeps
+    // the repeated asset-routing work inexpensive.
+    UpdateCustomPathsGameContext(stadiumId4, options);
 }
 
 // NBA Live 07: GameCourt::SetStadiumName(const char* stadiumId4).

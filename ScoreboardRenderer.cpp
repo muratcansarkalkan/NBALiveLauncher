@@ -12,6 +12,38 @@
 namespace scoreboard {
 namespace {
 
+float gRenderTargetScale = 1.0f;
+
+float Raster(float value)
+{
+    return value * gRenderTargetScale;
+}
+
+HRESULT GetLayoutViewport(
+    IDirect3DDevice9* device,
+    D3DVIEWPORT9* viewport)
+{
+    if (!device || !viewport)
+        return D3DERR_INVALIDCALL;
+
+    HRESULT hr = device->GetViewport(viewport);
+    if (FAILED(hr))
+        return hr;
+
+    if (gRenderTargetScale > 1.0f) {
+        viewport->X = static_cast<DWORD>(
+            static_cast<float>(viewport->X) / gRenderTargetScale);
+        viewport->Y = static_cast<DWORD>(
+            static_cast<float>(viewport->Y) / gRenderTargetScale);
+        viewport->Width = static_cast<DWORD>(
+            static_cast<float>(viewport->Width) / gRenderTargetScale + 0.5f);
+        viewport->Height = static_cast<DWORD>(
+            static_cast<float>(viewport->Height) / gRenderTargetScale + 0.5f);
+    }
+
+    return hr;
+}
+
 struct ScreenVertex {
     float x, y, z, rhw;
     D3DCOLOR color;
@@ -21,10 +53,10 @@ void DrawFilledRect(IDirect3DDevice9* device, float left, float top,
                     float right, float bottom, D3DCOLOR color)
 {
     const ScreenVertex vertices[4] = {
-        { left,  top,    0.0f, 1.0f, color },
-        { right, top,    0.0f, 1.0f, color },
-        { left,  bottom, 0.0f, 1.0f, color },
-        { right, bottom, 0.0f, 1.0f, color }
+        { Raster(left),  Raster(top),    0.0f, 1.0f, color },
+        { Raster(right), Raster(top),    0.0f, 1.0f, color },
+        { Raster(left),  Raster(bottom), 0.0f, 1.0f, color },
+        { Raster(right), Raster(bottom), 0.0f, 1.0f, color }
     };
     device->SetTexture(0, nullptr);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
@@ -41,8 +73,10 @@ void DrawGradientRect(IDirect3DDevice9* device, float left, float top,
     const D3DCOLOR bl = horizontal ? start : end;
     const D3DCOLOR br = end;
     const ScreenVertex vertices[4] = {
-        { left, top, 0.0f, 1.0f, tl }, { right, top, 0.0f, 1.0f, tr },
-        { left, bottom, 0.0f, 1.0f, bl }, { right, bottom, 0.0f, 1.0f, br }
+        { Raster(left), Raster(top), 0.0f, 1.0f, tl },
+        { Raster(right), Raster(top), 0.0f, 1.0f, tr },
+        { Raster(left), Raster(bottom), 0.0f, 1.0f, bl },
+        { Raster(right), Raster(bottom), 0.0f, 1.0f, br }
     };
     device->SetTexture(0, nullptr);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
@@ -56,13 +90,15 @@ void DrawFilledCircle(IDirect3DDevice9* device, float centerX,
     constexpr int SEGMENTS = 20;
     constexpr float TWO_PI = 6.28318530717958647692f;
     ScreenVertex vertices[SEGMENTS + 2] = {};
-    vertices[0] = { centerX, centerY, 0.0f, 1.0f, color };
+    vertices[0] = {
+        Raster(centerX), Raster(centerY), 0.0f, 1.0f, color
+    };
     for (int i = 0; i <= SEGMENTS; ++i) {
         const float angle = TWO_PI * static_cast<float>(i) /
             static_cast<float>(SEGMENTS);
         vertices[i + 1] = {
-            centerX + std::cos(angle) * radius,
-            centerY + std::sin(angle) * radius,
+            Raster(centerX + std::cos(angle) * radius),
+            Raster(centerY + std::sin(angle) * radius),
             0.0f, 1.0f, color
         };
     }
@@ -106,10 +142,10 @@ void DrawTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture,
     }
 
     const TextureVertex vertices[4] = {
-        { left,  top,    0.0f, 1.0f, color, 0.0f, 0.0f },
-        { right, top,    0.0f, 1.0f, color, 1.0f, 0.0f },
-        { left,  bottom, 0.0f, 1.0f, color, 0.0f, 1.0f },
-        { right, bottom, 0.0f, 1.0f, color, 1.0f, 1.0f }
+        { Raster(left),  Raster(top),    0.0f, 1.0f, color, 0.0f, 0.0f },
+        { Raster(right), Raster(top),    0.0f, 1.0f, color, 1.0f, 0.0f },
+        { Raster(left),  Raster(bottom), 0.0f, 1.0f, color, 0.0f, 1.0f },
+        { Raster(right), Raster(bottom), 0.0f, 1.0f, color, 1.0f, 1.0f }
     };
     device->SetTexture(0, texture);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
@@ -131,10 +167,10 @@ void DrawTextureStretched(IDirect3DDevice9* device,
 {
     if (!texture) return;
     const TextureVertex vertices[4] = {
-        { left,  top,    0.0f, 1.0f, color, 0.0f, 0.0f },
-        { right, top,    0.0f, 1.0f, color, 1.0f, 0.0f },
-        { left,  bottom, 0.0f, 1.0f, color, 0.0f, 1.0f },
-        { right, bottom, 0.0f, 1.0f, color, 1.0f, 1.0f }
+        { Raster(left),  Raster(top),    0.0f, 1.0f, color, 0.0f, 0.0f },
+        { Raster(right), Raster(top),    0.0f, 1.0f, color, 1.0f, 0.0f },
+        { Raster(left),  Raster(bottom), 0.0f, 1.0f, color, 0.0f, 1.0f },
+        { Raster(right), Raster(bottom), 0.0f, 1.0f, color, 1.0f, 1.0f }
     };
     device->SetTexture(0, texture);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
@@ -347,8 +383,9 @@ void DrawSmallCapsLeft(IDirect3DDevice9* device, const char* text,
             std::toupper(*p) : *p), '\0' };
         const float glyphY = fullBaseline -
             glyphHeight * kSmallCapsBaselineRatio;
-        popupfont::DrawLeft(device, glyph, x, glyphY,
-            glyphHeight, color, horizontalScale);
+        popupfont::DrawLeft(device, glyph,
+            Raster(x), Raster(glyphY), Raster(glyphHeight),
+            color, horizontalScale);
         x += popupfont::Measure(glyph, glyphHeight) * horizontalScale;
     }
 }
@@ -360,7 +397,8 @@ void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
                        scoreboardconfig::TextOverflow::Overflow,
                    scoreboardconfig::TextTransform transform =
                        scoreboardconfig::TextTransform::None,
-                   float smallCapsScale = 0.82f)
+                   float smallCapsScale = 0.82f,
+                   float verticalScale = 1.0f)
 {
     char transformed[128] = {};
     TransformText(sourceText, transform, transformed, sizeof(transformed));
@@ -370,9 +408,12 @@ void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
     // Fit preserves the legacy behavior: shrink uniformly in X/Y.
     // FitWidth keeps the requested height and only compresses horizontally.
     float actualHeight = height > 0.0f ? height : rectangle.height;
+    if (verticalScale < 0.25f) verticalScale = 0.25f;
+    if (verticalScale > 4.0f) verticalScale = 4.0f;
     if (overflow == scoreboardconfig::TextOverflow::Fit &&
-        rectangle.height > 0.0f && actualHeight > rectangle.height)
-        actualHeight = rectangle.height;
+        rectangle.height > 0.0f &&
+        actualHeight * verticalScale > rectangle.height)
+        actualHeight = rectangle.height / verticalScale;
 
     float horizontalScale = 1.0f;
     const float measured =
@@ -389,8 +430,10 @@ void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
         horizontalScale = rectangle.width / measured;
     }
 
+    const float drawHeight = actualHeight * verticalScale;
+    const float drawHorizontalScale = horizontalScale / verticalScale;
     const float y = rectangle.y +
-        (rectangle.height - actualHeight) * 0.5f;
+        (rectangle.height - drawHeight) * 0.5f;
 
     if (transform == scoreboardconfig::TextTransform::SmallCaps) {
         const float fittedWidth =
@@ -399,22 +442,23 @@ void DrawBoundText(IDirect3DDevice9* device, const char* sourceText,
         const float x = alignment < 0 ? rectangle.x : alignment > 0 ?
             rectangle.x + rectangle.width - fittedWidth :
             rectangle.x + (rectangle.width - fittedWidth) * 0.5f;
-        DrawSmallCapsLeft(device, sourceText, x, y, actualHeight,
-            smallCapsScale, color, horizontalScale);
+        DrawSmallCapsLeft(device, sourceText, x, y, drawHeight,
+            smallCapsScale, color, drawHorizontalScale);
         return;
     }
 
     if (alignment < 0)
-        popupfont::DrawLeft(device, text, rectangle.x, y,
-            actualHeight, color, horizontalScale);
+        popupfont::DrawLeft(device, text,
+            Raster(rectangle.x), Raster(y), Raster(drawHeight),
+            color, drawHorizontalScale);
     else if (alignment > 0)
         popupfont::DrawRight(device, text,
-            rectangle.x + rectangle.width, y, actualHeight, color,
-            horizontalScale);
+            Raster(rectangle.x + rectangle.width), Raster(y),
+            Raster(drawHeight), color, drawHorizontalScale);
     else
         popupfont::DrawCentered(device, text,
-            rectangle.x + rectangle.width * 0.5f,
-            y, actualHeight, color, horizontalScale);
+            Raster(rectangle.x + rectangle.width * 0.5f),
+            Raster(y), Raster(drawHeight), color, drawHorizontalScale);
 }
 
 struct StatTeamPair {
@@ -904,7 +948,12 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
             scoreboardconfig::ShotClockVisibility::UnderThreshold)
             show = seconds <= config.shotClockThreshold;
         if (!show) return false;
-        std::snprintf(output, capacity, "%u", seconds);
+        if (config.shotClockTwoDigits)
+            std::snprintf(output, capacity, "%s%02u",
+                config.shotClockPrefix, seconds);
+        else
+            std::snprintf(output, capacity, "%s%u",
+                config.shotClockPrefix, seconds);
         *defaultHeight = style.shotClockHeight;
         *color = seconds <= config.urgentShotClockThreshold ?
             config.shotClockUrgentColor : config.shotClockNormalColor;
@@ -1052,7 +1101,7 @@ bool RenderGenericElements(IDirect3DDevice9* device,
                 const int shadowOpacity = opacity * e.shadowAlpha / 255;
                 DrawBoundText(device, text, shadowRect, height * scale,
                     WithOpacity(e.shadowColor, shadowOpacity), alignment, overflow,
-                    e.textTransform, e.smallCapsScale);
+                    e.textTransform, e.smallCapsScale, e.fontVerticalScale);
             }
             if (e.strokeEnabled && e.strokeWidth > 0.0f) {
                 const int radius = static_cast<int>(
@@ -1069,13 +1118,13 @@ bool RenderGenericElements(IDirect3DDevice9* device,
                         strokeRect.y += static_cast<float>(y);
                         DrawBoundText(device, text, strokeRect, height * scale,
                             WithOpacity(e.strokeColor, opacity), alignment, overflow,
-                            e.textTransform, e.smallCapsScale);
+                            e.textTransform, e.smallCapsScale, e.fontVerticalScale);
                     }
                 }
             }
             DrawBoundText(device, text, r, height * scale,
                 WithOpacity(color, opacity), alignment, overflow,
-                e.textTransform, e.smallCapsScale);
+                e.textTransform, e.smallCapsScale, e.fontVerticalScale);
         }
         else if (e.type == scoreboardconfig::ElementType::Indicator && fontReady) {
             if (!popupfont::SelectFont(device, overlayName, e.font,
@@ -1164,7 +1213,7 @@ void Render(IDirect3DDevice9* device, const Frame& frame,
         return;
 
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
 
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
@@ -1300,7 +1349,12 @@ void Render(IDirect3DDevice9* device, const Frame& frame,
             std::sprintf(clock, "%u:%02u", totalSeconds / 60u,
                 totalSeconds % 60u);
         }
-        std::sprintf(shotClock, "%u", shotSeconds);
+        if (config.shotClockTwoDigits)
+            std::snprintf(shotClock, sizeof(shotClock), "%s%02u",
+                config.shotClockPrefix, shotSeconds);
+        else
+            std::snprintf(shotClock, sizeof(shotClock), "%s%u",
+                config.shotClockPrefix, shotSeconds);
         DrawBoundText(device, awayScore,
             ToScreen(config.awayScore, left, top, scale),
             style.scoreHeight * scale, style.scoreColor, 1);
@@ -1419,7 +1473,7 @@ void RenderViolation(IDirect3DDevice9* device, const Frame& frame,
         !frame.violationTitle || !*frame.violationTitle ||
         animationOpacity <= 0.0f) return;
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
         stateBlock->Capture();
@@ -1461,7 +1515,7 @@ void RenderPlayCall(IDirect3DDevice9* device, const Frame& frame,
         !frame.playCallName || !*frame.playCallName ||
         animationOpacity <= 0.0f) return;
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
         stateBlock->Capture();
@@ -1503,7 +1557,7 @@ void RenderIntro(IDirect3DDevice9* device, const Frame& frame,
         !frame.introValues[0] || !*frame.introValues[0] ||
         animationOpacity <= 0.0f) return;
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
         stateBlock->Capture();
@@ -1545,7 +1599,7 @@ void RenderStarting5(IDirect3DDevice9* device, const Frame& frame,
         !frame.starting5Values[5] || !*frame.starting5Values[5] ||
         animationOpacity <= 0.0f) return;
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
         stateBlock->Capture();
@@ -1586,7 +1640,7 @@ void RenderOutro(IDirect3DDevice9* device, const Frame& frame,
         !frame.outroValues[0] || !*frame.outroValues[0] ||
         animationOpacity <= 0.0f) return;
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
         stateBlock->Capture();
@@ -1627,7 +1681,7 @@ void RenderLineups(IDirect3DDevice9* device, const Frame& frame,
         !frame.lineupsValues[0] || !*frame.lineupsValues[0] ||
         animationOpacity <= 0.0f) return;
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
         stateBlock->Capture();
@@ -1670,7 +1724,7 @@ void RenderPlayerFoul(IDirect3DDevice9* device, const Frame& frame,
         !frame.playerLastName || !*frame.playerLastName ||
         animationOpacity <= 0.0f) return;
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
         stateBlock->Capture();
@@ -1712,7 +1766,7 @@ void RenderStat(IDirect3DDevice9* device, const Frame& frame,
         frame.statValueCount <= 0 || animationOpacity <= 0.0f)
         return;
     D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport))) return;
+    if (FAILED(GetLayoutViewport(device, &viewport))) return;
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)))
         stateBlock->Capture();
@@ -1744,6 +1798,13 @@ void RenderStat(IDirect3DDevice9* device, const Frame& frame,
     RenderGenericElements(device, config, frame, left, top, scale,
         overlayName, "stats", animationOpacity);
     if (stateBlock) { stateBlock->Apply(); stateBlock->Release(); }
+}
+
+void SetRenderTargetScale(float scale)
+{
+    if (scale < 1.0f) scale = 1.0f;
+    if (scale > 4.0f) scale = 4.0f;
+    gRenderTargetScale = scale;
 }
 
 } // namespace scoreboard

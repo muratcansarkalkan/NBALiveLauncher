@@ -1,6 +1,6 @@
 #include "plugin-std.h"
 #include "Resolutions.h"
-#include "ResolutionMenuStrings.h"
+#include <cwchar>
 
 using namespace plugin;
 
@@ -12,9 +12,6 @@ const float ASPECT_DIFF = ASPECT_RATIO / 1.33333f;
 static float gAspectScale07 = 1.0f;
 
 namespace live07 {
-
-    static ResolutionMenuStringPatcher gResolutionMenuStrings07;
-
     // Logical menu order. NBA Live 07 has one important native invariant:
     // renderer mode index 1 is the startup/current mode. Do not fight that.
     //
@@ -119,6 +116,98 @@ namespace live07 {
             add edi, 4
             jmp dword ptr [gResolutionMenuAppendReturn07]
         }
+    }
+
+
+    // ---------------------------------------------------------------------
+    // NBA Live 07 localized resolution labels
+    // ---------------------------------------------------------------------
+    // The localization IDs/files may vary, so do not key this on token IDs.
+    // Let the game's locale.eng/gameloc.eng lookup complete normally, then
+    // remap only the ten stock returned resolution strings.
+    //
+    // Proven 07 localization path:
+    //   0041AE30  FE localization wrapper
+    //   00CC8DF8  Localization singleton
+    //   00419B50  native token -> BBallWString lookup
+    //   004196E0  native BBallWString UTF-8 assignment helper
+    //
+    // This is the same strategy that worked in Live 06, with 07 addresses.
+    // The ten localization strings are tied to PHYSICAL native mode slots,
+    // not to the width/height currently stored in those slots.
+    //
+    // Because Live 07 requires the configured startup mode to be swapped into
+    // physical slot 1, the replacement text must follow the CURRENT CONTENTS
+    // of each physical slot. A fixed 0->640, 1->800 mapping is wrong after the
+    // swap and is exactly why the Detail Settings screen could say 800x600
+    // while gameplay was actually 1366x768.
+    static const wchar_t* kNativeResolutionTexts07[10] =
+    {
+        L"640x480x16",
+        L"640x480x32",
+        L"800x600x16",
+        L"800x600x32",
+        L"1024x768x16",
+        L"1024x768x32",
+        L"1280x1024x16",
+        L"1280x1024x32",
+        L"1600x1200x16",
+        L"1600x1200x32",
+    };
+
+    static void* __cdecl LocalizeStringHook07(
+        void* outString,
+        const char* token)
+    {
+        void* localization =
+            *reinterpret_cast<void**>(0x00CC8DF8);
+
+        using NativeLookupFn =
+            void* (__thiscall*)(void*, void*, const char*);
+
+        reinterpret_cast<NativeLookupFn>(0x00419B50)(
+            localization,
+            outString,
+            token);
+
+        if (!outString)
+            return outString;
+
+        const wchar_t* localized =
+            *reinterpret_cast<const wchar_t**>(outString);
+
+        if (!localized)
+            return outString;
+
+        for (int physicalSlot = 0; physicalSlot < 10; ++physicalSlot)
+        {
+            if (std::wcscmp(
+                    localized,
+                    kNativeResolutionTexts07[physicalSlot]) != 0)
+                continue;
+
+            // ids[] is kept in PHYSICAL-slot order. PrepareResolutionSlots07()
+            // may have swapped the configured mode into slot 1, so use the
+            // current contents of that physical slot for the visible label.
+            char replacement[32] = {};
+            sprintf_s(
+                replacement,
+                sizeof(replacement),
+                "%ux%u",
+                ids[physicalSlot].width,
+                ids[physicalSlot].height);
+
+            using AssignUtf8Fn =
+                void (__thiscall*)(void*, const char*);
+
+            reinterpret_cast<AssignUtf8Fn>(0x004196E0)(
+                outString,
+                replacement);
+
+            break;
+        }
+
+        return outString;
     }
 
     DWORD* METHOD SetPerspectiveProjection07(
@@ -613,21 +702,46 @@ void Install_LIVE07() {
     patch::RedirectJump(0x67BE80, SetTestInConicalFrustum07);
     InstallHighResolutionAptFonts07();
 
-    // Preserve Live 07's native startup/current-mode slot (index 1), but
-    // decouple menu ordering from physical table ordering.
+    // APT/frontend timing: remove GameDirector's forced minimum delta of 1.
+    //
+    // Stock:
+    //   006493A7 cmp edi, 1
+    //   006493AA jge short ...
+    //   006493AC mov edi, 1
+    //
+    // On an uncapped frontend loop, sub-one-unit elapsed time is repeatedly
+    // promoted to 1, so APT advances once per render iteration. Allowing the
+    // value to remain 0 preserves real elapsed timing.
+    //
+    // This outer-loop patch intentionally leaves the game's separate preload
+    // loop at 0x649504 (1000 explicit FESystem::Update(1) calls) untouched.
+    patch::SetUChar(0x6493AC, 0x31); // xor edi, edi
+    patch::SetUChar(0x6493AD, 0xFF);
+    patch::Nop(0x6493AE, 3);
+
+    // NBA Live 07 is different from 05/06:
+    //
+    // 0064E720 uses the selected mode for FORMAT, but hard-codes the
+    // WIDTH/HEIGHT from physical resolution record 1 (table + 0x14).
+    // Therefore the configured startup resolution really must occupy
+    // physical slot 1.
+    //
+    // PrepareResolutionSlots07() swaps the configured logical resolution into
+    // physical slot 1 and builds a logical-menu -> physical-slot map so the
+    // Detail Settings menu can still be presented in the normal order.
+    // Resolution labels come from localization files. Hook the native
+    // localization wrapper rather than scanning/replacing process memory.
     PrepareResolutionSlots07();
 
-    // 53A8CF: mov [edi], esi / add edi, 4
+    // Enable the localization remap only after the physical-slot contents and
+    // logical->physical menu mapping are finalized.
+    patch::RedirectJump(0x0041AE30, LocalizeStringHook07);
+
+    // 0053A870 builds a vector of PHYSICAL resolution indices.
+    // 0053A8CF normally appends ESI directly. Replace only that append with
+    // the logical -> physical mapping built above.
     patch::RedirectJump(0x53A8CF, AppendResolutionInLogicalOrder07);
-
-    // Capture the stock resolution labels before overwriting the mode table.
-    gResolutionMenuStrings07.Initialize(
-        0xC65CA0,
-        ids,
-        sizeof(ids) / sizeof(ids[0])
-    );
-
-    for (const auto& resolution : ids) {
+for (const auto& resolution : ids) {
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 4, resolution.width);
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 8, resolution.height);
         patch::SetUInt(0xC65CA0 + 20 * resolution.id + 12, resolution.depth);
