@@ -75,9 +75,6 @@
     <ClCompile Include="AntiAliasing.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="CustomCamera.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="ArenaLighting.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

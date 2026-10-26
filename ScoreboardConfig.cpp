@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace scoreboardconfig {
 namespace {
@@ -44,6 +45,27 @@ char g_statLayoutName[64] = {};
 char g_statLayoutFamilyName[64] = {};
 char g_playerFoulLayoutName[64] = {};
 char g_lastError[512] = {};
+
+struct StatLayoutCacheEntry {
+    std::string path;
+    Config playerConfig;
+    Config teamConfig;
+    bool playerParsed;
+    bool teamParsed;
+};
+
+struct StatResolutionCacheEntry {
+    std::string theme;
+    std::string subtype;
+    bool playerPayload;
+    int valueCase;
+    bool available;
+    std::string resolvedPath;
+};
+
+std::vector<StatLayoutCacheEntry> g_statLayoutCache;
+std::vector<StatResolutionCacheEntry> g_statResolutionCache;
+
 
 void SetDefaults(Config* c)
 {
@@ -575,6 +597,104 @@ void Parse(const std::string& json, Config* c)
         "freezeWhilePaused", c->freezeWhilePaused);
 }
 
+
+StatLayoutCacheEntry* FindStatLayoutCache(const std::string& path)
+{
+    for (size_t i = 0; i < g_statLayoutCache.size(); ++i)
+        if (_stricmp(g_statLayoutCache[i].path.c_str(), path.c_str()) == 0)
+            return &g_statLayoutCache[i];
+    return nullptr;
+}
+
+bool GetCachedStatConfig(const std::string& path, bool playerPayload, Config* output)
+{
+    StatLayoutCacheEntry* entry = FindStatLayoutCache(path);
+    if (!entry) return false;
+
+    const bool parsed = playerPayload ? entry->playerParsed : entry->teamParsed;
+    if (!parsed) return false;
+
+    *output = playerPayload ? entry->playerConfig : entry->teamConfig;
+    return true;
+}
+
+void StoreCachedStatConfig(const std::string& path, bool playerPayload,
+                           const Config& config)
+{
+    StatLayoutCacheEntry* entry = FindStatLayoutCache(path);
+    if (!entry) {
+        StatLayoutCacheEntry fresh = {};
+        fresh.path = path;
+        fresh.playerParsed = false;
+        fresh.teamParsed = false;
+        g_statLayoutCache.push_back(fresh);
+        entry = &g_statLayoutCache.back();
+    }
+
+    if (playerPayload) {
+        entry->playerConfig = config;
+        entry->playerParsed = true;
+    } else {
+        entry->teamConfig = config;
+        entry->teamParsed = true;
+    }
+}
+
+StatResolutionCacheEntry* FindStatResolution(
+    const char* themeName, const char* subtypeKey,
+    bool playerPayload, int valueCase)
+{
+    for (size_t i = 0; i < g_statResolutionCache.size(); ++i) {
+        StatResolutionCacheEntry& entry = g_statResolutionCache[i];
+        if (entry.playerPayload == playerPayload &&
+            entry.valueCase == valueCase &&
+            _stricmp(entry.theme.c_str(), themeName) == 0 &&
+            _stricmp(entry.subtype.c_str(), subtypeKey) == 0)
+            return &entry;
+    }
+    return nullptr;
+}
+
+void StoreStatResolution(const char* themeName, const char* subtypeKey,
+                         bool playerPayload, int valueCase,
+                         bool available, const std::string& resolvedPath)
+{
+    StatResolutionCacheEntry entry;
+    entry.theme = themeName ? themeName : "";
+    entry.subtype = subtypeKey ? subtypeKey : "";
+    entry.playerPayload = playerPayload;
+    entry.valueCase = valueCase;
+    entry.available = available;
+    entry.resolvedPath = resolvedPath;
+    g_statResolutionCache.push_back(entry);
+}
+
+void ClearStatCachesForTheme(const char* themeName)
+{
+    if (!themeName || !*themeName) {
+        g_statLayoutCache.clear();
+        g_statResolutionCache.clear();
+        return;
+    }
+
+    const std::string needle = std::string("\\assets\\popups\\") +
+        themeName + "\\stats\\";
+
+    for (size_t i = 0; i < g_statLayoutCache.size();) {
+        if (g_statLayoutCache[i].path.find(needle) != std::string::npos)
+            g_statLayoutCache.erase(g_statLayoutCache.begin() + i);
+        else
+            ++i;
+    }
+
+    for (size_t i = 0; i < g_statResolutionCache.size();) {
+        if (_stricmp(g_statResolutionCache[i].theme.c_str(), themeName) == 0)
+            g_statResolutionCache.erase(g_statResolutionCache.begin() + i);
+        else
+            ++i;
+    }
+}
+
 } // namespace
 
 const Config& Get() { return g_config; }
@@ -911,6 +1031,7 @@ bool LoadStat(const char* themeName, const char* subtypeKey,
 {
     if (!themeName || !subtypeKey || !*subtypeKey)
         return false;
+
     if (g_statLoaded && std::strcmp(g_statTheme, themeName) == 0 &&
         std::strcmp(g_statSubtype, subtypeKey) == 0 &&
         g_statValueCase == valueCase)
@@ -933,50 +1054,99 @@ bool LoadStat(const char* themeName, const char* subtypeKey,
         g_statLayoutFamilyName[sizeof(g_statLayoutFamilyName) - 1] = '\0';
     }
 
-    // Resolution order:
-    //   1. exact semantic subtype (leaders_centers.json)
-    //   2. shared semantic family (position_leaders.json / season_comparison.json)
-    //   3. generic value-count family (team_3.json / player_2.json)
-    //   4. generic payload fallback (team.json / player.json)
-    std::string path = base + subtypeKey + ".json";
-    std::string json;
-    if (!ReadFile(path.c_str(), &json)) {
-        if (sharedLayoutKey) {
-            path = base + sharedLayoutKey + ".json";
-            ReadFile(path.c_str(), &json);
-        }
-
-        // Generic player and team layouts may provide different geometry for
-        // one, two, or three populated value groups/columns.
-        const int maximumCase = playerPayload ? 5 : 3;
-        if (json.empty() && valueCase >= 1 && valueCase <= maximumCase) {
-            char caseName[32];
-            std::snprintf(caseName, sizeof(caseName),
-                "%s_%d.json", playerPayload ? "player" : "team",
-                valueCase);
-            path = base + caseName;
-            ReadFile(path.c_str(), &json);
-        }
-        if (json.empty())
-            path = base + (playerPayload ? "player.json" : "team.json");
-        if (json.empty() && !ReadFile(path.c_str(), &json)) {
-            std::snprintf(g_lastError, sizeof(g_lastError),
-                "Could not read subtype or family stat layout for %s", subtypeKey);
+    // First reuse a previously resolved subtype -> layout mapping.
+    if (StatResolutionCacheEntry* resolved = FindStatResolution(
+            themeName, subtypeKey, playerPayload, valueCase)) {
+        if (!resolved->available) {
             g_statLoaded = true;
             g_statAvailable = false;
-            std::strncpy(g_statTheme, themeName,
-                sizeof(g_statTheme) - 1);
+            std::strncpy(g_statTheme, themeName, sizeof(g_statTheme) - 1);
             g_statTheme[sizeof(g_statTheme) - 1] = '\0';
-            std::strncpy(g_statSubtype, subtypeKey,
-                sizeof(g_statSubtype) - 1);
+            std::strncpy(g_statSubtype, subtypeKey, sizeof(g_statSubtype) - 1);
             g_statSubtype[sizeof(g_statSubtype) - 1] = '\0';
             g_statValueCase = valueCase;
             g_statLayoutName[0] = '\0';
             return false;
         }
+
+        if (GetCachedStatConfig(resolved->resolvedPath, playerPayload, &next)) {
+            g_statConfig = next;
+            g_statLoaded = true;
+            g_statAvailable = true;
+            std::strncpy(g_statTheme, themeName, sizeof(g_statTheme) - 1);
+            g_statTheme[sizeof(g_statTheme) - 1] = '\0';
+            std::strncpy(g_statSubtype, subtypeKey, sizeof(g_statSubtype) - 1);
+            g_statSubtype[sizeof(g_statSubtype) - 1] = '\0';
+            g_statValueCase = valueCase;
+            CopyFileName(resolved->resolvedPath, g_statLayoutName,
+                sizeof(g_statLayoutName));
+            g_lastError[0] = '\0';
+            return true;
+        }
     }
 
-    Parse(json, &next);
+    // Resolution order:
+    //   1. exact semantic subtype
+    //   2. shared semantic family
+    //   3. generic value-count family
+    //   4. generic payload fallback
+    std::string path = base + subtypeKey + ".json";
+    std::string json;
+
+    auto tryPath = [&](const std::string& candidate) -> bool {
+        path = candidate;
+
+        if (GetCachedStatConfig(path, playerPayload, &next))
+            return true;
+
+        json.clear();
+        if (!ReadFile(path.c_str(), &json))
+            return false;
+
+        Config parsed;
+        SetDefaults(&parsed);
+        parsed.width = playerPayload ? 520.0f : 560.0f;
+        parsed.height = playerPayload ? 100.0f : 90.0f;
+        parsed.offsetY = 90.0f;
+        parsed.overlayZ = 20;
+        Parse(json, &parsed);
+        StoreCachedStatConfig(path, playerPayload, parsed);
+        next = parsed;
+        return true;
+    };
+
+    bool found = tryPath(path);
+
+    if (!found && sharedLayoutKey)
+        found = tryPath(base + sharedLayoutKey + ".json");
+
+    const int maximumCase = playerPayload ? 5 : 3;
+    if (!found && valueCase >= 1 && valueCase <= maximumCase) {
+        char caseName[32];
+        std::snprintf(caseName, sizeof(caseName), "%s_%d.json",
+            playerPayload ? "player" : "team", valueCase);
+        found = tryPath(base + caseName);
+    }
+
+    if (!found)
+        found = tryPath(base + (playerPayload ? "player.json" : "team.json"));
+
+    if (!found) {
+        std::snprintf(g_lastError, sizeof(g_lastError),
+            "Could not read subtype or family stat layout for %s", subtypeKey);
+        g_statLoaded = true;
+        g_statAvailable = false;
+        std::strncpy(g_statTheme, themeName, sizeof(g_statTheme) - 1);
+        g_statTheme[sizeof(g_statTheme) - 1] = '\0';
+        std::strncpy(g_statSubtype, subtypeKey, sizeof(g_statSubtype) - 1);
+        g_statSubtype[sizeof(g_statSubtype) - 1] = '\0';
+        g_statValueCase = valueCase;
+        g_statLayoutName[0] = '\0';
+        StoreStatResolution(themeName, subtypeKey, playerPayload,
+            valueCase, false, std::string());
+        return false;
+    }
+
     g_statConfig = next;
     g_statLoaded = true;
     g_statAvailable = true;
@@ -986,6 +1156,8 @@ bool LoadStat(const char* themeName, const char* subtypeKey,
     g_statSubtype[sizeof(g_statSubtype) - 1] = '\0';
     g_statValueCase = valueCase;
     CopyFileName(path, g_statLayoutName, sizeof(g_statLayoutName));
+    StoreStatResolution(themeName, subtypeKey, playerPayload,
+        valueCase, true, path);
     g_lastError[0] = '\0';
     return true;
 }
@@ -1000,6 +1172,10 @@ bool ReloadStat(const char* themeName, const char* subtypeKey,
     g_statValueCase = 0;
     g_statLayoutName[0] = '\0';
     g_statLayoutFamilyName[0] = '\0';
+
+    // Explicit reload means the user expects modified JSON to be reread.
+    ClearStatCachesForTheme(themeName);
+
     if (!subtypeKey || !*subtypeKey)
         return true;
     return LoadStat(themeName, subtypeKey, playerPayload, valueCase);

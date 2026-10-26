@@ -19,12 +19,11 @@ struct Style {
     D3DCOLOR shotClockColor;
 };
 
-// Creates or reuses a cached GDI-backed glyph atlas for this popup directory.
+// Creates a GDI-backed glyph atlas using the active popup's TTF file.
 // Returns false only when even the Windows fallback font cannot be created.
 bool Begin(IDirect3DDevice9* device, const char* themeName,
            const char* overlayDirectory = "scoreboard");
 // Selects a named entry from popup.json's optional "fonts" object.
-// Font atlases are cached independently per theme + overlay directory.
 // Empty, missing, or invalid IDs fall back to the legacy default font.
 bool SelectFont(IDirect3DDevice9* device, const char* themeName,
                 const char* fontId,

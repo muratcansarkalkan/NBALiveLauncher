@@ -1,4 +1,4 @@
-#include "plugin-std.h"
+﻿#include "plugin-std.h"
 
 #include <Windows.h>
 #include <cctype>
@@ -6,6 +6,11 @@
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
+#include <cstdlib>
+#include <cmath>
+#include <string>
+#include <fstream>
+#include <sstream>
 
 using namespace plugin;
 
@@ -19,6 +24,402 @@ namespace custompaths
         GAME_LIVE_07,
         GAME_LIVE_08
     };
+
+    // NBA Live 06 bench pose overrides from assets\stadia\<id4>.json.
+    // Missing benchPlayers or absent slots retain native game behavior.
+    // The source EXE must be unmodified at the two validated hook sites.
+    enum BenchPose { BENCH_NATIVE, BENCH_SEATED, BENCH_FLOOR };
+    struct BenchSlotConfig
+    {
+        BenchPose pose = BENCH_NATIVE;
+        bool hasOffset = false;
+        float offset[3] = {};
+        bool hasYaw = false;
+        float yaw = 0.0f;
+    };
+    BenchSlotConfig gBenchSlots[2][7] = {};
+    bool gBenchHasPositionRequests = false;
+    // Set only by the 14 validated bench actor creation callsites.
+    // Record addresses are used for identity, never as guessed position offsets.
+    uintptr_t gBenchActorRecords[2][7] = {};
+
+
+    // JSON is read only on stadium change. Parse strictly and leave the
+    // entire feature at native defaults on invalid input.
+    class BenchJson
+    {
+    public:
+        explicit BenchJson(const std::string& contents) : text(contents) {}
+        bool Parse(BenchSlotConfig (&slots)[2][7], bool& hasPosition)
+        {
+            hasPosition = false;
+            if (!ObjectRoot(slots, hasPosition)) return false;
+            Space(); return pos == text.size();
+        }
+    private:
+        const std::string& text;
+        size_t pos = 0;
+        void Space() { while (pos < text.size() &&
+            (text[pos]==' ' || text[pos]=='\n' || text[pos]=='\r' || text[pos]=='\t')) ++pos; }
+        bool Take(char c) { Space(); if (pos >= text.size() || text[pos]!=c) return false; ++pos; return true; }
+        bool Str(std::string& out)
+        {
+            if (!Take('"')) return false;
+            out.clear();
+            while (pos < text.size())
+            {
+                char c=text[pos++];
+                if (c=='"') return true;
+                if (c=='\\')
+                {
+                    if (pos==text.size()) return false;
+                    c=text[pos++];
+                    if (c=='"'||c=='\\'||c=='/') out.push_back(c);
+                    else if (c=='n') out.push_back('\n');
+                    else if (c=='t') out.push_back('\t');
+                    else if (c=='r') out.push_back('\r');
+                    else if (c=='b') out.push_back('\b');
+                    else if (c=='f') out.push_back('\f');
+                    else if (c=='u') {
+                        // Consume a JSON Unicode escape. Bench schema field names
+                        // are ASCII; escape sequences in other stadium data are skipped.
+                        if (pos+4>text.size()) return false;
+                        for (int i=0;i<4;++i)
+                            if (!std::isxdigit(static_cast<unsigned char>(text[pos+i]))) return false;
+                        pos+=4;
+                        out.push_back('?');
+                    }
+                    else return false;
+                }
+                else { if (static_cast<unsigned char>(c)<32) return false; out.push_back(c); }
+            }
+            return false;
+        }
+        bool Number(float& v)
+        {
+            Space(); if (pos >= text.size()) return false;
+            const char* ptr=text.c_str()+pos; char* end=nullptr;
+            v=strtof(ptr,&end);
+            if (ptr==end || !std::isfinite(v)) return false;
+            pos+=static_cast<size_t>(end-ptr);
+            return true;
+        }
+        bool Skip()
+        {
+            Space(); if (pos>=text.size()) return false;
+            if (text[pos]=='{') {
+                ++pos; if (Take('}')) return true;
+                do { std::string k; if (!Str(k)||!Take(':')||!Skip()) return false;
+                    if (Take('}')) return true; } while (Take(',')); return false;
+            }
+            if (text[pos]=='[') {
+                ++pos; if (Take(']')) return true;
+                do { if (!Skip()) return false; if (Take(']')) return true; }
+                while (Take(',')); return false;
+            }
+            if (text[pos]=='"') {std::string x;return Str(x);}
+            for (const char* keyword : {"true","false","null"}) {
+                const size_t n=strlen(keyword);
+                if (text.compare(pos,n,keyword)==0) {pos+=n;return true;}
+            }
+            float v=0; return Number(v);
+        }
+        bool Offset(BenchSlotConfig& slot)
+        {
+            if (!Take('[')) return false;
+            for (int i=0;i<3;++i) {
+                if (i && !Take(',')) return false;
+                if (!Number(slot.offset[i])) return false;
+            }
+            if (!Take(']')) return false;
+            slot.hasOffset=true; return true;
+        }
+        bool Slot(BenchSlotConfig& slot, bool& hasPosition)
+        {
+            if (!Take('{')) return false;
+            if (Take('}')) return true;
+            do {
+                std::string k; if (!Str(k)||!Take(':')) return false;
+                if (k=="pose") {
+                    std::string v; if (!Str(v)) return false;
+                    if (v=="default") slot.pose=BENCH_NATIVE;
+                    else if (v=="seated") slot.pose=BENCH_SEATED;
+                    else if (v=="floor") slot.pose=BENCH_FLOOR;
+                    else return false;
+                } else if (k=="positionOffset") {
+                    if (!Offset(slot)) return false; hasPosition=true;
+                } else if (k=="yawOffset") {
+                    if (!Number(slot.yaw)) return false;
+                    slot.hasYaw=true;hasPosition=true;
+                } else if (!Skip()) return false;
+                if (Take('}')) return true;
+            } while (Take(','));
+            return false;
+        }
+        bool Side(BenchSlotConfig (&slots)[7], bool& hasPosition)
+        {
+            if (!Take('{')) return false;
+            if (Take('}')) return true;
+            do {
+                std::string k; if (!Str(k)||!Take(':')) return false;
+                if (k=="slots") {
+                    if (!Take('[')) return false;
+                    int n=0;
+                    if (!Take(']')) {
+                        do {
+                            if (n>=7 || !Slot(slots[n++],hasPosition)) return false;
+                            if (Take(']')) break;
+                        } while (Take(','));
+                        if (n!=7) return false;
+                    } else return false;
+                } else if (!Skip()) return false;
+                if (Take('}')) return true;
+            } while (Take(',')); return false;
+        }
+        bool BenchPlayers(BenchSlotConfig (&slots)[2][7], bool& hasPosition)
+        {
+            if (!Take('{')) return false;
+            if (Take('}')) return true;
+            do {
+                std::string key; if (!Str(key)||!Take(':')) return false;
+                if (key=="home" || key=="away") {
+                    if (!Side(slots[key=="away"?1:0],hasPosition)) return false;
+                } else if (!Skip()) return false;
+                if (Take('}')) return true;
+            } while (Take(','));
+            return false;
+        }
+        bool ObjectRoot(BenchSlotConfig (&slots)[2][7], bool& hasPosition)
+        {
+            if (!Take('{')) return false;
+            if (Take('}')) return true;
+            do {
+                std::string key; if (!Str(key)||!Take(':')) return false;
+                if (key=="benchPlayers") {
+                    if (!BenchPlayers(slots,hasPosition)) return false;
+                } else if (!Skip()) return false;
+                if (Take('}')) return true;
+            } while (Take(','));return false;
+        }
+    };
+    void LoadBenchStadiumConfig(const char* id4)
+    {
+        BenchSlotConfig defaults[2][7] = {};
+        std::memcpy(gBenchSlots,defaults,sizeof(gBenchSlots));
+        gBenchHasPositionRequests=false;
+        if (!id4 || !*id4) return;
+        char filename[MAX_PATH]={};
+        sprintf_s(filename,"assets\\stadia\\%s.json",id4);
+        std::ifstream file(filename,std::ios::binary);
+        if (!file.good()) return;
+        std::ostringstream buffer; buffer<<file.rdbuf();
+        const std::string json=buffer.str();
+        if (json.size()>1048576) {OutputDebugStringA("[CustomPaths] stadium JSON too large for bench settings; ignored.\n");return;}
+        BenchSlotConfig proposed[2][7] = {};
+        bool positionRequests=false;
+        BenchJson reader(json);
+        if (!reader.Parse(proposed,positionRequests)) {
+            OutputDebugStringA("[CustomPaths] Invalid stadium JSON or benchPlayers; original bench settings retained.\n"); return;
+        }
+        std::memcpy(gBenchSlots,proposed,sizeof(gBenchSlots));
+        gBenchHasPositionRequests=positionRequests;
+        OutputDebugStringA("[CustomPaths] Read benchPlayers from assets\\stadia\\<id4>.json.\n");
+        if (positionRequests)
+            OutputDebugStringA("[CustomPaths] Bench position offsets loaded; experimental pre-propagation root transform hook enabled.\n");
+    }
+
+#if defined(_M_IX86)
+    static uintptr_t gBenchStartContinue=0x005ED0C9;
+    static uintptr_t gBenchReplayContinue=0x005ED45F;
+    // This is the ANIMATION controller address, not an actor transform.
+    int __stdcall ResolveBenchPose(int original, uintptr_t controller, int slot)
+    {
+        if (slot<0||slot>=7) return original;
+        __try {
+            const uintptr_t root=*reinterpret_cast<const uintptr_t*>(0x00D20640);
+            if (!root) return original;
+            int side=-1;
+            const uintptr_t home=*reinterpret_cast<const uintptr_t*>(root+0x164);
+            const uintptr_t away=*reinterpret_cast<const uintptr_t*>(root+0x354);
+            if (controller==home+static_cast<uintptr_t>(slot)*0x1100+0x60) side=0;
+            else if (controller==away+static_cast<uintptr_t>(slot)*0x1100+0x60) side=1;
+            if (side<0) return original;
+            const BenchPose pose=gBenchSlots[side][slot].pose;
+            if (pose==BENCH_NATIVE) return original;
+            return pose==BENCH_SEATED ? 1 : 7;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {return original;}
+    }
+    __declspec(naked) void BenchStartPoseHook()
+    {
+        __asm {
+            pushfd
+            pushad
+            push edi             // zero-based slot
+            push esi             // animation controller
+            push eax             // native animation argument
+            call ResolveBenchPose // __stdcall cleans 12 bytes
+            mov [esp+28],eax    // replace PUSHAD's saved EAX
+            popad
+            popfd
+            push eax            // stolen PUSH EAX
+            mov ecx,esi         // stolen MOV ECX,ESI
+            mov byte ptr [esi+8],0 // stolen instruction
+            jmp dword ptr [gBenchStartContinue]
+        }
+    }
+    __declspec(naked) void BenchReplayPoseHook()
+    {
+        __asm {
+            pushfd
+            pushad
+            push ebp
+            push edi
+            push eax
+            call ResolveBenchPose
+            mov [esp+28],eax
+            popad
+            popfd
+            mov edx,[edi]       // stolen MOV EDX,[EDI]
+            push 40000000h      // stolen PUSH 2.0f
+            jmp dword ptr [gBenchReplayContinue]
+        }
+    }
+    bool InstallBenchPoseBranch(unsigned int address,const unsigned char* bytes,
+                                size_t length,void* hook)
+    {
+        if (memcmp(reinterpret_cast<void*>(address),bytes,length)!=0) return false;
+        DWORD old=0;
+        if (!VirtualProtect(reinterpret_cast<void*>(address),length,PAGE_EXECUTE_READWRITE,&old)) return false;
+        unsigned char patchBytes[8]={0xE9};
+        const int relative=static_cast<int>(reinterpret_cast<uintptr_t>(hook)-address-5);
+        memcpy(patchBytes+1,&relative,4);
+        for (size_t i=5;i<length;++i) patchBytes[i]=0x90;
+        memcpy(reinterpret_cast<void*>(address),patchBytes,length);
+        DWORD unused=0; VirtualProtect(reinterpret_cast<void*>(address),length,old,&unused);
+        FlushInstructionCache(GetCurrentProcess(),reinterpret_cast<void*>(address),length);
+        return true;
+    }
+    // Experimental v4: shift the native player root BEFORE sub_603680
+    // propagates it to render matrices and attached scene geodes.
+    // The prior v3 hook only translated selected output matrices, leaving
+    // independently-rendered headband/hair/geode attachments behind.
+    using BenchFactoryFn = void (__cdecl *)(uintptr_t, uintptr_t, uintptr_t,
+        uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+    static const BenchFactoryFn kBenchFactory = reinterpret_cast<BenchFactoryFn>(0x00605A20);
+
+    void __cdecl BenchFactoryCapture(uintptr_t record, uintptr_t name,
+        uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5,
+        uintptr_t a6, uintptr_t a7, uintptr_t a8)
+    {
+        kBenchFactory(record,name,a2,a3,a4,a5,a6,a7,a8);
+        if (!record || !name) return;
+        const char* path = reinterpret_cast<const char*>(name);
+        const char* home = "scene/homeTeam/bench_";
+        const char* away = "scene/awayTeam/bench_";
+        int side=-1; const char* suffix=nullptr;
+        if (strncmp(path,home,strlen(home))==0) {side=0;suffix=path+strlen(home);}
+        else if (strncmp(path,away,strlen(away))==0) {side=1;suffix=path+strlen(away);}
+        if (side>=0 && suffix && suffix[0]>='1' && suffix[0]<='7' && suffix[1]==0)
+            gBenchActorRecords[side][suffix[0]-'1']=record;
+    }
+
+    // At sub_603680+0x28, the virtual transform getter has just filled
+    // [record+0x4F0+0x30], the 4x4 root matrix. Here "matrix" points to
+    // the getter's output destination (transform+0x30), NOT to the 0x4F0 object.
+    void __stdcall BenchApplyRootOffset(uintptr_t matrix)
+    {
+        if (!matrix || !gBenchHasPositionRequests) return;
+        for (int side=0;side<2;++side) for (int slot=0;slot<7;++slot) {
+            const uintptr_t record=gBenchActorRecords[side][slot];
+            if (!record || matrix!=record+0x4F0+0x30) continue;
+            const BenchSlotConfig& config=gBenchSlots[side][slot];
+            if (!config.hasOffset) return;
+            __try {
+                float* translation=reinterpret_cast<float*>(matrix+0x30);
+                translation[0]+=config.offset[0];
+                translation[1]+=config.offset[1];
+                translation[2]+=config.offset[2];
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                OutputDebugStringA("[CustomPaths] Pre-propagation bench root offset failed.\n");
+            }
+            return;
+        }
+    }
+
+    // Replaces exactly six original bytes at 0x006036A8:
+    // FF 50 08   call dword ptr [eax+8]
+    // 8A 45 0C   mov al, [ebp+arg_4]
+    // The virtual method consumes its one stack argument (no caller ADD ESP).
+    // Duplicate the original getter argument from the stack top, leave the
+    // original copy available for our helper, then discard it and jump
+    // to the first untouched native instruction (0x006036AE).
+    // All registers except the native MOV AL result are preserved around helper.
+    static uintptr_t gBenchRootContinue = 0x006036AE;
+    __declspec(naked) void BenchRootTransformHook()
+    {
+        __asm {
+            push dword ptr [esp]     // duplicate original getter output pointer
+            call dword ptr [eax+8]  // native getter fills root matrix; pops duplicate
+            pushfd
+            pushad
+            mov eax,[esp+36]        // PUSHFD (4) + PUSHAD (32)
+            push eax
+            call BenchApplyRootOffset // stdcall pops its pointer
+            popad
+            popfd
+            add esp,4                // discard the original getter argument
+            mov al,[ebp+0Ch]        // stolen MOV AL,[EBP+arg_4]
+            jmp dword ptr [gBenchRootContinue] // patched site entered via JMP, not CALL
+        }
+    }
+
+    static bool BenchValidateRelativeCall(uintptr_t at,uintptr_t expected)
+    {
+        if (*reinterpret_cast<const uint8_t*>(at)!=0xE8) return false;
+        const int32_t relative=*reinterpret_cast<const int32_t*>(at+1);
+        return static_cast<uintptr_t>(at+5+relative)==expected;
+    }
+
+    void InstallLive06BenchPositionHooks()
+    {
+        static const uintptr_t factoryCalls[]={
+            0x0061E60F,0x0061E658,0x0061E6A1,0x0061E6EA,
+            0x0061E733,0x0061E77C,0x0061E7C5,
+            0x0061EB3E,0x0061EB87,0x0061EBD0,0x0061EC19,
+            0x0061EC62,0x0061ECAB,0x0061ECF4
+        };
+        for (uintptr_t call:factoryCalls) if (!BenchValidateRelativeCall(call,0x00605A20)) {
+            OutputDebugStringA("[CustomPaths] Bench factory validation failed; offsets disabled.\n");return;
+        }
+        const unsigned char originalRootCall[6]={0xFF,0x50,0x08,0x8A,0x45,0x0C};
+        if (memcmp(reinterpret_cast<const void*>(0x006036A8),originalRootCall,6)!=0) {
+            OutputDebugStringA("[CustomPaths] Native root transform instructions differ; offsets disabled.\n");return;
+        }
+        // Install identity-capture hooks before enabling the shared transform hook.
+        for (uintptr_t call:factoryCalls) patch::RedirectCall(call,BenchFactoryCapture);
+        if (!InstallBenchPoseBranch(0x006036A8,originalRootCall,6,
+                                   reinterpret_cast<void*>(BenchRootTransformHook))) {
+            OutputDebugStringA("[CustomPaths] Failed to install pre-propagation root hook.\n");return;
+        }
+        OutputDebugStringA("[CustomPaths] Experimental Live06 bench root transform v4 installed.\n");
+    }
+
+    void InstallLive06BenchPoseHooks()
+    {
+        // Two validated, whole-instruction branch sites. Hooking the shared
+        // virtual method would also affect unrelated actors, so do not.
+        const unsigned char start[7]={0x50,0x8B,0xCE,0xC6,0x46,0x08,0x00};
+        const unsigned char replay[7]={0x8B,0x17,0x68,0x00,0x00,0x00,0x40};
+        if (memcmp(reinterpret_cast<const void*>(0x005ED0C2),start,7)!=0 ||
+            memcmp(reinterpret_cast<const void*>(0x005ED458),replay,7)!=0) {
+            OutputDebugStringA("[CustomPaths] Bench hook bytes differ; no hooks installed.\n");
+            return;
+        }
+        const bool a=InstallBenchPoseBranch(0x005ED0C2,start,7,reinterpret_cast<void*>(BenchStartPoseHook));
+        const bool b=InstallBenchPoseBranch(0x005ED458,replay,7,reinterpret_cast<void*>(BenchReplayPoseHook));
+        if (!a||!b) OutputDebugStringA("[CustomPaths] Bench hook validation failed. Use original unmodified NBA Live 06 EXE.\n");
+    }
+#endif
 
     enum OverrideSlot
     {
@@ -3075,6 +3476,7 @@ namespace custompaths
 
     void DisableAllSlots()
     {
+        LoadBenchStadiumConfig(nullptr);
         for (unsigned int i = 0; i < SLOT_COUNT; ++i)
             gOverridePaths[i][0] = '\0';
 
@@ -3084,6 +3486,17 @@ namespace custompaths
         gOverrideCacheCount = 0;
         gOverrideCacheCursor = 0;
         std::memset(gOverrideCache, 0, sizeof(gOverrideCache));
+    }
+
+    // Entered at the native 3D game handoff, not during launcher startup.
+    // Explicitly expire the previous game's context even if the next game uses
+    // exactly the same ID4 and playoff round. UpdateGameContext is still cached
+    // within that game, including the post-Setup options normalization pass.
+    void BeginNewGameStadiumLoad()
+    {
+        DisableAllSlots();
+        OutputDebugStringA(
+            "[CustomPaths] New game load: expired stadium configuration/cache.\n");
     }
 
     void UpdateGameContext(const char* stadiumId4, void* suppliedOptions)
@@ -3108,8 +3521,9 @@ namespace custompaths
         const bool playoffs = stage != STAGE_REGULAR;
         const char* stageFolder = GetStageFolder(stage);
 
-        // Repeated GameCourt notifications for the same arena/stage do not
-        // invalidate an already-warm filename cache.
+        // Within the same loading session, repeated notifications for the same
+        // arena/stage do not invalidate the newly loaded filename cache.
+        // BeginNewGameStadiumLoad expires it at the next gameplay handoff.
         if (gGameContextValid &&
             _stricmp(gCurrentStadiumId4, id4) == 0 &&
             gCurrentStage == stage)
@@ -3121,6 +3535,7 @@ namespace custompaths
         gGameContextValid = true;
         strcpy_s(gCurrentStadiumId4, sizeof(gCurrentStadiumId4), id4);
         gCurrentStage = stage;
+        if (gGameVersion == GAME_LIVE_06) LoadBenchStadiumConfig(id4);
 
         char path[kOverridePathCapacity] = {};
 
@@ -3508,6 +3923,7 @@ namespace custompaths
         void*,
         const char* stadiumId4)
     {
+        BeginNewGameStadiumLoad();
         UpdateGameContext(stadiumId4, nullptr);
         CallMethodDynGlobal(
             kLive08GameCourtSetStadiumName,
@@ -3651,6 +4067,10 @@ namespace custompaths
                 gGameVersion = GAME_LIVE_06;
                 patch::RedirectCall(0x005E756C, AddCustomPaths06);
                 InstallOpenResolvedGate(0x006DC8F9);
+#if defined(_M_IX86)
+                InstallLive06BenchPoseHooks();
+                InstallLive06BenchPositionHooks();
+#endif
             }
             else if (patch::GetFloat(0xBBBC3C) == 1.3333334f)
             {
@@ -3858,7 +4278,371 @@ void UpdateCustomPathsGameContext(const char* stadiumId4, void* options)
     custompaths::UpdateGameContext(stadiumId4, options);
 }
 
+// Called once at the pre-Setup stadium handoff for each game session.
+// The post-Setup context update preserves the newly loaded JSON/cache.
+void BeginCustomPathsGameLoad()
+{
+    custompaths::BeginNewGameStadiumLoad();
+}
+
+void InitializeCustomCamera(); // Legacy entrypoint retained for compatibility.
+
 void InitializeCustomPaths()
 {
     custompaths::Initialize();
+    InitializeCustomCamera();
+}
+
+
+// -----------------------------------------------------------------------------
+// Stadium camera script selection and GameCourt context capture.
+// Merged from CustomCamera.cpp.
+// Keep the legacy InitializeCustomCamera symbol until all launcher call sites
+// have been removed; InitializeCustomPaths initializes it directly.
+// -----------------------------------------------------------------------------
+
+bool ResolveStadiumCameraPath(
+    const char* stadiumId,
+    char* outPath,
+    size_t outPathSize);
+
+void UpdateCustomPathsGameContext(
+    const char* stadiumId4,
+    void* options);
+
+namespace {
+
+constexpr unsigned int kLive2005EntryPoint = 0x00CD8005;
+constexpr unsigned int kLive060708EntryPoint = 0x0040109F;
+constexpr unsigned int kLive06AspectRatio = 0x00BD832C;
+constexpr unsigned int kLive07AspectRatio = 0x00BBBC3C;
+constexpr float kStandardAspectRatio = 1.3333334f;
+
+const char kDefaultCameraScript[] = "merlin\\nbacam.mgd";
+char gStadiumId4[5] = {};
+char gCustomCameraScript[MAX_PATH] = {};
+
+const unsigned int kLive2005GameCourtSetupCalls[] = {
+    0x0060A0A0, 0x0060A0B3, 0x0060A15C, 0x0060A2D1,
+    0x0060A379, 0x0060A746, 0x0060ADDE, 0x0060AFE1,
+    0x0060B06F, 0x0060B38D, 0x0060C40F, 0x0060D536,
+    0x0060D56B, 0x0060E357, 0x0060E39A
+};
+
+const unsigned int kLive2005CameraLoadCalls[] = {
+    0x00620F1D, 0x00621632, 0x00621912, 0x00621C02,
+    0x00622206, 0x00622BA6, 0x006233F2, 0x00623C22
+};
+
+const unsigned int kLive06GameCourtSetupCalls[] = {
+    0x00617F10, 0x00617F23, 0x00617FCC, 0x00618461,
+    0x00618508, 0x00619391, 0x0061941E, 0x0061B146,
+    0x0061B17B, 0x0061CD2E, 0x0061D2E2, 0x0061DC80,
+    0x0061E059, 0x0061F0BB
+};
+
+const unsigned int kLive06CameraLoadCalls[] = {
+    0x0063071D, 0x00630E32, 0x00631112, 0x00631438,
+    0x00631A48, 0x00632418, 0x00632C38, 0x006333F2
+};
+
+// NBA Live 07 stores the stadium abbreviation through a small GameCourt
+// setter instead of passing it through the NBA Live 05/06 Setup signature.
+const unsigned int kLive07GameCourtNameCalls[] = {
+    0x0064EDE7, 0x006504D2, 0x00650B42, 0x006515A2,
+    0x00655CF1, 0x006567E1, 0x00656D83, 0x00657053
+};
+
+const unsigned int kLive07CameraLoadCalls[] = {
+    0x0066721D, 0x00667932, 0x00667C12, 0x00667F28,
+    0x00668548, 0x00668F18, 0x00669738, 0x00669F02
+};
+
+enum StadiumCaptureKind {
+    CAPTURE_GAMECOURT_SETUP_0506,
+    CAPTURE_GAMECOURT_NAME_07
+};
+
+struct CustomCameraBuild {
+    const char* name;
+    StadiumCaptureKind stadiumCaptureKind;
+    unsigned int gameCourtSetup;
+    unsigned int cameraManagerLoadScripts;
+    unsigned int nbaCameraScriptSlot;
+    const unsigned int* gameCourtSetupCalls;
+    size_t gameCourtSetupCallCount;
+    const unsigned int* cameraLoadCalls;
+    size_t cameraLoadCallCount;
+};
+
+const CustomCameraBuild kLive2005Build = {
+    "NBA Live 2005",
+    CAPTURE_GAMECOURT_SETUP_0506,
+    0x00608A00,
+    0x006251A0,
+    0x00B640CC,
+    kLive2005GameCourtSetupCalls,
+    sizeof(kLive2005GameCourtSetupCalls) /
+        sizeof(kLive2005GameCourtSetupCalls[0]),
+    kLive2005CameraLoadCalls,
+    sizeof(kLive2005CameraLoadCalls) / sizeof(kLive2005CameraLoadCalls[0])
+};
+
+const CustomCameraBuild kLive06Build = {
+    "NBA Live 06",
+    CAPTURE_GAMECOURT_SETUP_0506,
+    0x00616D60,
+    0x00634980,
+    0x00BCA4E4,
+    kLive06GameCourtSetupCalls,
+    sizeof(kLive06GameCourtSetupCalls) /
+        sizeof(kLive06GameCourtSetupCalls[0]),
+    kLive06CameraLoadCalls,
+    sizeof(kLive06CameraLoadCalls) / sizeof(kLive06CameraLoadCalls[0])
+};
+
+const CustomCameraBuild kLive07Build = {
+    "NBA Live 07",
+    CAPTURE_GAMECOURT_NAME_07,
+    0x0067B710,
+    0x0066B4C0,
+    0x00BEC128,
+    kLive07GameCourtNameCalls,
+    sizeof(kLive07GameCourtNameCalls) /
+        sizeof(kLive07GameCourtNameCalls[0]),
+    kLive07CameraLoadCalls,
+    sizeof(kLive07CameraLoadCalls) /
+        sizeof(kLive07CameraLoadCalls[0])
+};
+
+const CustomCameraBuild* gBuild = nullptr;
+
+const CustomCameraBuild* DetectBuild() {
+    const unsigned int entryPoint = FM::GetEntryPoint();
+
+    if (entryPoint == kLive2005EntryPoint)
+        return &kLive2005Build;
+
+    if (entryPoint == kLive060708EntryPoint &&
+        patch::GetFloat(kLive06AspectRatio) == kStandardAspectRatio) {
+        return &kLive06Build;
+    }
+
+    if (entryPoint == kLive060708EntryPoint &&
+        patch::GetFloat(kLive07AspectRatio) == kStandardAspectRatio) {
+        return &kLive07Build;
+    }
+
+    return nullptr;
+}
+
+bool IsValidStadiumId4(const char* value) {
+    if (!value)
+        return false;
+
+    for (int i = 0; i < 4; ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if (c == '\0' || !std::isalnum(c))
+            return false;
+    }
+
+    return value[4] == '\0';
+}
+
+void CacheStadiumId4(const char* value) {
+    if (!IsValidStadiumId4(value)) {
+        gStadiumId4[0] = '\0';
+        return;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        gStadiumId4[i] = static_cast<char>(std::tolower(c));
+    }
+    gStadiumId4[4] = '\0';
+}
+
+bool FileExistsBesideExecutable(const char* relativePath) {
+    char absolutePath[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameA(nullptr, absolutePath, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+        return false;
+
+    char* separator = std::strrchr(absolutePath, '\\');
+    if (!separator)
+        return false;
+
+    separator[1] = '\0';
+    const size_t used = std::strlen(absolutePath);
+    const size_t available = MAX_PATH - used;
+    if (std::strlen(relativePath) + 1 > available)
+        return false;
+
+    std::strcat(absolutePath, relativePath);
+    const DWORD attributes = GetFileAttributesA(absolutePath);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+void SelectCameraScript() {
+    const char* selectedPath = kDefaultCameraScript;
+
+    if (gStadiumId4[0] != '\0') {
+        const bool hasConfiguredCamera =
+            ResolveStadiumCameraPath(
+                gStadiumId4,
+                gCustomCameraScript,
+                sizeof(gCustomCameraScript));
+
+        if (!hasConfiguredCamera) {
+            sprintf_s(
+                gCustomCameraScript,
+                sizeof(gCustomCameraScript),
+                "assets\\camera\\%s.mgd",
+                gStadiumId4);
+            gCustomCameraScript[sizeof(gCustomCameraScript) - 1] = '\0';
+        }
+
+        if (FileExistsBesideExecutable(gCustomCameraScript))
+            selectedPath = gCustomCameraScript;
+    }
+
+    patch::SetPointer(gBuild->nbaCameraScriptSlot,
+                      const_cast<char*>(selectedPath));
+}
+
+// Shared NBA Live 2005/06 signature:
+// GameCourt::Setup(const char*, const char*, CameraGlobal*, OptionsSettings*,
+//                  bool, bool, const char*)
+void __fastcall GameCourtSetupHook(
+    void* gameCourt,
+    void*,
+    const char* ubiPath,
+    const char* stadiumId4,
+    void* camera,
+    void* options,
+    bool arg5,
+    bool arg6,
+    const char* arg7) {
+    BeginCustomPathsGameLoad();
+    CacheStadiumId4(stadiumId4);
+    UpdateCustomPathsGameContext(stadiumId4, options);
+
+    CallMethodDynGlobal(
+        gBuild->gameCourtSetup,
+        gameCourt,
+        ubiPath,
+        stadiumId4,
+        camera,
+        options,
+        arg5,
+        arg6,
+        arg7);
+
+    // GameCourt::Setup can populate the playoff schedule service and can
+    // rewrite OptionsSettings after the pre-call context pass. Apply the
+    // context again so forced mode, round, series game, and clinching flags
+    // are committed to the final native state. The CustomPaths cache keeps
+    // the repeated asset-routing work inexpensive.
+    UpdateCustomPathsGameContext(stadiumId4, options);
+}
+
+// NBA Live 07: GameCourt::SetStadiumName(const char* stadiumId4).
+// The original copies the zero-terminated ID into GameCourt + 0x3BC.
+void __fastcall GameCourtSetStadiumNameHook07(
+    void* gameCourt,
+    void*,
+    const char* stadiumId4) {
+    BeginCustomPathsGameLoad();
+    CacheStadiumId4(stadiumId4);
+    UpdateCustomPathsGameContext(stadiumId4, nullptr);
+    CallMethodDynGlobal(
+        gBuild->gameCourtSetup,
+        gameCourt,
+        stadiumId4);
+}
+
+// CamManager::LoadCameraScripts(int mode)
+void __fastcall CameraLoadHook(void* cameraManager, void*, int mode) {
+    SelectCameraScript();
+    CallMethodDynGlobal(
+        gBuild->cameraManagerLoadScripts, cameraManager, mode);
+}
+
+bool ValidateCallSites(
+    const unsigned int* sites,
+    size_t count,
+    unsigned int expectedTarget) {
+    for (size_t i = 0; i < count; ++i) {
+        const unsigned int callAddress = sites[i];
+        if (patch::GetUChar(callAddress) != 0xE8)
+            return false;
+
+        const int displacement = patch::GetInt(callAddress + 1);
+        const unsigned int target = callAddress + 5 + displacement;
+        if (target != expectedTarget)
+            return false;
+    }
+    return true;
+}
+
+void RedirectCalls(const unsigned int* sites, size_t count, void* hook) {
+    for (size_t i = 0; i < count; ++i)
+        patch::RedirectCall(sites[i], hook);
+}
+
+} // namespace
+
+void InitializeCustomCamera() {
+    // May be called both by InitializeCustomPaths and a legacy launcher entry.
+    // Never rewire the already redirected native callsites twice.
+    static bool initialized = false;
+    if (initialized)
+        return;
+    initialized = true;
+    gBuild = DetectBuild();
+    if (!gBuild)
+        return;
+
+    // Refuse the whole patch if this is not the exact executable revision.
+    // This prevents a partial installation when an address belongs to a
+    // different build.
+    if (!ValidateCallSites(
+            gBuild->gameCourtSetupCalls,
+            gBuild->gameCourtSetupCallCount,
+            gBuild->gameCourtSetup) ||
+        !ValidateCallSites(
+            gBuild->cameraLoadCalls,
+            gBuild->cameraLoadCallCount,
+            gBuild->cameraManagerLoadScripts)) {
+        OutputDebugStringA(
+            "[CustomCamera] Call-site validation failed.\n");
+        gBuild = nullptr;
+        return;
+    }
+
+    gStadiumId4[0] = '\0';
+    patch::SetPointer(gBuild->nbaCameraScriptSlot,
+                      const_cast<char*>(kDefaultCameraScript));
+    void* stadiumCaptureHook =
+        gBuild->stadiumCaptureKind == CAPTURE_GAMECOURT_NAME_07
+            ? reinterpret_cast<void*>(&GameCourtSetStadiumNameHook07)
+            : reinterpret_cast<void*>(&GameCourtSetupHook);
+
+    RedirectCalls(
+                  gBuild->gameCourtSetupCalls,
+                  gBuild->gameCourtSetupCallCount,
+                  stadiumCaptureHook);
+    RedirectCalls(
+                  gBuild->cameraLoadCalls,
+                  gBuild->cameraLoadCallCount,
+                  reinterpret_cast<void*>(&CameraLoadHook));
+
+    char message[96] = {};
+    sprintf_s(
+        message,
+        sizeof(message),
+        "[CustomCamera] Initialized for %s.\n",
+        gBuild->name);
+    OutputDebugStringA(message);
 }
