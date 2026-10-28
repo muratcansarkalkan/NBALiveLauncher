@@ -87,6 +87,9 @@
     <ClCompile Include="DeviceNavigation.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ExitWorkaround.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Resolutions.h">
@@ -129,6 +132,9 @@
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="ControllerSetup.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ExitWorkaround.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

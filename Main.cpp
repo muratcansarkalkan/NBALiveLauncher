@@ -3,6 +3,7 @@
 #include "Games.h"
 #include "DebugConsole.h"
 #include "AntiAliasing.h"
+#include "ExitWorkaround.h"
 
 using namespace plugin;
 
@@ -52,6 +53,7 @@ public:
         InitializeDebugConsole();
         InitializeDebugLogging();
         InitializeMemoryUpgrader();
+        InstallExitWorkaround();
         InitializeCustomPaths();
         InitializeCustomCamera();
         InitializeArenaLighting();
