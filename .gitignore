@@ -13,8 +13,8 @@
 .vs/
 /bin/
 /obj/
-Release/
-Debug/
+/Release/
+/Debug/
 
 # Compiled binaries
 *.dll
