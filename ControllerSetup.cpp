@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <climits>
 #include <cstring>
+#include <intrin.h> // _ReturnAddress: original callsite after patched CALL
 #include <ShlObj.h>
 #pragma comment(lib, "Shell32.lib")
 
@@ -648,6 +649,527 @@ namespace {
         return end >= start && end <= regionEnd;
     }
 
+    // --------------------- Individual Practice, NBA Live 06 ---------------------
+    // NBA Live 06's default Practice participant is Dwyane Wade (PLAYERID=1133).
+    // The original Practice constructor passes 1133 to the native setter
+    // 0x00536190; our players.dbf also identifies Wade as PLAYERID=1133.
+    // Use PLAYER_DB_ID directly for this FE setter in NBA Live 06 only.
+    // This does NOT yet verify the player actor in 3D gameplay or start
+    // Practice without EA's original frontend.
+    struct PracticeProbe06 {
+        bool enabled = false;
+        int dbId = -1;
+        int jerseyId = -1;     // -1 = EA default; >=0 = teamgear.dbf.ID
+        int kind = 0;
+        bool useKeyboard = false;
+        bool autoSelectMode = false;  // opt-in: construct Practice as initial FE mode
+        int lastFePlayer = -1;
+        int lastFeJersey = -1;
+        int lastFeKind = -1;
+        unsigned long frontendCalls = 0;
+        unsigned long backendCalls = 0;
+    };
+    PracticeProbe06 g_practice06;
+    constexpr uintptr_t kPracticeNativePlayerSetter06 = 0x00536190;
+    constexpr uintptr_t kPracticeSceneStart06 = 0x0061DEA0;
+    using PracticeSetPlayerFn06 = void (__thiscall*)(void*, int);
+    using PracticeSceneFn06 = void (__thiscall*)(void*, int);
+
+    void PracticeLog06(const char* message) {
+        OutputDebugStringA(message);
+        HANDLE file = CreateFileA(".\\PracticeSetup.log", FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(file, message, static_cast<DWORD>(strlen(message)), &written, nullptr);
+            CloseHandle(file);
+        }
+    }
+
+    // The Practice selection object's +0x0C field holds the resolved teamgear
+    // ID. EA's setter fills it automatically; override AFTER that setter, and
+    // again at the verified backend preparation boundary. Never use JERSEYTYPE
+    // (0=Home, 1=Away, etc.) as a substitute for teamgear.dbf.ID.
+    bool PracticeApplyJersey06(const char* phase, void* participant) {
+        if (!g_practice06.enabled || g_practice06.jerseyId < 0)
+            return false;
+        char message[352] = {};
+        if (!IsReadableAddress(participant, 0x14)) {
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] %s jersey override SKIPPED: selection object unreadable.\n",
+                phase);
+            PracticeLog06(message);
+            return false;
+        }
+        const auto* bytes = static_cast<const unsigned char*>(participant);
+        int actualPlayer = -1;
+        int previousJersey = -1;
+        memcpy(&actualPlayer, bytes + 0x08, sizeof(actualPlayer));
+        memcpy(&previousJersey, bytes + 0x0C, sizeof(previousJersey));
+        // Avoid changing a selection object belonging to another player.
+        if (actualPlayer != g_practice06.dbId) {
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] %s jersey override SKIPPED: playerId=%d expected=%d.\n",
+                phase, actualPlayer, g_practice06.dbId);
+            PracticeLog06(message);
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION info = {};
+        auto* field = static_cast<unsigned char*>(participant) + 0x0C;
+        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY |
+            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (VirtualQuery(field, &info, sizeof(info)) != sizeof(info) ||
+            info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+            !(info.Protect & writable)) {
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] %s jersey override SKIPPED: +0C is not writable.\n", phase);
+            PracticeLog06(message);
+            return false;
+        }
+        const int requested = g_practice06.jerseyId;
+        memcpy(field, &requested, sizeof(requested));
+        int readback = -1;
+        memcpy(&readback, field, sizeof(readback));
+        sprintf_s(message, sizeof(message),
+            "[PracticeSetup] %s jersey override: playerId=%d jersey %d->%d readback=%d match=%s\n",
+            phase, actualPlayer, previousJersey, requested, readback,
+            readback == requested ? "yes" : "NO");
+        PracticeLog06(message);
+        return readback == requested;
+    }
+
+    void __fastcall PracticePlayerCallHook06(void* feObject, void*, int originalNativeId) {
+        // ECX = Practice FE object, one stack integer, RET 4.
+        // Captured from the original game CALL: this identifies which native
+        // frontend/session constructor or reset path reached the setter.
+        const void* callerRet = _ReturnAddress();
+        // This call runs during construction, the APT SetPlayer action, and
+        // SetPracticeKind's player reset. Apply the same selected player after
+        // each of these original FE actions to avoid losing the override.
+        const int appliedId = (g_practice06.enabled && g_practice06.kind == 0 &&
+                               g_practice06.dbId >= 0)
+            ? g_practice06.dbId : originalNativeId;
+        reinterpret_cast<PracticeSetPlayerFn06>(kPracticeNativePlayerSetter06)(
+            feObject, appliedId);
+        // The native call may reset jersey to its preferred Practice uniform.
+        PracticeApplyJersey06("FE after SetPlayer", feObject);
+        ++g_practice06.frontendCalls;
+
+        int player = -1;
+        int jersey = -1;
+        int kind = -1;
+        char message[400] = {};
+        if (IsReadableAddress(feObject, 0x14)) {
+            const auto* p = static_cast<const unsigned char*>(feObject);
+            memcpy(&player, p + 0x08, sizeof(player));
+            memcpy(&jersey, p + 0x0C, sizeof(jersey));
+            memcpy(&kind, p + 0x10, sizeof(kind));
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] FE player refresh #%lu callerRet=%p object=%p inputPlayerId=%d appliedPlayerId=%d readbackPlayer=%d jersey=%d kind=%d match=%s\n",
+                g_practice06.frontendCalls, callerRet, feObject, originalNativeId,
+                appliedId, player, jersey, kind,
+                player == appliedId ? "yes" : "NO");
+        } else {
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] FE player refresh #%lu callerRet=%p object=%p inputPlayerId=%d appliedPlayerId=%d; object unreadable\n",
+                g_practice06.frontendCalls, callerRet, feObject, originalNativeId,
+                appliedId);
+        }
+        g_practice06.lastFePlayer = player;
+        g_practice06.lastFeJersey = jersey;
+        g_practice06.lastFeKind = kind;
+        PracticeLog06(message);
+    }
+
+    // Optional first step toward launching Practice without APT navigation.
+    // At 005DDF59, the original FE initializer calls 00582340 with mode 5
+    // (Exhibition).  The native game-mode dispatcher constructs the appropriate
+    // mode object; passing 10 selects Individual Practice instead.  This is a
+    // native FE mode selection, NOT a completed 3D gameplay auto-start.
+    constexpr uintptr_t kPracticeBootModeCall06 = 0x005DDF59;
+    constexpr uintptr_t kNativeModeConstructor06 = 0x00582340;
+    constexpr int kExhibitionMode06 = 5;
+    constexpr int kIndividualPracticeMode06 = 10;
+    using PracticeBootModeFn06 = void (__thiscall*)(void*, int);
+
+    void __fastcall PracticeBootModeCallHook06(void* feModeManager, void*, int originalMode) {
+        const bool override = g_practice06.enabled && g_practice06.autoSelectMode &&
+            g_practice06.kind == 0 && g_practice06.dbId >= 0 &&
+            originalMode == kExhibitionMode06;
+        const int selectedMode = override ? kIndividualPracticeMode06 : originalMode;
+        char message[384] = {};
+        sprintf_s(message, sizeof(message),
+            "[PracticeSetup] FE initial mode request: manager=%p original=%d selected=%d override=%s\n",
+            feModeManager, originalMode, selectedMode, override ? "yes" : "no");
+        PracticeLog06(message);
+
+        // Run EA's original mode/session-object construction on its own thread.
+        reinterpret_cast<PracticeBootModeFn06>(kNativeModeConstructor06)(
+            feModeManager, selectedMode);
+
+        if (IsReadableAddress(feModeManager, 0x14)) {
+            const auto* manager = static_cast<const unsigned char*>(feModeManager);
+            int activeMode = -1, pendingMode = -1;
+            void* session = nullptr;
+            memcpy(&activeMode, manager + 0x08, sizeof(activeMode));
+            memcpy(&pendingMode, manager + 0x0C, sizeof(pendingMode));
+            memcpy(&session, manager + 0x10, sizeof(session));
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] FE initial mode readback: current=%d pending=%d session=%p expected=%d match=%s\n",
+                activeMode, pendingMode, session, selectedMode,
+                (activeMode == selectedMode && session) ? "yes" : "NO");
+            PracticeLog06(message);
+        }
+        else {
+            PracticeLog06("[PracticeSetup] FE initial mode readback: manager unreadable.\n");
+        }
+    }
+
+    bool InstallPracticeBootModeHook06() {
+        const uintptr_t site = kPracticeBootModeCall06;
+        if (!IsReadableAddress(reinterpret_cast<const void*>(site), 5)) {
+            PracticeLog06("[PracticeSetup] FE initial-mode hook skipped: unreadable call site.\n");
+            return false;
+        }
+        const auto* instruction = reinterpret_cast<const unsigned char*>(site);
+        if (instruction[0] != 0xE8 ||
+            *reinterpret_cast<const unsigned char*>(site - 2) != 0x6A ||
+            *reinterpret_cast<const unsigned char*>(site - 1) != 0x05) {
+            PracticeLog06("[PracticeSetup] FE initial-mode hook skipped: opcode signature mismatch.\n");
+            return false;
+        }
+        int32_t originalDisplacement = 0;
+        memcpy(&originalDisplacement, instruction + 1, sizeof(originalDisplacement));
+        if (static_cast<intptr_t>(site + 5) + originalDisplacement !=
+            static_cast<intptr_t>(kNativeModeConstructor06)) {
+            PracticeLog06("[PracticeSetup] FE initial-mode hook skipped: original target mismatch.\n");
+            return false;
+        }
+        const intptr_t relative = reinterpret_cast<intptr_t>(&PracticeBootModeCallHook06) -
+            static_cast<intptr_t>(site + 5);
+        if (relative < INT32_MIN || relative > INT32_MAX) {
+            PracticeLog06("[PracticeSetup] FE initial-mode hook skipped: rel32 out of range.\n");
+            return false;
+        }
+        DWORD previousProtection = 0;
+        auto* writable = reinterpret_cast<unsigned char*>(site);
+        if (!VirtualProtect(writable, 5, PAGE_EXECUTE_READWRITE, &previousProtection)) {
+            PracticeLog06("[PracticeSetup] FE initial-mode hook skipped: VirtualProtect failed.\n");
+            return false;
+        }
+        const int32_t displacement = static_cast<int32_t>(relative);
+        memcpy(writable + 1, &displacement, sizeof(displacement));
+        FlushInstructionCache(GetCurrentProcess(), writable, 5);
+        DWORD unused = 0;
+        VirtualProtect(writable, 5, previousProtection, &unused);
+        PracticeLog06("[PracticeSetup] FE initial-mode override installed (original Exhibition 5 -> Practice 10).\n");
+        return true;
+    }
+
+    // This backend preparation call is reached by the Practice scene setup
+    // path (0x005EF450). It consumes the *actual session selection object*.
+    // Diagnostic only: do not change the ID, jersey, kind, or any gameplay data.
+    constexpr uintptr_t kPracticePrepareCallsite06 = 0x005EF462;
+    constexpr uintptr_t kPracticePrepareTarget06 = 0x005EB690;
+    using PracticePrepareFn06 = unsigned char (__thiscall*)(void*, void*, void*);
+
+    void PracticeDescribeParticipant06(const char* stage, const void* participant) {
+        char message[320] = {};
+        if (!IsReadableAddress(participant, 0x14)) {
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] %s participant=%p NOT READABLE\n", stage, participant);
+            PracticeLog06(message);
+            return;
+        }
+        const auto* bytes = static_cast<const unsigned char*>(participant);
+        int player = -1, jersey = -1, kind = -1;
+        memcpy(&player, bytes + 0x08, sizeof(player));
+        memcpy(&jersey, bytes + 0x0C, sizeof(jersey));
+        memcpy(&kind, bytes + 0x10, sizeof(kind));
+        sprintf_s(message, sizeof(message),
+            "[PracticeSetup] %s participant=%p playerId=%d jersey=%d kind=%d requestedDbId=%d requestedJersey=%d playerMatch=%s jerseyMatch=%s\n",
+            stage, participant, player, jersey, kind, g_practice06.dbId,
+            g_practice06.jerseyId,
+            player == g_practice06.dbId ? "yes" : "NO",
+            g_practice06.jerseyId < 0 ? "native-default" :
+                (jersey == g_practice06.jerseyId ? "yes" : "NO"));
+        PracticeLog06(message);
+    }
+
+    unsigned char __fastcall PracticePrepareCallHook06(
+        void* runtimeSetup, void*, void* participant, void* stagingRecord)
+    {
+        // Native __thiscall: ECX=runtimeSetup; two stack pointers; RET 8.
+        // The compiler's __fastcall wrapper likewise cleans two stack args.
+        PracticeDescribeParticipant06("BE preparation BEFORE", participant);
+        // Covers FE-bypassed startup and any native jersey reset performed
+        // after the FE hook. EA's BE preparation consumes this selected ID.
+        PracticeApplyJersey06("BE before preparation", participant);
+        const unsigned char result = reinterpret_cast<PracticePrepareFn06>(
+            kPracticePrepareTarget06)(runtimeSetup, participant, stagingRecord);
+        PracticeDescribeParticipant06("BE preparation AFTER", participant);
+        if (IsReadableAddress(stagingRecord, 0x14)) {
+            const auto* bytes = static_cast<const unsigned char*>(stagingRecord);
+            unsigned int w[3] = {};
+            memcpy(w, bytes + 0x08, sizeof(w));
+            char message[320] = {};
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] BE staging record=%p +08=%u +0C=%u +10=%u nativeResult=%u (raw, not assumed player IDs)\n",
+                stagingRecord, w[0], w[1], w[2], static_cast<unsigned>(result));
+            PracticeLog06(message);
+        }
+        return result;
+    }
+
+    bool InstallPracticePrepareHook06() {
+        const uintptr_t site = kPracticePrepareCallsite06;
+        if (!IsReadableAddress(reinterpret_cast<const void*>(site), 5)) {
+            PracticeLog06("[PracticeSetup] BE preparation hook skipped: unreadable callsite.\n");
+            return false;
+        }
+        const auto* bytes = reinterpret_cast<const unsigned char*>(site);
+        if (bytes[0] != 0xE8) {
+            PracticeLog06("[PracticeSetup] BE preparation hook skipped: opcode mismatch.\n");
+            return false;
+        }
+        int32_t oldRel = 0;
+        memcpy(&oldRel, bytes + 1, sizeof(oldRel));
+        if (site + 5 + static_cast<intptr_t>(oldRel) != kPracticePrepareTarget06) {
+            PracticeLog06("[PracticeSetup] BE preparation hook skipped: target mismatch.\n");
+            return false;
+        }
+        const intptr_t rel = reinterpret_cast<intptr_t>(&PracticePrepareCallHook06) -
+            static_cast<intptr_t>(site + 5);
+        if (rel < INT32_MIN || rel > INT32_MAX) {
+            PracticeLog06("[PracticeSetup] BE preparation hook skipped: wrapper out of range.\n");
+            return false;
+        }
+        DWORD originalProtection = 0;
+        auto* writable = reinterpret_cast<unsigned char*>(site);
+        if (!VirtualProtect(writable, 5, PAGE_EXECUTE_READWRITE, &originalProtection)) {
+            PracticeLog06("[PracticeSetup] BE preparation hook skipped: VirtualProtect failed.\n");
+            return false;
+        }
+        const int32_t newRel = static_cast<int32_t>(rel);
+        memcpy(writable + 1, &newRel, sizeof(newRel));
+        FlushInstructionCache(GetCurrentProcess(), writable, 5);
+        DWORD ignored = 0;
+        VirtualProtect(writable, 5, originalProtection, &ignored);
+        PracticeLog06("[PracticeSetup] BE preparation diagnostic installed at 005EF462 (execution not established).\n");
+        return true;
+    }
+
+    // Backend-side witness. These bytes are raw diagnostic material, NOT a
+    // documented Practice structure. No write or player-ID override occurs.
+    // Log only at scene-entry boundaries to keep the output bounded.
+    void PracticeDumpWords06(const char* label, const void* ptr, size_t byteCount) {
+        char line[320] = {};
+        sprintf_s(line, sizeof(line),
+            "[PracticeSetup] BE snapshot %s base=%p bytes=%u (raw DWORDs; offsets are not verified fields)\n",
+            label, ptr, static_cast<unsigned>(byteCount));
+        PracticeLog06(line);
+        if (!ptr || byteCount > 0x100 || (byteCount % sizeof(uint32_t)) != 0 ||
+            !IsReadableAddress(ptr, byteCount)) {
+            PracticeLog06("[PracticeSetup] BE snapshot skipped: address not readable as one contiguous region.\n");
+            return;
+        }
+        const auto* data = static_cast<const unsigned char*>(ptr);
+        for (size_t offset = 0; offset < byteCount; offset += 16) {
+            uint32_t w[4] = {};
+            memcpy(w, data + offset, sizeof(w));
+            sprintf_s(line, sizeof(line),
+                "[PracticeSetup]   +%03X: %08X %08X %08X %08X%s\n",
+                static_cast<unsigned>(offset),
+                static_cast<unsigned>(w[0]), static_cast<unsigned>(w[1]),
+                static_cast<unsigned>(w[2]), static_cast<unsigned>(w[3]),
+                (w[0] == static_cast<uint32_t>(g_practice06.dbId) ||
+                 w[1] == static_cast<uint32_t>(g_practice06.dbId) ||
+                 w[2] == static_cast<uint32_t>(g_practice06.dbId) ||
+                 w[3] == static_cast<uint32_t>(g_practice06.dbId))
+                    ? "  [requested ID value present; not proof of player binding]" : "");
+            PracticeLog06(line);
+        }
+    }
+
+    void PracticeTraceStack06() {
+        void* frames[16] = {};
+        const USHORT count = CaptureStackBackTrace(0, 16, frames, nullptr);
+        char line[200] = {};
+        sprintf_s(line, sizeof(line),
+            "[PracticeSetup] BE entry stack trace: %u captured addresses (ret addr chain).\n",
+            static_cast<unsigned>(count));
+        PracticeLog06(line);
+        for (USHORT i = 0; i < count; ++i) {
+            sprintf_s(line, sizeof(line), "[PracticeSetup]   stack[%u]=%p\n",
+                static_cast<unsigned>(i), frames[i]);
+            PracticeLog06(line);
+        }
+    }
+
+    void __fastcall PracticeSceneCallHook06(void* sceneObject, void*, int setupArg) {
+        // Virtual function at vtable 0x00BC6C38 + 0x0C. Native ends in RET 4.
+        // DO NOT treat the FE participant as transferred into gameplay until
+        // actor/player-creation handling has been identified and checked.
+        ++g_practice06.backendCalls;
+        char message[384] = {};
+        sprintf_s(message, sizeof(message),
+            "[PracticeSetup] BE Practice scene entry #%lu object=%p arg=%d; FE updates=%lu; lastFePlayer=%d lastFeJersey=%d lastFeKind=%d; requestedDbId=%d\n",
+            g_practice06.backendCalls, sceneObject, setupArg,
+            g_practice06.frontendCalls, g_practice06.lastFePlayer,
+            g_practice06.lastFeJersey, g_practice06.lastFeKind,
+            g_practice06.dbId);
+        PracticeLog06(message);
+        if (g_practice06.frontendCalls == 0) {
+            PracticeLog06("[PracticeSetup] IMPORTANT: no intercepted FE player setter has executed. "
+                "Player override is NOT applied; FE calls may have run earlier or used an alternate path.\n");
+        }
+        PracticeTraceStack06();
+        // The original vtable +4 stores the selection/config pointer at +14;
+        // the Practice scene routine reads [sceneObject+14] at 0061DF12.
+        if (IsReadableAddress(sceneObject, 0x18)) {
+            const auto* p = static_cast<const unsigned char*>(sceneObject);
+            const void* participant = nullptr;
+            memcpy(&participant, p + 0x14, sizeof(participant));
+            PracticeDescribeParticipant06("BE SCENE selection +14", participant);
+        }
+        PracticeDumpWords06("sceneObject BEFORE", sceneObject, 0x80);
+        // setupArg is still passed as its original integer. Treat its bit
+        // pattern as an address ONLY for a guarded read-only diagnostic.
+        const void* argCandidate = reinterpret_cast<const void*>(
+            static_cast<uintptr_t>(static_cast<uint32_t>(setupArg)));
+        PracticeDumpWords06("setupArg BEFORE (pointer candidate)", argCandidate, 0x40);
+        reinterpret_cast<PracticeSceneFn06>(kPracticeSceneStart06)(
+            sceneObject, setupArg);
+        PracticeDumpWords06("sceneObject AFTER", sceneObject, 0x80);
+        PracticeLog06("[PracticeSetup] BE Practice scene initialization returned. "
+            "Gameplay player identity NOT YET VERIFIED.\n");
+    }
+
+    bool VerifyPracticeCall06(uintptr_t site) {
+        if (!IsReadableAddress(reinterpret_cast<const void*>(site), 5))
+            return false;
+        const auto* bytes = reinterpret_cast<const unsigned char*>(site);
+        if (bytes[0] != 0xE8)
+            return false;
+        int32_t displacement = 0;
+        memcpy(&displacement, bytes + 1, sizeof(displacement));
+        return site + 5 + static_cast<intptr_t>(displacement) ==
+            kPracticeNativePlayerSetter06;
+    }
+
+    bool InstallPracticePlayerCall06(uintptr_t site) {
+        const auto target = reinterpret_cast<intptr_t>(&PracticePlayerCallHook06);
+        const auto relative = target - static_cast<intptr_t>(site + 5);
+        if (relative < INT32_MIN || relative > INT32_MAX)
+            return false;
+        DWORD previous = 0;
+        auto* bytes = reinterpret_cast<unsigned char*>(site);
+        if (!VirtualProtect(bytes, 5, PAGE_EXECUTE_READWRITE, &previous))
+            return false;
+        const int32_t displacement = static_cast<int32_t>(relative);
+        memcpy(bytes + 1, &displacement, sizeof(displacement));
+        FlushInstructionCache(GetCurrentProcess(), bytes, 5);
+        DWORD ignored = 0;
+        VirtualProtect(bytes, 5, previous, &ignored);
+        return true;
+    }
+
+    void InitializePracticeProbe06() {
+        g_practice06 = {};
+        if (FM::GetEntryPoint() != 0x40109F ||
+            patch::GetFloat(0xBD832C) != 1.3333334f)
+            return; // Not the verified NBA Live 06 binary.
+
+        g_practice06.enabled = GetPrivateProfileIntA(
+            "PRACTICE", "PROFILE_ENABLED", 0, kIniFile) == 1;
+        if (!g_practice06.enabled)
+            return;
+        g_practice06.kind = GetPrivateProfileIntA(
+            "PRACTICE", "KIND", -1, kIniFile);
+        g_practice06.dbId = GetPrivateProfileIntA(
+            "PRACTICE", "PLAYER_DB_ID", -1, kIniFile);
+        g_practice06.jerseyId = GetPrivateProfileIntA(
+            "PRACTICE", "JERSEY_ID", -1, kIniFile);
+        g_practice06.useKeyboard = GetPrivateProfileIntA(
+            "PRACTICE", "USE_KEYBOARD", 0, kIniFile) == 1;
+        g_practice06.autoSelectMode = GetPrivateProfileIntA(
+            "PRACTICE", "AUTO_SELECT_MODE", 0, kIniFile) == 1;
+        if (g_practice06.kind != 0 || g_practice06.dbId < 0 ||
+            g_practice06.jerseyId < -1 || g_practice06.jerseyId > 32767) {
+            PracticeLog06("[PracticeSetup] Invalid or unsupported Practice profile; no native hooks installed.\n");
+            return;
+        }
+        char message[400] = {};
+        sprintf_s(message, sizeof(message),
+            "[PracticeSetup] NBA06 profile parsed: kind=%d playerDbId=%d jerseyId=%d useKeyboard=%d. Practice FE native setter receives PLAYER_DB_ID directly.\n",
+            g_practice06.kind, g_practice06.dbId, g_practice06.jerseyId,
+            g_practice06.useKeyboard ? 1 : 0);
+        PracticeLog06(message);
+        PracticeLog06("[PracticeSetup] FE player override enabled; PLAYER_NATIVE_ID is no longer read. JERSEY_ID=-1 keeps EA default.\n");
+        if (g_practice06.autoSelectMode)
+            PracticeLog06("[PracticeSetup] Experimental FE initial-mode selection requested. This does not automatically enter gameplay.\n");
+
+        // Native direct calls to the Practice player/jersey setter:
+        // 0x0055967C = Practice participant constructor (default Wade)
+        // 0x00559650 = APT SetPlayer callback
+        // 0x005759BC = Practice subtype reset
+        // 0x00571277 = separate Practice session participant constructor
+        // 0x00536255 = native default-player helper (default Wade)
+        // Do not confuse a patched site with proof that its path executes.
+        constexpr uintptr_t sites[] = {
+            0x0055967C, 0x00559650, 0x005759BC,
+            0x00571277, 0x00536255
+        };
+        for (const auto site : sites) {
+            if (!VerifyPracticeCall06(site)) {
+                sprintf_s(message, sizeof(message),
+                    "[PracticeSetup] Original call mismatch at %08lX; aborting FE hook installation.\n",
+                    static_cast<unsigned long>(site));
+                PracticeLog06(message);
+                return;
+            }
+        }
+        for (const auto site : sites) {
+            if (!InstallPracticePlayerCall06(site)) {
+                sprintf_s(message, sizeof(message),
+                    "[PracticeSetup] FE hook FAILED at %08lX; partial hooks may remain.\n",
+                    static_cast<unsigned long>(site));
+                PracticeLog06(message);
+                return;
+            }
+        }
+        PracticeLog06("[PracticeSetup] Practice setter direct call sites INSTALLED: 5/5 (execution not established).\n");
+        // Do not change normal boot behavior unless AUTO_SELECT_MODE=1.
+        if (g_practice06.autoSelectMode)
+            InstallPracticeBootModeHook06();
+        // Trace a second independent native path: actual Practice session preparation.
+        // This runs before the Practice scene and player actor setup, if reached.
+        InstallPracticePrepareHook06();
+
+        // The backend path is a virtual method, not a direct callsite.
+        // Its ABI is __thiscall (ECX + one stack arg, RET 4). Read-only trace.
+        const uintptr_t vtableEntry = 0x00BC6C38 + 0x0C;
+        auto* entry = reinterpret_cast<void**>(vtableEntry);
+        if (!IsReadableAddress(entry, sizeof(void*)) ||
+            *entry != reinterpret_cast<void*>(kPracticeSceneStart06)) {
+            PracticeLog06("[PracticeSetup] Backend vtable signature mismatch; backend trace disabled.\n");
+            return;
+        }
+        DWORD previous = 0;
+        if (!VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &previous)) {
+            PracticeLog06("[PracticeSetup] Backend vtable VirtualProtect failed.\n");
+            return;
+        }
+        *entry = reinterpret_cast<void*>(&PracticeSceneCallHook06);
+        DWORD ignored = 0;
+        VirtualProtect(entry, sizeof(void*), previous, &ignored);
+        PracticeLog06("[PracticeSetup] Backend practice-scene virtual callback instrumented.\n");
+        PracticeLog06("[PracticeSetup] Direct headless Practice launch NOT enabled; requires FE dispatcher and verified player handoff into gameplay.\n");
+    }
+
+    // -------------------------------------------------------------------------
+
     void ApplyConfiguredControllerState(
         unsigned char* gameMode,
         void* sideData)
@@ -1130,6 +1652,8 @@ void InitializeControllerSetup() {
         Log("[ControllerSetup] Unsupported executable/version; initialization skipped.\n");
         return;
     }
+    // Independent of [CONTROLLERS] ENABLED: the FE/BE probe can still run.
+    InitializePracticeProbe06();
     {
         char msg[160] = {};
         sprintf_s(msg, sizeof(msg),

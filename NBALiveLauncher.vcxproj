@@ -107,6 +107,7 @@ xcopy /y "$(TargetDir)$(TargetName).pdb" "C:\Games\NBA LIVE 08\plugins" </Comman
     <ClCompile Include="AdjustWSUI.cpp" />
     <ClCompile Include="AntiAliasing.cpp" />
     <ClCompile Include="ArenaLighting.cpp" />
+    <ClCompile Include="AutoStartGame.cpp" />
     <ClCompile Include="ControllerSetup.cpp" />
     <ClCompile Include="CustomPaths.cpp" />
     <ClCompile Include="DebugConsole.cpp" />
@@ -133,6 +134,7 @@ xcopy /y "$(TargetDir)$(TargetName).pdb" "C:\Games\NBA LIVE 08\plugins" </Comman
   <ItemGroup>
     <ClInclude Include="AdjustWSUI.h" />
     <ClInclude Include="AntiAliasing.h" />
+    <ClInclude Include="AutoStartGame.h" />
     <ClInclude Include="ControllerSetup.h" />
     <ClInclude Include="DebugConsole.h" />
     <ClInclude Include="ExitWorkaround.h" />

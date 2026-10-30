@@ -14,6 +14,7 @@ namespace NBALiveTurnoverFix {
 void EnableWindowed();
 void InitializeShotClock();
 void InitializeStartupTeams();
+void InitializeAutoStartGame();
 void InitializeControllerSetup();
 void InitializeDeviceNavigation();
 void InitializeMemoryUpgrader();
@@ -75,6 +76,7 @@ public:
         EnableWindowed();
         InitializeShotClock();
         InitializeStartupTeams();
+        InitializeAutoStartGame();
         InitializeControllerSetup();
         InitializeDeviceNavigation();
         InitializeStadiumDornaConfig();

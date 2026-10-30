@@ -1,6 +1,8 @@
 #include "ExitWorkaround.h"
 
 #include <Windows.h>
+
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 
@@ -11,6 +13,17 @@ namespace
     ExitProcessFn g_originalExitProcess = nullptr;
     void**        g_exitProcessSlot     = nullptr;
     bool          g_installed           = false;
+
+    std::atomic<bool> g_altF4Running{ false };
+    HANDLE            g_altF4Thread = nullptr;
+
+    // Alt+F4 first asks the game's foreground window to close normally.
+    // If the game ignores WM_CLOSE (or never reaches its normal shutdown)
+    // for this long, we fall back to FastTerminateProcess().
+    //
+    // This preserves EA's own shutdown when possible while still making
+    // Alt+F4 reliable from gameplay/loading/menu states.
+    constexpr ULONGLONG kAltF4GracePeriodMs = 1500;
 
     void DebugLog(const char* text)
     {
@@ -23,6 +36,7 @@ namespace
             return false;
 
         DWORD oldProtect = 0;
+
         if (!VirtualProtect(
                 slot,
                 sizeof(void*),
@@ -40,6 +54,7 @@ namespace
             sizeof(void*));
 
         DWORD ignored = 0;
+
         VirtualProtect(
             slot,
             sizeof(void*),
@@ -49,56 +64,42 @@ namespace
         return true;
     }
 
-    __declspec(noreturn) VOID WINAPI FastExitProcess(UINT exitCode)
+    bool IsCurrentProcessForeground(HWND* outWindow = nullptr)
     {
-        // NBA Live has already reached its final ExitProcess call at this
-        // point. The compatibility workaround intentionally bypasses
-        // ExitProcess -> RtlExitUserProcess and its user-mode DLL/CRT/heap
-        // teardown, which is the shutdown path implicated in the intermittent
-        // stale-process hang.
-        //
-        // TerminateProcess is intentional here.
+        HWND foreground = GetForegroundWindow();
 
+        if (!foreground)
+            return false;
+
+        DWORD foregroundPid = 0;
+        GetWindowThreadProcessId(
+            foreground,
+            &foregroundPid);
+
+        if (foregroundPid != GetCurrentProcessId())
+            return false;
+
+        if (outWindow)
+            *outWindow = foreground;
+
+        return true;
+    }
+
+    __declspec(noreturn) VOID WINAPI HookedExitProcess(UINT exitCode)
+    {
         DebugLog(
-            "[NBALiveLauncher] FastExit: replacing final ExitProcess "
-            "with TerminateProcess.\n");
+            "[NBALiveLauncher] FastExit: intercepted final ExitProcess.\n");
 
-        if (TerminateProcess(GetCurrentProcess(), exitCode))
-        {
-            // Terminating the current process should prevent meaningful
-            // execution from continuing. Keep a non-returning fallback in
-            // case the request is asynchronous on a particular system.
-            for (;;)
-                Sleep(INFINITE);
-        }
-
-        // If TerminateProcess fails, fall back to the game's original
-        // ExitProcess behavior instead of leaving the process running.
-        DebugLog(
-            "[NBALiveLauncher] FastExit: TerminateProcess failed; "
-            "falling back to original ExitProcess.\n");
-
-        ExitProcessFn original = g_originalExitProcess;
-
-        if (original &&
-            original != &FastExitProcess)
-        {
-            original(exitCode);
-        }
-
-        // Last resort. ExitProcess should not return.
-        for (;;)
-            Sleep(INFINITE);
+        FastTerminateProcess(exitCode);
     }
 
     bool IsExitProcessImport(
         std::uint8_t* base,
-        const IMAGE_IMPORT_DESCRIPTOR& descriptor,
         std::size_t index,
         IMAGE_THUNK_DATA* originalThunk,
         IMAGE_THUNK_DATA* firstThunk)
     {
-        // Preferred path: identify the import by name from OriginalFirstThunk.
+        // Preferred path: identify the import by name.
         if (originalThunk)
         {
             const auto ordinal =
@@ -126,7 +127,6 @@ namespace
         }
 
         // Fallback for an image without OriginalFirstThunk.
-        // Compare the resolved IAT value against the system export.
         HMODULE kernel32 =
             GetModuleHandleW(L"kernel32.dll");
 
@@ -138,7 +138,9 @@ namespace
             return false;
 
         FARPROC systemExitProcess =
-            GetProcAddress(kernel32, "ExitProcess");
+            GetProcAddress(
+                kernel32,
+                "ExitProcess");
 
         if (!systemExitProcess)
             return false;
@@ -152,7 +154,7 @@ namespace
     {
         static_assert(
             sizeof(void*) == 4,
-            "NBA Live 2005-08 PC compatibility hook must be built x86.");
+            "NBA Live 2005-08 compatibility hook must be built x86.");
 
         HMODULE module =
             GetModuleHandleW(nullptr);
@@ -178,14 +180,11 @@ namespace
                 base + dos->e_lfanew);
 
         if (!nt ||
-            nt->Signature != IMAGE_NT_SIGNATURE)
+            nt->Signature != IMAGE_NT_SIGNATURE ||
+            nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
         {
             return false;
         }
-
-        // These games are PE32/x86.
-        if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
-            return false;
 
         const IMAGE_DATA_DIRECTORY& importDir =
             nt->OptionalHeader.DataDirectory[
@@ -225,7 +224,6 @@ namespace
             {
                 if (!IsExitProcessImport(
                         base,
-                        *descriptor,
                         i,
                         originalThunk,
                         firstThunk))
@@ -243,8 +241,8 @@ namespace
                 if (!original)
                     return false;
 
-                // If something installed us twice, treat it as success.
-                if (original == &FastExitProcess)
+                // Already installed.
+                if (original == &HookedExitProcess)
                 {
                     g_exitProcessSlot = slot;
                     g_installed = true;
@@ -256,7 +254,7 @@ namespace
 
                 if (!WritePointer(
                         slot,
-                        reinterpret_cast<void*>(&FastExitProcess)))
+                        reinterpret_cast<void*>(&HookedExitProcess)))
                 {
                     g_originalExitProcess = nullptr;
                     g_exitProcessSlot = nullptr;
@@ -266,31 +264,205 @@ namespace
                 g_installed = true;
 
                 DebugLog(
-                    "[NBALiveLauncher] FastExit compatibility hook "
-                    "installed.\n");
+                    "[NBALiveLauncher] FastExit compatibility hook installed.\n");
 
                 return true;
             }
         }
 
         DebugLog(
-            "[NBALiveLauncher] FastExit: ExitProcess import "
-            "was not found in the main executable.\n");
+            "[NBALiveLauncher] FastExit: ExitProcess import was not found "
+            "in the main executable.\n");
 
         return false;
     }
+
+    DWORD WINAPI AltF4WatcherThread(LPVOID)
+    {
+        bool previousPressed = false;
+        bool closePending = false;
+        ULONGLONG closeRequestedAt = 0;
+        HWND closeWindow = nullptr;
+
+        while (g_altF4Running.load(std::memory_order_relaxed))
+        {
+            const bool altDown =
+                (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+            const bool f4Down =
+                (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
+
+            const bool pressed =
+                altDown && f4Down;
+
+            if (pressed && !previousPressed && !closePending)
+            {
+                HWND foreground = nullptr;
+
+                // Do not treat Alt+F4 pressed in another application as a
+                // command to kill NBA Live while it is in the background.
+                if (IsCurrentProcessForeground(&foreground))
+                {
+                    DebugLog(
+                        "[NBALiveLauncher] Alt+F4 detected. "
+                        "Requesting normal game-window close first.\n");
+
+                    closePending = true;
+                    closeRequestedAt = GetTickCount64();
+                    closeWindow = foreground;
+
+                    // Give NBA Live the opportunity to perform its own
+                    // normal shutdown. If it reaches ExitProcess, our IAT
+                    // hook will still replace only the final Windows teardown.
+                    PostMessageW(
+                        closeWindow,
+                        WM_CLOSE,
+                        0,
+                        0);
+                }
+            }
+
+            previousPressed = pressed;
+
+            if (closePending)
+            {
+                const ULONGLONG elapsed =
+                    GetTickCount64() - closeRequestedAt;
+
+                if (elapsed >= kAltF4GracePeriodMs)
+                {
+                    // If the process is still here after the grace period,
+                    // WM_CLOSE did not complete shutdown. Alt+F4 is defined
+                    // as "quit now", so use the shared force-exit path.
+                    DebugLog(
+                        "[NBALiveLauncher] Alt+F4 normal-close grace period "
+                        "expired. Forcing process termination.\n");
+
+                    FastTerminateProcess(0);
+                }
+            }
+
+            Sleep(10);
+        }
+
+        return 0;
+    }
+}
+
+[[noreturn]] void FastTerminateProcess(UINT exitCode)
+{
+    DebugLog(
+        "[NBALiveLauncher] FastExit: TerminateProcess(GetCurrentProcess()).\n");
+
+    if (TerminateProcess(
+            GetCurrentProcess(),
+            exitCode))
+    {
+        // Terminating the current process should prevent meaningful
+        // execution from continuing. Keep this function non-returning even
+        // if termination completion is asynchronous on a particular system.
+        for (;;)
+            Sleep(INFINITE);
+    }
+
+    DebugLog(
+        "[NBALiveLauncher] FastExit: TerminateProcess failed; "
+        "falling back to original ExitProcess.\n");
+
+    ExitProcessFn original =
+        g_originalExitProcess;
+
+    if (original &&
+        original != &HookedExitProcess)
+    {
+        original(exitCode);
+    }
+
+    // Ultimate fallback if both termination paths fail unexpectedly.
+    for (;;)
+        Sleep(INFINITE);
+}
+
+bool StartAltF4ExitWatcher()
+{
+    if (g_altF4Running.exchange(true))
+        return true;
+
+    g_altF4Thread =
+        CreateThread(
+            nullptr,
+            0,
+            AltF4WatcherThread,
+            nullptr,
+            0,
+            nullptr);
+
+    if (!g_altF4Thread)
+    {
+        g_altF4Running.store(false);
+        return false;
+    }
+
+    DebugLog(
+        "[NBALiveLauncher] Alt+F4 exit watcher started.\n");
+
+    return true;
+}
+
+void StopAltF4ExitWatcher()
+{
+    if (!g_altF4Running.exchange(false))
+        return;
+
+    HANDLE thread = g_altF4Thread;
+    g_altF4Thread = nullptr;
+
+    if (thread)
+    {
+        // The watcher sleeps only 10 ms per loop, so this should return
+        // immediately under normal circumstances.
+        WaitForSingleObject(
+            thread,
+            1000);
+
+        CloseHandle(thread);
+    }
+
+    DebugLog(
+        "[NBALiveLauncher] Alt+F4 exit watcher stopped.\n");
+}
+
+bool IsAltF4ExitWatcherRunning()
+{
+    return g_altF4Running.load();
 }
 
 bool InstallExitWorkaround()
 {
-    if (g_installed)
-        return true;
+    bool hookInstalled = g_installed;
 
-    return FindAndPatchExitProcessImport();
+    if (!hookInstalled)
+        hookInstalled = FindAndPatchExitProcessImport();
+
+    if (!hookInstalled)
+        return false;
+
+    // Drop-in behavior: existing callers that already invoke only
+    // InstallExitWorkaround() automatically gain Alt+F4 support.
+    if (!StartAltF4ExitWatcher())
+    {
+        DebugLog(
+            "[NBALiveLauncher] FastExit hook installed, but Alt+F4 watcher "
+            "could not be started.\n");
+    }
+
+    return true;
 }
 
 bool UninstallExitWorkaround()
 {
+    StopAltF4ExitWatcher();
+
     if (!g_installed)
         return true;
 
