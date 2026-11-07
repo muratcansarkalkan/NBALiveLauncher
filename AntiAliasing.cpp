@@ -11,6 +11,7 @@
 #include <wincodec.h>
 #include <string>
 #include <vector>
+#include "D3D9HookChain.h"
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -52,6 +53,9 @@ bool gSupersamplingEnabled = false;
 unsigned int gSupersamplingPercent = 200;
 unsigned int gSupersamplingScale = 2; // legacy/display convenience
 
+IDirect3DDevice9* gSsOwner = nullptr; // Owns one COM reference while resources exist.
+IDirect3DDevice9* gFeatureDevice = nullptr; // Identity only; never dereferenced.
+bool gSsResourcesReleasing = false;
 IDirect3DSurface9* gSsColor = nullptr;
 IDirect3DSurface9* gSsDepth = nullptr;
 IDirect3DSurface9* gSsRealBackBuffer = nullptr;
@@ -195,30 +199,177 @@ typedef HRESULT (STDMETHODCALLTYPE* StateBlockApplyFn)(
     IDirect3DStateBlock9*);
 
 Direct3DCreate9Fn gOriginalDirect3DCreate9 = nullptr;
-CreateDeviceFn gOriginalCreateDevice = nullptr;
-ResetFn gOriginalReset = nullptr;
-PresentFn gOriginalPresent = nullptr;
 
-CreateTextureFn gOriginalCreateTexture = nullptr;
-CreateRenderTargetFn gOriginalCreateRenderTarget = nullptr;
-CreateDepthStencilSurfaceFn gOriginalCreateDepthStencilSurface = nullptr;
-StretchRectFn gOriginalStretchRect = nullptr;
-SetRenderTargetFn gOriginalSetRenderTarget = nullptr;
-SetDepthStencilSurfaceFn gOriginalSetDepthStencilSurface = nullptr;
-SetViewportFn gOriginalSetViewport = nullptr;
-SetScissorRectFn gOriginalSetScissorRect = nullptr;
 
-SetRenderStateFn gOriginalSetRenderState = nullptr;
 unsigned int gMsaaStateWriteCount = 0;
 
-CreateStateBlockFn gOriginalCreateStateBlock = nullptr;
-BeginStateBlockFn gOriginalBeginStateBlock = nullptr;
-EndStateBlockFn gOriginalEndStateBlock = nullptr;
-StateBlockApplyFn gOriginalStateBlockApply = nullptr;
 unsigned int gStateBlockCreateCount = 0;
 unsigned int gStateBlockBeginCount = 0;
 unsigned int gStateBlockEndCount = 0;
 unsigned int gStateBlockApplyCount = 0;
+
+HRESULT STDMETHODCALLTYPE HookReset(
+    IDirect3DDevice9* self,
+    D3DPRESENT_PARAMETERS* pp);
+HRESULT STDMETHODCALLTYPE HookPresentSSAA(
+    IDirect3DDevice9* self,
+    const RECT* sourceRect,
+    const RECT* destRect,
+    HWND destWindowOverride,
+    const RGNDATA* dirtyRegion);
+HRESULT STDMETHODCALLTYPE HookCreateTexture(
+    IDirect3DDevice9* self,
+    UINT width,
+    UINT height,
+    UINT levels,
+    DWORD usage,
+    D3DFORMAT format,
+    D3DPOOL pool,
+    IDirect3DTexture9** outTexture,
+    HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateRenderTarget(
+    IDirect3DDevice9* self,
+    UINT width,
+    UINT height,
+    D3DFORMAT format,
+    D3DMULTISAMPLE_TYPE multisample,
+    DWORD quality,
+    BOOL lockable,
+    IDirect3DSurface9** outSurface,
+    HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateDepthStencilSurface(
+    IDirect3DDevice9* self,
+    UINT width,
+    UINT height,
+    D3DFORMAT format,
+    D3DMULTISAMPLE_TYPE multisample,
+    DWORD quality,
+    BOOL discard,
+    IDirect3DSurface9** outSurface,
+    HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookStretchRect(
+    IDirect3DDevice9* self,
+    IDirect3DSurface9* src,
+    const RECT* srcRect,
+    IDirect3DSurface9* dst,
+    const RECT* dstRect,
+    D3DTEXTUREFILTERTYPE filter);
+HRESULT STDMETHODCALLTYPE HookSetRenderTarget(
+    IDirect3DDevice9* self,
+    DWORD index,
+    IDirect3DSurface9* surface);
+HRESULT STDMETHODCALLTYPE HookSetDepthStencilSurface(
+    IDirect3DDevice9* self,
+    IDirect3DSurface9* surface);
+HRESULT STDMETHODCALLTYPE HookSetViewportSSAA(
+    IDirect3DDevice9* self,
+    const D3DVIEWPORT9* viewport);
+HRESULT STDMETHODCALLTYPE HookSetRenderState(
+    IDirect3DDevice9* self,
+    D3DRENDERSTATETYPE state,
+    DWORD value);
+HRESULT STDMETHODCALLTYPE HookCreateStateBlock(
+    IDirect3DDevice9* self,
+    D3DSTATEBLOCKTYPE type,
+    IDirect3DStateBlock9** outBlock);
+HRESULT STDMETHODCALLTYPE HookBeginStateBlock(
+    IDirect3DDevice9* self);
+HRESULT STDMETHODCALLTYPE HookEndStateBlock(
+    IDirect3DDevice9* self,
+    IDirect3DStateBlock9** outBlock);
+HRESULT STDMETHODCALLTYPE HookSetScissorRectSSAA(
+    IDirect3DDevice9* self,
+    const RECT* rect);
+HRESULT STDMETHODCALLTYPE HookCreateDevice(
+    IDirect3D9* self,
+    UINT adapter,
+    D3DDEVTYPE deviceType,
+    HWND focusWindow,
+    DWORD behaviorFlags,
+    D3DPRESENT_PARAMETERS* pp,
+    IDirect3DDevice9** outDevice);
+HRESULT STDMETHODCALLTYPE HookStateBlockApplyImpl(
+    IDirect3DStateBlock9* self);
+
+ResetFn OriginalReset(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<ResetFn>(object, 16, reinterpret_cast<void*>(&HookReset));
+}
+
+PresentFn OriginalPresent(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<PresentFn>(object, 17, reinterpret_cast<void*>(&HookPresentSSAA));
+}
+
+CreateTextureFn OriginalCreateTexture(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<CreateTextureFn>(object, 23, reinterpret_cast<void*>(&HookCreateTexture));
+}
+
+CreateRenderTargetFn OriginalCreateRenderTarget(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<CreateRenderTargetFn>(object, 28, reinterpret_cast<void*>(&HookCreateRenderTarget));
+}
+
+CreateDepthStencilSurfaceFn OriginalCreateDepthStencilSurface(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<CreateDepthStencilSurfaceFn>(object, 29, reinterpret_cast<void*>(&HookCreateDepthStencilSurface));
+}
+
+StretchRectFn OriginalStretchRect(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<StretchRectFn>(object, 34, reinterpret_cast<void*>(&HookStretchRect));
+}
+
+SetRenderTargetFn OriginalSetRenderTarget(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<SetRenderTargetFn>(object, 37, reinterpret_cast<void*>(&HookSetRenderTarget));
+}
+
+SetDepthStencilSurfaceFn OriginalSetDepthStencilSurface(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<SetDepthStencilSurfaceFn>(object, 39, reinterpret_cast<void*>(&HookSetDepthStencilSurface));
+}
+
+SetViewportFn OriginalSetViewport(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<SetViewportFn>(object, 47, reinterpret_cast<void*>(&HookSetViewportSSAA));
+}
+
+SetRenderStateFn OriginalSetRenderState(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<SetRenderStateFn>(object, 57, reinterpret_cast<void*>(&HookSetRenderState));
+}
+
+CreateStateBlockFn OriginalCreateStateBlock(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<CreateStateBlockFn>(object, 59, reinterpret_cast<void*>(&HookCreateStateBlock));
+}
+
+BeginStateBlockFn OriginalBeginStateBlock(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<BeginStateBlockFn>(object, 60, reinterpret_cast<void*>(&HookBeginStateBlock));
+}
+
+EndStateBlockFn OriginalEndStateBlock(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<EndStateBlockFn>(object, 61, reinterpret_cast<void*>(&HookEndStateBlock));
+}
+
+SetScissorRectFn OriginalSetScissorRect(IDirect3DDevice9* object)
+{
+    return d3d9chain::Next<SetScissorRectFn>(object, 75, reinterpret_cast<void*>(&HookSetScissorRectSSAA));
+}
+
+CreateDeviceFn OriginalCreateDevice(IDirect3D9* object)
+{
+    return d3d9chain::Next<CreateDeviceFn>(object, 16, reinterpret_cast<void*>(&HookCreateDevice));
+}
+
+StateBlockApplyFn OriginalStateBlockApply(IDirect3DStateBlock9* object)
+{
+    return d3d9chain::Next<StateBlockApplyFn>(object, 5, reinterpret_cast<void*>(&HookStateBlockApplyImpl));
+}
 
 constexpr uintptr_t kLive05TakeScreenshot = 0x005F2EC0;
 constexpr size_t kLive05TakeScreenshotPatchSize = 6;
@@ -1065,47 +1216,40 @@ DWORD ScaleSsCoordUnsigned(DWORD value)
 
 void ReleaseSupersamplingResources()
 {
-    if (gSsOverlaySavedState) {
-        gSsOverlaySavedState->Release();
-        gSsOverlaySavedState = nullptr;
-    }
-    if (gSsOverlaySurface) {
-        gSsOverlaySurface->Release();
-        gSsOverlaySurface = nullptr;
-    }
-    if (gSsOverlayTexture) {
-        gSsOverlayTexture->Release();
-        gSsOverlayTexture = nullptr;
-    }
-
-    if (gSsColor) {
-        gSsColor->Release();
-        gSsColor = nullptr;
-    }
-
-    if (gSsDepth) {
-        gSsDepth->Release();
-        gSsDepth = nullptr;
-    }
-
-    if (gSsRealBackBuffer) {
-        gSsRealBackBuffer->Release();
-        gSsRealBackBuffer = nullptr;
-    }
-
-    if (gSsRealDepth) {
-        gSsRealDepth->Release();
-        gSsRealDepth = nullptr;
-    }
-
-    gSsLogicalWidth = 0;
-    gSsLogicalHeight = 0;
-    gSsPhysicalWidth = 0;
-    gSsPhysicalHeight = 0;
+    if (gSsResourcesReleasing) return;
+    gSsResourcesReleasing = true;
+    IDirect3DDevice9* owner = gSsOwner;
+    auto* state = gSsOverlaySavedState;
+    auto* overlaySurface = gSsOverlaySurface;
+    auto* overlayTexture = gSsOverlayTexture;
+    auto* color = gSsColor;
+    auto* depth = gSsDepth;
+    auto* backBuffer = gSsRealBackBuffer;
+    auto* realDepth = gSsRealDepth;
+    gSsOwner = nullptr;
+    gSsOverlaySavedState = nullptr;
+    gSsOverlaySurface = nullptr;
+    gSsOverlayTexture = nullptr;
+    gSsColor = nullptr;
+    gSsDepth = nullptr;
+    gSsRealBackBuffer = nullptr;
+    gSsRealDepth = nullptr;
+    gSsLogicalWidth = gSsLogicalHeight = 0;
+    gSsPhysicalWidth = gSsPhysicalHeight = 0;
     gSsInternalOperation = false;
     gSsNativeOverlayPass = false;
     gSsOverlaySupersampledActive = false;
     gSsResolvedThisFrame = false;
+    if (state) state->Release();
+    if (overlaySurface) overlaySurface->Release();
+    if (overlayTexture) overlayTexture->Release();
+    if (color) color->Release();
+    if (depth) depth->Release();
+    if (backBuffer) backBuffer->Release();
+    if (realDepth) realDepth->Release();
+    // The creating wrapper must outlive ALL its resources and callbacks.
+    if (owner) owner->Release();
+    gSsResourcesReleasing = false;
 }
 
 bool IsSameSurface(
@@ -1117,7 +1261,7 @@ bool IsSameSurface(
 
 void SetSupersampledViewport(IDirect3DDevice9* device)
 {
-    if (!device ||
+    if (!device || device != gSsOwner ||
         !gSupersamplingEnabled ||
         gSsPhysicalWidth == 0 ||
         gSsPhysicalHeight == 0)
@@ -1132,8 +1276,8 @@ void SetSupersampledViewport(IDirect3DDevice9* device)
     vp.MaxZ = 1.0f;
 
     gSsInternalOperation = true;
-    if (gOriginalSetViewport)
-        gOriginalSetViewport(device, &vp);
+    if (OriginalSetViewport(device))
+        OriginalSetViewport(device)(device, &vp);
     else
         device->SetViewport(&vp);
     gSsInternalOperation = false;
@@ -1141,21 +1285,21 @@ void SetSupersampledViewport(IDirect3DDevice9* device)
 
 bool BindSupersamplingTargets(IDirect3DDevice9* device)
 {
-    if (!device ||
+    if (!device || device != gSsOwner ||
         !gSupersamplingEnabled ||
         !gSsColor)
         return false;
 
     gSsInternalOperation = true;
 
-    HRESULT rtHr = gOriginalSetRenderTarget
-        ? gOriginalSetRenderTarget(device, 0, gSsColor)
+    HRESULT rtHr = OriginalSetRenderTarget(device)
+        ? OriginalSetRenderTarget(device)(device, 0, gSsColor)
         : device->SetRenderTarget(0, gSsColor);
 
     HRESULT depthHr = D3D_OK;
     if (gSsDepth) {
-        depthHr = gOriginalSetDepthStencilSurface
-            ? gOriginalSetDepthStencilSurface(device, gSsDepth)
+        depthHr = OriginalSetDepthStencilSurface(device)
+            ? OriginalSetDepthStencilSurface(device)(device, gSsDepth)
             : device->SetDepthStencilSurface(gSsDepth);
     }
 
@@ -1182,7 +1326,10 @@ bool CreateSupersamplingResources(IDirect3DDevice9* device)
         !device)
         return false;
 
+    if (gSsResourcesReleasing) return false;
     ReleaseSupersamplingResources();
+    device->AddRef();
+    gSsOwner = device;
 
     HRESULT hr = device->GetBackBuffer(
         0,
@@ -1320,14 +1467,23 @@ bool CreateSupersamplingResources(IDirect3DDevice9* device)
         gSsPhysicalWidth,
         gSsPhysicalHeight);
 
-    return BindSupersamplingTargets(device);
+    if (!BindSupersamplingTargets(device)) {
+        ReleaseSupersamplingResources();
+        return false;
+    }
+    return true;
 }
 
 HRESULT STDMETHODCALLTYPE HookSetViewportSSAA(
     IDirect3DDevice9* self,
     const D3DVIEWPORT9* viewport)
 {
-    if (!gOriginalSetViewport)
+    if (self != gSsOwner || d3d9chain::PresentationDepth() != 0) {
+        const auto next = OriginalSetViewport(self);
+        return next ? next(self, viewport) : D3DERR_INVALIDCALL;
+    }
+
+    if (!OriginalSetViewport(self))
         return D3DERR_INVALIDCALL;
 
     if (gSsInternalOperation ||
@@ -1337,7 +1493,7 @@ HRESULT STDMETHODCALLTYPE HookSetViewportSSAA(
         gSsLogicalWidth == 0 ||
         gSsLogicalHeight == 0)
     {
-        return gOriginalSetViewport(self, viewport);
+        return OriginalSetViewport(self)(self, viewport);
     }
 
     D3DVIEWPORT9 scaled = *viewport;
@@ -1353,14 +1509,19 @@ HRESULT STDMETHODCALLTYPE HookSetViewportSSAA(
         scaled.Height = ScaleSsDimension(viewport->Height);
     }
 
-    return gOriginalSetViewport(self, &scaled);
+    return OriginalSetViewport(self)(self, &scaled);
 }
 
 HRESULT STDMETHODCALLTYPE HookSetScissorRectSSAA(
     IDirect3DDevice9* self,
     const RECT* rect)
 {
-    if (!gOriginalSetScissorRect)
+    if (self != gSsOwner || d3d9chain::PresentationDepth() != 0) {
+        const auto next = OriginalSetScissorRect(self);
+        return next ? next(self, rect) : D3DERR_INVALIDCALL;
+    }
+
+    if (!OriginalSetScissorRect(self))
         return D3DERR_INVALIDCALL;
 
     if (gSsInternalOperation ||
@@ -1370,7 +1531,7 @@ HRESULT STDMETHODCALLTYPE HookSetScissorRectSSAA(
         gSsLogicalWidth == 0 ||
         gSsLogicalHeight == 0)
     {
-        return gOriginalSetScissorRect(self, rect);
+        return OriginalSetScissorRect(self)(self, rect);
     }
 
     RECT scaled = *rect;
@@ -1388,7 +1549,7 @@ HRESULT STDMETHODCALLTYPE HookSetScissorRectSSAA(
         scaled.bottom = ScaleSsCoordSigned(rect->bottom);
     }
 
-    return gOriginalSetScissorRect(self, &scaled);
+    return OriginalSetScissorRect(self)(self, &scaled);
 }
 
 HRESULT STDMETHODCALLTYPE HookPresentSSAA(
@@ -1398,6 +1559,11 @@ HRESULT STDMETHODCALLTYPE HookPresentSSAA(
     HWND destWindowOverride,
     const RGNDATA* dirtyRegion)
 {
+    const auto nextPresent = OriginalPresent(self);
+    if (self != gFeatureDevice || d3d9chain::PresentationDepth() != 0)
+        return nextPresent ? nextPresent(self, sourceRect, destRect,
+            destWindowOverride, dirtyRegion) : D3DERR_INVALIDCALL;
+
     ++gSsPresentCount;
 
     if (gSupersamplingEnabled &&
@@ -1408,13 +1574,13 @@ HRESULT STDMETHODCALLTYPE HookPresentSSAA(
         // Bypass our SetRenderTarget substitution while doing the resolve.
         gSsInternalOperation = true;
 
-        HRESULT rtHr = gOriginalSetRenderTarget
-            ? gOriginalSetRenderTarget(self, 0, gSsRealBackBuffer)
+        HRESULT rtHr = OriginalSetRenderTarget(self)
+            ? OriginalSetRenderTarget(self)(self, 0, gSsRealBackBuffer)
             : self->SetRenderTarget(0, gSsRealBackBuffer);
 
         if (gSsRealDepth) {
-            if (gOriginalSetDepthStencilSurface)
-                gOriginalSetDepthStencilSurface(self, gSsRealDepth);
+            if (OriginalSetDepthStencilSurface(self))
+                OriginalSetDepthStencilSurface(self)(self, gSsRealDepth);
             else
                 self->SetDepthStencilSurface(gSsRealDepth);
         }
@@ -1427,12 +1593,12 @@ HRESULT STDMETHODCALLTYPE HookPresentSSAA(
         logicalVp.MinZ = 0.0f;
         logicalVp.MaxZ = 1.0f;
 
-        if (gOriginalSetViewport)
-            gOriginalSetViewport(self, &logicalVp);
+        if (OriginalSetViewport(self))
+            OriginalSetViewport(self)(self, &logicalVp);
 
         // Actual SSAA resolve: high-resolution scene -> normal backbuffer.
-        HRESULT stretchHr = gOriginalStretchRect
-            ? gOriginalStretchRect(
+        HRESULT stretchHr = OriginalStretchRect(self)
+            ? OriginalStretchRect(self)(
                 self,
                 gSsColor,
                 nullptr,
@@ -1447,6 +1613,8 @@ HRESULT STDMETHODCALLTYPE HookPresentSSAA(
                 D3DTEXF_LINEAR);
 
         gSsInternalOperation = false;
+        if (SUCCEEDED(stretchHr))
+            gSsResolvedThisFrame = true;
 
         if (gSsPresentCount <= 10 || FAILED(stretchHr)) {
             Log("SSAA Present #%u: restoreRT=0x%08lX resolve=0x%08lX.",
@@ -1456,14 +1624,12 @@ HRESULT STDMETHODCALLTYPE HookPresentSSAA(
         }
     }
 
-    HRESULT hr = gOriginalPresent
-        ? gOriginalPresent(
-            self,
-            sourceRect,
-            destRect,
-            destWindowOverride,
-            dirtyRegion)
-        : D3DERR_INVALIDCALL;
+    HRESULT hr = D3DERR_INVALIDCALL;
+    {
+        d3d9chain::PresentScope effectsScope;
+        if (nextPresent)
+            hr = nextPresent(self, sourceRect, destRect, destWindowOverride, dirtyRegion);
+    }
 
     // Prepare the private surfaces again for the next frame. This happens
     // after Present, so Clear calls issued before BeginScene also hit the
@@ -1582,7 +1748,7 @@ HRESULT STDMETHODCALLTYPE HookCreateTexture(
     IDirect3DTexture9** outTexture,
     HANDLE* sharedHandle)
 {
-    HRESULT hr = gOriginalCreateTexture(
+    HRESULT hr = OriginalCreateTexture(self)(
         self, width, height, levels, usage, format, pool, outTexture, sharedHandle);
 
     if ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0) {
@@ -1618,7 +1784,7 @@ HRESULT STDMETHODCALLTYPE HookCreateRenderTarget(
         width, height, (unsigned long)format, SampleName(multisample),
         (unsigned long)multisample, (unsigned long)quality, (unsigned long)lockable);
 
-    HRESULT hr = gOriginalCreateRenderTarget(
+    HRESULT hr = OriginalCreateRenderTarget(self)(
         self, width, height, format, multisample, quality,
         lockable, outSurface, sharedHandle);
 
@@ -1647,7 +1813,7 @@ HRESULT STDMETHODCALLTYPE HookCreateDepthStencilSurface(
         width, height, (unsigned long)format, SampleName(multisample),
         (unsigned long)multisample, (unsigned long)quality, (unsigned long)discard);
 
-    HRESULT hr = gOriginalCreateDepthStencilSurface(
+    HRESULT hr = OriginalCreateDepthStencilSurface(self)(
         self, width, height, format, multisample, quality,
         discard, outSurface, sharedHandle);
 
@@ -1666,6 +1832,11 @@ HRESULT STDMETHODCALLTYPE HookSetRenderTarget(
     DWORD index,
     IDirect3DSurface9* surface)
 {
+    if (self != gSsOwner || d3d9chain::PresentationDepth() != 0) {
+        const auto next = OriginalSetRenderTarget(self);
+        return next ? next(self, index, surface) : D3DERR_INVALIDCALL;
+    }
+
     if (index < 4 && gLastRT[index] != surface) {
         gLastRT[index] = surface;
         char label[64] = {};
@@ -1692,16 +1863,21 @@ HRESULT STDMETHODCALLTYPE HookSetRenderTarget(
         Log("SSAA: substituting real backbuffer bind with private %ux%u target.",
             gSsPhysicalWidth,
             gSsPhysicalHeight);
-        return gOriginalSetRenderTarget(self, index, gSsColor);
+        return OriginalSetRenderTarget(self)(self, index, gSsColor);
     }
 
-    return gOriginalSetRenderTarget(self, index, surface);
+    return OriginalSetRenderTarget(self)(self, index, surface);
 }
 
 HRESULT STDMETHODCALLTYPE HookSetDepthStencilSurface(
     IDirect3DDevice9* self,
     IDirect3DSurface9* surface)
 {
+    if (self != gSsOwner || d3d9chain::PresentationDepth() != 0) {
+        const auto next = OriginalSetDepthStencilSurface(self);
+        return next ? next(self, surface) : D3DERR_INVALIDCALL;
+    }
+
     if (gLastDepth != surface) {
         gLastDepth = surface;
         DescribeSurface("SetDepthStencilSurface", surface);
@@ -1720,10 +1896,10 @@ HRESULT STDMETHODCALLTYPE HookSetDepthStencilSurface(
         Log("SSAA: substituting real depth bind with private %ux%u depth.",
             gSsPhysicalWidth,
             gSsPhysicalHeight);
-        return gOriginalSetDepthStencilSurface(self, gSsDepth);
+        return OriginalSetDepthStencilSurface(self)(self, gSsDepth);
     }
 
-    return gOriginalSetDepthStencilSurface(self, surface);
+    return OriginalSetDepthStencilSurface(self)(self, surface);
 }
 
 HRESULT STDMETHODCALLTYPE HookStretchRect(
@@ -1752,7 +1928,7 @@ HRESULT STDMETHODCALLTYPE HookStretchRect(
         }
     }
 
-    return gOriginalStretchRect(
+    return OriginalStretchRect(self)(
         self, src, srcRect, dst, dstRect, filter);
 }
 
@@ -1762,6 +1938,11 @@ HRESULT STDMETHODCALLTYPE HookSetRenderState(
     D3DRENDERSTATETYPE state,
     DWORD value)
 {
+    if (self != gFeatureDevice || d3d9chain::PresentationDepth() != 0) {
+        const auto next = OriginalSetRenderState(self);
+        return next ? next(self, state, value) : D3DERR_INVALIDCALL;
+    }
+
     if (state == D3DRS_MULTISAMPLEANTIALIAS) {
         ++gMsaaStateWriteCount;
 
@@ -1785,7 +1966,7 @@ HRESULT STDMETHODCALLTYPE HookSetRenderState(
             (unsigned long)value);
     }
 
-    return gOriginalSetRenderState(self, state, value);
+    return OriginalSetRenderState(self)(self, state, value);
 }
 
 
@@ -1806,8 +1987,8 @@ HRESULT STDMETHODCALLTYPE HookStateBlockApplyImpl(
     Log("StateBlock::Apply #%u block=%p BEFORE MSAA=%lu",
         gStateBlockApplyCount, self, (unsigned long)before);
 
-    HRESULT hr = gOriginalStateBlockApply
-        ? gOriginalStateBlockApply(self)
+    HRESULT hr = OriginalStateBlockApply(self)
+        ? OriginalStateBlockApply(self)(self)
         : D3DERR_INVALIDCALL;
 
     DWORD after = 0xFFFFFFFF;
@@ -1819,7 +2000,8 @@ HRESULT STDMETHODCALLTYPE HookStateBlockApplyImpl(
             (unsigned long)hr,
             (unsigned long)after);
 
-        if (gEnabled && SUCCEEDED(hr) && after == FALSE) {
+        if (gEnabled && device == gFeatureDevice &&
+            d3d9chain::PresentationDepth() == 0 && SUCCEEDED(hr) && after == FALSE) {
             Log("StateBlock::Apply #%u disabled MSAA; forcing it back ON.",
                 gStateBlockApplyCount);
 
@@ -1843,31 +2025,10 @@ HRESULT STDMETHODCALLTYPE HookStateBlockApplyImpl(
 
 void HookStateBlockApply(IDirect3DStateBlock9* block)
 {
-    if (!block)
-        return;
-
-    void** vtbl = *reinterpret_cast<void***>(block);
-    // IDirect3DStateBlock9::Apply is vtable index 5.
-    void** slot = &vtbl[5];
-
-    if (*slot == reinterpret_cast<void*>(&HookStateBlockApplyImpl))
-        return;
-
-    void* original = nullptr;
-    if (PatchPointer(
-            slot,
-            reinterpret_cast<void*>(&HookStateBlockApplyImpl),
-            &original))
-    {
-        if (!gOriginalStateBlockApply)
-            gOriginalStateBlockApply =
-                reinterpret_cast<StateBlockApplyFn>(original);
-
-        Log("Hooked IDirect3DStateBlock9::Apply vtable=%p original=%p",
-            vtbl, original);
-    } else {
-        Log("FAILED to hook IDirect3DStateBlock9::Apply vtable=%p", vtbl);
-    }
+    if (!block) return;
+    void** table = *reinterpret_cast<void***>(block);
+    if (!d3d9chain::Install(table, 5, reinterpret_cast<void*>(&HookStateBlockApplyImpl)))
+        Log("FAILED to hook IDirect3DStateBlock9::Apply table=%p", table);
 }
 
 HRESULT STDMETHODCALLTYPE HookCreateStateBlock(
@@ -1879,8 +2040,8 @@ HRESULT STDMETHODCALLTYPE HookCreateStateBlock(
     Log("CreateStateBlock #%u type=%lu",
         gStateBlockCreateCount, (unsigned long)type);
 
-    HRESULT hr = gOriginalCreateStateBlock
-        ? gOriginalCreateStateBlock(self, type, outBlock)
+    HRESULT hr = OriginalCreateStateBlock(self)
+        ? OriginalCreateStateBlock(self)(self, type, outBlock)
         : D3DERR_INVALIDCALL;
 
     IDirect3DStateBlock9* block =
@@ -1906,8 +2067,8 @@ HRESULT STDMETHODCALLTYPE HookBeginStateBlock(
     Log("BeginStateBlock #%u current MSAA=%lu",
         gStateBlockBeginCount, (unsigned long)msaa);
 
-    return gOriginalBeginStateBlock
-        ? gOriginalBeginStateBlock(self)
+    return OriginalBeginStateBlock(self)
+        ? OriginalBeginStateBlock(self)(self)
         : D3DERR_INVALIDCALL;
 }
 
@@ -1917,8 +2078,8 @@ HRESULT STDMETHODCALLTYPE HookEndStateBlock(
 {
     ++gStateBlockEndCount;
 
-    HRESULT hr = gOriginalEndStateBlock
-        ? gOriginalEndStateBlock(self, outBlock)
+    HRESULT hr = OriginalEndStateBlock(self)
+        ? OriginalEndStateBlock(self)(self, outBlock)
         : D3DERR_INVALIDCALL;
 
     IDirect3DStateBlock9* block =
@@ -1948,37 +2109,36 @@ void HookRenderTargetMethods(IDirect3DDevice9* device)
     struct HookSpec {
         unsigned int index;
         void* replacement;
-        void** originalStorage;
         const char* name;
     };
 
     HookSpec specs[] = {
         { 17, reinterpret_cast<void*>(&HookPresentSSAA),
-          reinterpret_cast<void**>(&gOriginalPresent), "Present" },
+          "Present" },
         { 23, reinterpret_cast<void*>(&HookCreateTexture),
-          reinterpret_cast<void**>(&gOriginalCreateTexture), "CreateTexture" },
+          "CreateTexture" },
         { 28, reinterpret_cast<void*>(&HookCreateRenderTarget),
-          reinterpret_cast<void**>(&gOriginalCreateRenderTarget), "CreateRenderTarget" },
+          "CreateRenderTarget" },
         { 29, reinterpret_cast<void*>(&HookCreateDepthStencilSurface),
-          reinterpret_cast<void**>(&gOriginalCreateDepthStencilSurface), "CreateDepthStencilSurface" },
+          "CreateDepthStencilSurface" },
         { 34, reinterpret_cast<void*>(&HookStretchRect),
-          reinterpret_cast<void**>(&gOriginalStretchRect), "StretchRect" },
+          "StretchRect" },
         { 37, reinterpret_cast<void*>(&HookSetRenderTarget),
-          reinterpret_cast<void**>(&gOriginalSetRenderTarget), "SetRenderTarget" },
+          "SetRenderTarget" },
         { 39, reinterpret_cast<void*>(&HookSetDepthStencilSurface),
-          reinterpret_cast<void**>(&gOriginalSetDepthStencilSurface), "SetDepthStencilSurface" },
+          "SetDepthStencilSurface" },
         { 47, reinterpret_cast<void*>(&HookSetViewportSSAA),
-          reinterpret_cast<void**>(&gOriginalSetViewport), "SetViewport" },
+          "SetViewport" },
         { 57, reinterpret_cast<void*>(&HookSetRenderState),
-          reinterpret_cast<void**>(&gOriginalSetRenderState), "SetRenderState" },
+          "SetRenderState" },
         { 59, reinterpret_cast<void*>(&HookCreateStateBlock),
-          reinterpret_cast<void**>(&gOriginalCreateStateBlock), "CreateStateBlock" },
+          "CreateStateBlock" },
         { 60, reinterpret_cast<void*>(&HookBeginStateBlock),
-          reinterpret_cast<void**>(&gOriginalBeginStateBlock), "BeginStateBlock" },
+          "BeginStateBlock" },
         { 61, reinterpret_cast<void*>(&HookEndStateBlock),
-          reinterpret_cast<void**>(&gOriginalEndStateBlock), "EndStateBlock" },
+          "EndStateBlock" },
         { 75, reinterpret_cast<void*>(&HookSetScissorRectSSAA),
-          reinterpret_cast<void**>(&gOriginalSetScissorRect), "SetScissorRect" },
+          "SetScissorRect" },
     };
 
     for (const HookSpec& spec : specs) {
@@ -2009,20 +2169,11 @@ void HookRenderTargetMethods(IDirect3DDevice9* device)
         if (!needed)
             continue;
 
-        void** slot = &vtbl[spec.index];
-
-        if (*slot == spec.replacement)
-            continue;
-
-        void* original = nullptr;
-        if (PatchPointer(slot, spec.replacement, &original)) {
-            if (*spec.originalStorage == nullptr)
-                *spec.originalStorage = original;
-            Log("Hooked IDirect3DDevice9::%s index=%u original=%p",
-                spec.name, spec.index, original);
+        if (d3d9chain::Install(vtbl, spec.index, spec.replacement)) {
+            Log("Hooked IDirect3DDevice9::%s index=%u table=%p",
+                spec.name, spec.index, vtbl);
         } else {
-            Log("FAILED to hook IDirect3DDevice9::%s index=%u",
-                spec.name, spec.index);
+            Log("FAILED to hook IDirect3DDevice9::%s table=%p", spec.name, vtbl);
         }
     }
 }
@@ -2065,46 +2216,18 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(
 
 void HookDeviceReset(IDirect3DDevice9* device)
 {
-    if (!device)
-        return;
-
-    void** vtbl = *reinterpret_cast<void***>(device);
-    // IDirect3DDevice9::Reset is vtable index 16.
-    void** slot = &vtbl[16];
-
-    if (*slot == reinterpret_cast<void*>(&HookReset))
-        return;
-
-    void* original = nullptr;
-    if (PatchPointer(slot, reinterpret_cast<void*>(&HookReset), &original)) {
-        if (!gOriginalReset)
-            gOriginalReset = reinterpret_cast<ResetFn>(original);
-        Log("Hooked IDirect3DDevice9::Reset vtable=%p original=%p", vtbl, original);
-    } else {
-        Log("FAILED to hook IDirect3DDevice9::Reset vtable=%p", vtbl);
-    }
+    if (!device) return;
+    void** table = *reinterpret_cast<void***>(device);
+    if (!d3d9chain::Install(table, 16, reinterpret_cast<void*>(&HookReset)))
+        Log("FAILED to hook IDirect3DDevice9::Reset table=%p", table);
 }
 
 void HookD3D9CreateDevice(IDirect3D9* d3d)
 {
-    if (!d3d)
-        return;
-
-    void** vtbl = *reinterpret_cast<void***>(d3d);
-    // IDirect3D9::CreateDevice is vtable index 16.
-    void** slot = &vtbl[16];
-
-    if (*slot == reinterpret_cast<void*>(&HookCreateDevice))
-        return;
-
-    void* original = nullptr;
-    if (PatchPointer(slot, reinterpret_cast<void*>(&HookCreateDevice), &original)) {
-        if (!gOriginalCreateDevice)
-            gOriginalCreateDevice = reinterpret_cast<CreateDeviceFn>(original);
-        Log("Hooked IDirect3D9::CreateDevice vtable=%p original=%p", vtbl, original);
-    } else {
-        Log("FAILED to hook IDirect3D9::CreateDevice vtable=%p", vtbl);
-    }
+    if (!d3d) return;
+    void** table = *reinterpret_cast<void***>(d3d);
+    if (!d3d9chain::Install(table, 16, reinterpret_cast<void*>(&HookCreateDevice)))
+        Log("FAILED to hook IDirect3D9::CreateDevice table=%p", table);
 }
 
 IDirect3D9* WINAPI HookDirect3DCreate9(UINT sdkVersion)
@@ -2129,6 +2252,20 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(
     D3DPRESENT_PARAMETERS* pp,
     IDirect3DDevice9** outDevice)
 {
+    // A proxy may call a native factory whose table is also hooked. Only the
+    // outermost call owns feature setup, after the complete wrapper is returned.
+    static thread_local unsigned int createDepth = 0;
+    const auto nextCreate = OriginalCreateDevice(self);
+    if (!nextCreate) return D3DERR_INVALIDCALL;
+    if (createDepth != 0 || d3d9chain::FeatureBypassDepth() != 0)
+        return nextCreate(self, adapter, deviceType, focusWindow,
+            behaviorFlags, pp, outDevice);
+    struct CreateScope {
+        unsigned int& depth;
+        explicit CreateScope(unsigned int& value) : depth(value) { ++depth; }
+        ~CreateScope() { --depth; }
+    } createScope(createDepth);
+
     ++gCreateDeviceCount;
     Log("CreateDevice #%u intercepted: d3d=%p adapter=%u type=%lu behavior=0x%08lX out=%p",
         gCreateDeviceCount, self, adapter, (unsigned long)deviceType,
@@ -2136,12 +2273,12 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(
 
     ApplyMsaa("CreateDevice BEFORE", self, adapter, deviceType, pp);
 
-    if (!gOriginalCreateDevice) {
+    if (!OriginalCreateDevice(self)) {
         Log("CreateDevice #%u FAILED: original function pointer is null.", gCreateDeviceCount);
         return D3DERR_INVALIDCALL;
     }
 
-    HRESULT hr = gOriginalCreateDevice(
+    HRESULT hr = OriginalCreateDevice(self)(
         self, adapter, deviceType, focusWindow,
         behaviorFlags, pp, outDevice);
 
@@ -2152,6 +2289,7 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(
         gCreateDeviceCount, (unsigned long)hr, device);
 
     if (SUCCEEDED(hr) && device) {
+        gFeatureDevice = device;
         HookDeviceReset(device);
 
         if (gEnabled || gSupersamplingEnabled)
@@ -2175,9 +2313,14 @@ HRESULT STDMETHODCALLTYPE HookReset(
     IDirect3DDevice9* self,
     D3DPRESENT_PARAMETERS* pp)
 {
+    const auto nextReset = OriginalReset(self);
+    if (!nextReset) return D3DERR_INVALIDCALL;
+    if (self != gFeatureDevice)
+        return nextReset(self, pp);
+
     ++gResetCount;
 
-    if (gSupersamplingEnabled)
+    if (gSupersamplingEnabled && self == gSsOwner)
         ReleaseSupersamplingResources();
     Log("Reset #%u intercepted: device=%p", gResetCount, self);
 
@@ -2200,12 +2343,12 @@ HRESULT STDMETHODCALLTYPE HookReset(
     if (d3d)
         d3d->Release();
 
-    if (!gOriginalReset) {
+    if (!OriginalReset(self)) {
         Log("Reset #%u FAILED: original function pointer is null.", gResetCount);
         return D3DERR_INVALIDCALL;
     }
 
-    HRESULT hr = gOriginalReset(self, pp);
+    HRESULT hr = OriginalReset(self)(self, pp);
     Log("Reset #%u returned hr=0x%08lX", gResetCount, (unsigned long)hr);
 
     if (SUCCEEDED(hr)) {
@@ -2214,7 +2357,7 @@ HRESULT STDMETHODCALLTYPE HookReset(
                 D3DRS_MULTISAMPLEANTIALIAS,
                 TRUE);
 
-        if (gSupersamplingEnabled)
+        if (gSupersamplingEnabled && self == gFeatureDevice)
             CreateSupersamplingResources(self);
 
         ProbeDevice("Reset ACTUAL", self);
@@ -3473,7 +3616,7 @@ const char* GameName()
 
 bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
 {
-    if (!device ||
+    if (!device || device != gSsOwner ||
         !gSupersamplingEnabled ||
         !gSsColor ||
         !gSsRealBackBuffer ||
@@ -3503,14 +3646,14 @@ bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
     }
 
     // Resolve the completed high-resolution game frame first.
-    HRESULT rtHr = gOriginalSetRenderTarget
-        ? gOriginalSetRenderTarget(device, 0, gSsRealBackBuffer)
+    HRESULT rtHr = OriginalSetRenderTarget(device)
+        ? OriginalSetRenderTarget(device)(device, 0, gSsRealBackBuffer)
         : device->SetRenderTarget(0, gSsRealBackBuffer);
 
     HRESULT depthHr = D3D_OK;
     if (gSsRealDepth) {
-        depthHr = gOriginalSetDepthStencilSurface
-            ? gOriginalSetDepthStencilSurface(device, gSsRealDepth)
+        depthHr = OriginalSetDepthStencilSurface(device)
+            ? OriginalSetDepthStencilSurface(device)(device, gSsRealDepth)
             : device->SetDepthStencilSurface(gSsRealDepth);
     }
 
@@ -3520,12 +3663,12 @@ bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
     logicalVp.MinZ = 0.0f;
     logicalVp.MaxZ = 1.0f;
 
-    HRESULT viewportHr = gOriginalSetViewport
-        ? gOriginalSetViewport(device, &logicalVp)
+    HRESULT viewportHr = OriginalSetViewport(device)
+        ? OriginalSetViewport(device)(device, &logicalVp)
         : device->SetViewport(&logicalVp);
 
-    HRESULT stretchHr = gOriginalStretchRect
-        ? gOriginalStretchRect(
+    HRESULT stretchHr = OriginalStretchRect(device)
+        ? OriginalStretchRect(device)(
             device, gSsColor, nullptr,
             gSsRealBackBuffer, nullptr, D3DTEXF_LINEAR)
         : device->StretchRect(
@@ -3558,12 +3701,12 @@ bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
     gSsResolvedThisFrame = true;
 
     if (gSsOverlaySurface && gSsOverlayTexture) {
-        HRESULT overlayRtHr = gOriginalSetRenderTarget
-            ? gOriginalSetRenderTarget(device, 0, gSsOverlaySurface)
+        HRESULT overlayRtHr = OriginalSetRenderTarget(device)
+            ? OriginalSetRenderTarget(device)(device, 0, gSsOverlaySurface)
             : device->SetRenderTarget(0, gSsOverlaySurface);
 
-        HRESULT noDepthHr = gOriginalSetDepthStencilSurface
-            ? gOriginalSetDepthStencilSurface(device, nullptr)
+        HRESULT noDepthHr = OriginalSetDepthStencilSurface(device)
+            ? OriginalSetDepthStencilSurface(device)(device, nullptr)
             : device->SetDepthStencilSurface(nullptr);
 
         D3DVIEWPORT9 overlayVp = {};
@@ -3572,8 +3715,8 @@ bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
         overlayVp.MinZ = 0.0f;
         overlayVp.MaxZ = 1.0f;
 
-        HRESULT overlayVpHr = gOriginalSetViewport
-            ? gOriginalSetViewport(device, &overlayVp)
+        HRESULT overlayVpHr = OriginalSetViewport(device)
+            ? OriginalSetViewport(device)(device, &overlayVp)
             : device->SetViewport(&overlayVp);
 
         RECT overlayScissor = {
@@ -3582,8 +3725,8 @@ bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
             static_cast<LONG>(gSsPhysicalHeight)
         };
 
-        HRESULT scissorHr = gOriginalSetScissorRect
-            ? gOriginalSetScissorRect(device, &overlayScissor)
+        HRESULT scissorHr = OriginalSetScissorRect(device)
+            ? OriginalSetScissorRect(device)(device, &overlayScissor)
             : device->SetScissorRect(&overlayScissor);
 
         HRESULT clearHr = device->Clear(
@@ -3619,12 +3762,12 @@ bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
                 (unsigned long)scissorHr,
                 (unsigned long)clearHr);
 
-            if (gOriginalSetRenderTarget)
-                gOriginalSetRenderTarget(device, 0, gSsRealBackBuffer);
-            if (gSsRealDepth && gOriginalSetDepthStencilSurface)
-                gOriginalSetDepthStencilSurface(device, gSsRealDepth);
-            if (gOriginalSetViewport)
-                gOriginalSetViewport(device, &logicalVp);
+            if (OriginalSetRenderTarget(device))
+                OriginalSetRenderTarget(device)(device, 0, gSsRealBackBuffer);
+            if (gSsRealDepth && OriginalSetDepthStencilSurface(device))
+                OriginalSetDepthStencilSurface(device)(device, gSsRealDepth);
+            if (OriginalSetViewport(device))
+                OriginalSetViewport(device)(device, &logicalVp);
         }
     }
 
@@ -3646,6 +3789,7 @@ bool BeginAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
 
 void EndAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
 {
+    if (device != gSsOwner) return;
     if (!device || !gSsNativeOverlayPass)
         return;
 
@@ -3655,14 +3799,14 @@ void EndAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
     {
         gSsInternalOperation = true;
 
-        if (gOriginalSetRenderTarget)
-            gOriginalSetRenderTarget(device, 0, gSsRealBackBuffer);
+        if (OriginalSetRenderTarget(device))
+            OriginalSetRenderTarget(device)(device, 0, gSsRealBackBuffer);
         else
             device->SetRenderTarget(0, gSsRealBackBuffer);
 
         if (gSsRealDepth) {
-            if (gOriginalSetDepthStencilSurface)
-                gOriginalSetDepthStencilSurface(device, gSsRealDepth);
+            if (OriginalSetDepthStencilSurface(device))
+                OriginalSetDepthStencilSurface(device)(device, gSsRealDepth);
             else
                 device->SetDepthStencilSurface(gSsRealDepth);
         }
@@ -3673,8 +3817,8 @@ void EndAntiAliasingNativeOverlayPass(IDirect3DDevice9* device)
         vp.MinZ = 0.0f;
         vp.MaxZ = 1.0f;
 
-        if (gOriginalSetViewport)
-            gOriginalSetViewport(device, &vp);
+        if (OriginalSetViewport(device))
+            OriginalSetViewport(device)(device, &vp);
         else
             device->SetViewport(&vp);
 

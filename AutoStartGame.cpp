@@ -1,217 +1,60 @@
 #include "plugin-std.h"
-#include "AutoStartGame.h"
-
 #include <Windows.h>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
-#include <cstdarg>
+#include <cstdlib>
+#include <cctype>
+#include <cmath>
 #include <string>
+#include <fstream>
+#include <sstream>
+#include <intrin.h>
 #include <vector>
 #include <algorithm>
+#include <cstdarg>
+#include "AutoStartGame.h"
+#include "AutoStartInternal.h"
 
 using namespace plugin;
+namespace autostartdetail {
+bool g_enabled = false;
 
-namespace
-{
-    // NBA Live 06 1.0 NOCD only.
-    constexpr unsigned int kLive06EntryPoint       = 0x0040109F;
-    constexpr unsigned int kLive06AspectMarker     = 0x00BD832C;
-    constexpr float        kStockAspectMarker      = 1.3333334f;
+bool g_pending = false;
 
-    // Native 06 anchors.
-    constexpr unsigned int kFESystemGlobal         = 0x00CB2AF4;
-    constexpr unsigned int kFESystemUpdate         = 0x00598980;
+bool g_consumed = false;
 
-    // APT callback used by the title flow to ask where startup should go.
-    constexpr unsigned int kGetStartupScreen       = 0x005CBA30;
-    constexpr unsigned int kSetAptEnumReturn       = 0x005C8C60;
+DWORD g_feRunSeenAt = 0;
 
-    // GD_FE_RUN -> FESystem::Update(delta) call site.
-    constexpr unsigned int kFEUpdateCall           = 0x005F6AAF;
+DWORD g_autoStartDelayMs = 750;
 
-    // Intercept the two boot packages at FileSystem::OpenResolved.
-    // The supplied modified BIG files contain the APT transition to TITLE;
-    // we leave their bytes unchanged and supply them as alternate assets.
-    // If another module already detours this entry with JMP rel32, chain it.
-    constexpr unsigned int kOpenResolved06          = 0x006DC8F9;
+DWORD g_autoStartInitializedAt = 0;
 
-    // Async file-request constructor instrumentation.
-    //
-    // sub_6DD894:
-    //   006DD8A3 call sub_6DC39E
-    //   006DD8A8 mov eax,[ebp+08]
-    //   006DD8AB mov ecx,esi
-    //   006DD8AD mov [esi],00BD506C
-    //
-    // sub_6DC39E has already populated the request object here, including
-    // the filename pointer later consumed from [request+0x30].
-    constexpr unsigned int kRequestCtorTracePatch06  = 0x006DD8A8;
-    constexpr unsigned int kRequestCtorTraceResume06 = 0x006DD8AD;
+DWORD g_titleStartupCallbackAt = 0;
 
-    // FEUberGameMode singleton getter, useful only for diagnostics here.
-    constexpr unsigned int kGetFEUberGameMode      = 0x004B8870;
+TitleBranchPatch g_titleBranchPatches[8] = {};
 
-    constexpr int kStateFeRun                      = 4;
-    constexpr int kGDFeRun                         = 5;
-    constexpr int kGDGameInit                      = 14;
+size_t g_titleBranchPatchCount = 0;
 
-    bool g_enabled = false;
-    bool g_pending = false;
-    bool g_consumed = false;
+volatile LONG g_bootAssetOverridesActive = 0;
 
-    // GetStartupScreen() is called while the title package is still being
-    // initialized (FE_INIT).  Arm there, then wait until the title has
-    // actually entered FE_RUN and has remained there briefly before starting
-    // the game.
-    DWORD g_feRunSeenAt = 0;
-    DWORD g_autoStartDelayMs = 750;
-    // Diagnostics: the INI delay begins at FE_RUN, not when Title first renders.
-    DWORD g_autoStartInitializedAt = 0;
-    DWORD g_titleStartupCallbackAt = 0;
+const char* g_splashOverridePath = nullptr;
 
-    // ---------------------------------------------------------------------
-    // title.apt: suppress only the normal PC MAIN_MENU transition.
-    //
-    // The supplied screens~bootup~title.big was decoded and the relevant
-    // action stream is:
-    //
-    //   CallFunction("GetStartupScreen()")
-    //   compare STARTUP_SCREEN_ONLINE
-    //   if not online -> branch +0x1C to:
-    //
-    //       SCREEN.MAIN_MENU
-    //       gSM.changeMainScreen(...)
-    //
-    // The first byte after that MAIN_MENU action is +0x25 from the same
-    // branch base.  While autostart is armed we change only:
-    //
-    //       9D 1C 00 00 00  ->  9D 25 00 00 00
-    //
-    // so the non-online path skips changeMainScreen(MAIN_MENU).
-    //
-    // This is a PROCESS-MEMORY patch only.  No BIG/APT file is modified.
-    // The original byte is restored once the native GD_GAME_INIT handoff
-    // is consumed.
-    // ---------------------------------------------------------------------
-    constexpr unsigned char kTitleStartupBranchPattern[] =
-    {
-        0xA2, 0x1E,                   // GetStartupScreen()
-        0x5A,
-        0xA2, 0x0B,                   // CallFunction
-        0x3D,
-        0xA2, 0x1F,                   // STARTUP_SCREEN_ONLINE
-        0x49,
-        0x12,
-        0x9D, 0x1C, 0x00, 0x00, 0x00,
+const char* g_healthOverridePath = nullptr;
 
-        0xA2, 0x20,                   // ChangeGameMode(GAMEMODE_ONLINE)
-        0x5A,
-        0xB0, 0x0B,
-        0xAE, 0x11,
-        0xAF, 0x21,                   // SCREEN.MAIN_MENU
-        0x5A,
-        0xAE, 0x13,
-        0xB2, 0x22,                   // gSM.pushScreen (online branch)
-        0xAE, 0x11,
-        0xAF, 0x23,                   // SCREEN.SN_START
-        0x5A,
-        0xAE, 0x13,
-        0xB2, 0x14,                   // gSM.changeMainScreen
-        0x99, 0x09, 0x00, 0x00, 0x00,
+volatile LONG g_splashOverrideRequests = 0;
 
-        // Normal PC branch target in stock title.apt:
-        0xAE, 0x11,
-        0xAF, 0x21,                   // SCREEN.MAIN_MENU
-        0x5A,
-        0xAE, 0x13,
-        0xB2, 0x14                    // gSM.changeMainScreen
-    };
+volatile LONG g_healthOverrideRequests = 0;
 
-    constexpr size_t kTitleBranchOperandOffset = 11;
-    constexpr unsigned char kTitleBranchStockOffset = 0x1C;
-    constexpr unsigned char kTitleBranchSkipMainMenuOffset = 0x25;
-
-    struct TitleBranchPatch
-    {
-        unsigned char* operand = nullptr;
-        unsigned char original = 0;
-    };
-
-    TitleBranchPatch g_titleBranchPatches[8] = {};
-    size_t g_titleBranchPatchCount = 0;
-
-    // Auto-start asset overrides are enabled only when AUTO_START_GAME=1.
-    // They are one-shot for the initial boot; Title initialization disables
-    // redirection so later FE navigation uses the original game assets.
-    volatile LONG g_bootAssetOverridesActive = 0;
-    const char* g_splashOverridePath = nullptr;
-    const char* g_healthOverridePath = nullptr;
-    volatile LONG g_splashOverrideRequests = 0;
-    volatile LONG g_healthOverrideRequests = 0;
-
-    // These paths are relative to the NBA Live 06 executable directory.
-    // Accept either the native archive member filename or shorter aliases.
-    constexpr char kSplashAssetNative[] =
-        "assets\\autostart\\06\\screens~bootup~splash.big";
-    constexpr char kHealthAssetNative[] =
-        "assets\\autostart\\06\\screens~bootup~health.big";
-    constexpr char kSplashAssetShort[] =
-        "assets\\autostart\\06\\splash.big";
-    constexpr char kHealthAssetShort[] =
-        "assets\\autostart\\06\\health.big";
-
-    constexpr char kBootSplashPackage[] =
-        "screens~bootup~splash.big";
-    constexpr char kBootHealthPackage[] =
-        "screens~bootup~health.big";
-
-    bool g_bootSelectorTrace = false;
-    FILE* g_bootSelectorTraceFile = nullptr;
-    bool g_tracedLegal = false;
-    bool g_tracedNbaLogo = false;
-    bool g_tracedTitle = false;
+bool g_bootSelectorTrace = false;
 
 #if defined(_M_IX86)
-    bool g_requestCtorTraceHookInstalled = false;
+uintptr_t g_bootOpenResolvedContinuation = 0;
+
+bool g_bootOpenResolvedHookInstalled = false;
+
 #endif
-
-#if defined(_M_IX86)
-    uintptr_t g_bootOpenResolvedContinuation = 0;
-    bool g_bootOpenResolvedHookInstalled = false;
-#endif
-
-    const char kBootLegalPackage[] =
-        "screens~bootup~legal.big";
-
-    const char kBootTitlePackage[] =
-        "screens~bootup~title.big";
-
-    const char kBootNbaLogoPackage[] =
-        "screens~bootup~nbalogo.big";
-
-    void Log(const char* format, ...)
-    {
-        char buffer[768] = {};
-
-        va_list args;
-        va_start(args, format);
-        vsnprintf_s(
-            buffer,
-            sizeof(buffer),
-            _TRUNCATE,
-            format,
-            args);
-        va_end(args);
-
-        OutputDebugStringA(buffer);
-
-        // The launcher already has a debug console in development builds.
-        std::printf("%s", buffer);
-        std::fflush(stdout);
-    }
-
-    std::string GetMainIniPath()
+std::string GetMainIniPath()
     {
         char exePath[MAX_PATH] = {};
 
@@ -239,7 +82,7 @@ namespace
         return std::string(exePath) + "main.ini";
     }
 
-    bool AssetFileExists06(const char* relativePath)
+bool AssetFileExists06(const char* relativePath)
     {
         // OpenResolved accepts game-root-relative paths. Verify that these
         // files live next to the actual EXE, not an arbitrary current CWD.
@@ -256,7 +99,7 @@ namespace
                (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
     }
 
-    const char* ChooseBootOverride06(
+const char* ChooseBootOverride06(
         const char* nativeName,
         const char* shortName)
     {
@@ -267,13 +110,13 @@ namespace
         return nullptr;
     }
 
-    bool IsLive06()
+bool IsLive06()
     {
         return FM::GetEntryPoint() == kLive06EntryPoint &&
                patch::GetFloat(kLive06AspectMarker) == kStockAspectMarker;
     }
 
-    int ReadFEState(void* feSystem)
+int ReadFEState(void* feSystem)
     {
         if (!feSystem)
             return -1;
@@ -282,7 +125,7 @@ namespace
             static_cast<std::uint8_t*>(feSystem) + 0x0C);
     }
 
-    int ReadGDState(void* feSystem)
+int ReadGDState(void* feSystem)
     {
         if (!feSystem)
             return -1;
@@ -291,43 +134,7 @@ namespace
             static_cast<std::uint8_t*>(feSystem) + 0x10);
     }
 
-    void DumpUberState(const char* reason)
-    {
-        void* uber =
-            reinterpret_cast<void*(__cdecl*)()>(
-                kGetFEUberGameMode)();
-
-        if (!uber)
-        {
-            Log(
-                "[AutoStart06] %s: FEUberGameMode=null\n",
-                reason);
-            return;
-        }
-
-        const auto* bytes =
-            static_cast<const std::uint8_t*>(uber);
-
-        const int currentMode =
-            *reinterpret_cast<const int*>(bytes + 0x08);
-
-        const int nextMode =
-            *reinterpret_cast<const int*>(bytes + 0x0C);
-
-        const int inGameplay =
-            bytes[0x84] ? 1 : 0;
-
-        Log(
-            "[AutoStart06] %s: uber=%p currentMode=%d "
-            "nextMode=%d inGameplay=%d\n",
-            reason,
-            uber,
-            currentMode,
-            nextMode,
-            inGameplay);
-    }
-
-    const char* BaseNameOfPath(const char* path)
+const char* BaseNameOfPath(const char* path)
     {
         if (!path)
             return "";
@@ -343,626 +150,8 @@ namespace
         return base;
     }
 
-    bool IsLikelyCodeAddress06(uintptr_t value)
-    {
-        return value >= 0x00401000 &&
-               value <  0x00B91E51;
-    }
-
-    bool CopyReadableCString(
-        const char* source,
-        char* destination,
-        size_t destinationSize)
-    {
-        if (!source ||
-            !destination ||
-            destinationSize == 0)
-        {
-            return false;
-        }
-
-        destination[0] = '\0';
-
-        __try
-        {
-            size_t i = 0;
-
-            for (;
-                 i + 1 < destinationSize;
-                 ++i)
-            {
-                const char c = source[i];
-                destination[i] = c;
-
-                if (c == '\0')
-                    return i != 0;
-
-                const unsigned char uc =
-                    static_cast<unsigned char>(c);
-
-                if (uc < 0x20 &&
-                    c != '\t')
-                {
-                    destination[0] = '\0';
-                    return false;
-                }
-            }
-
-            destination[destinationSize - 1] = '\0';
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            destination[0] = '\0';
-            return false;
-        }
-    }
-
-    void OpenBootSelectorTraceFile()
-    {
-        if (!g_bootSelectorTrace || g_bootSelectorTraceFile)
-            return;
-
-        char exePath[MAX_PATH] = {};
-        const DWORD len =
-            GetModuleFileNameA(
-                nullptr,
-                exePath,
-                static_cast<DWORD>(sizeof(exePath)));
-
-        if (!len || len >= sizeof(exePath))
-            return;
-
-        char* slash = std::strrchr(exePath, '\\');
-        if (!slash)
-            return;
-
-        *(slash + 1) = '\0';
-
-        char logsDir[MAX_PATH] = {};
-        sprintf_s(
-            logsDir,
-            sizeof(logsDir),
-            "%slogs",
-            exePath);
-
-        CreateDirectoryA(logsDir, nullptr);
-
-        char logPath[MAX_PATH] = {};
-        sprintf_s(
-            logPath,
-            sizeof(logPath),
-            "%slogs\\boot_selector_trace06.log",
-            exePath);
-
-        fopen_s(
-            &g_bootSelectorTraceFile,
-            logPath,
-            "a");
-
-        if (!g_bootSelectorTraceFile)
-            return;
-
-        SYSTEMTIME st = {};
-        GetLocalTime(&st);
-
-        std::fprintf(
-            g_bootSelectorTraceFile,
-            "\n============================================================\n"
-            "NBA Live 06 boot selector trace %04u-%02u-%02u "
-            "%02u:%02u:%02u\n"
-            "============================================================\n",
-            st.wYear,
-            st.wMonth,
-            st.wDay,
-            st.wHour,
-            st.wMinute,
-            st.wSecond);
-
-        std::fflush(g_bootSelectorTraceFile);
-    }
-
-    bool IsMainExeCodeAddress(uintptr_t value)
-    {
-        return IsLikelyCodeAddress06(value);
-    }
-
-    void WriteBootSelectorTraceLine(
-        const char* format,
-        ...)
-    {
-        if (!g_bootSelectorTrace)
-            return;
-
-        OpenBootSelectorTraceFile();
-
-        if (!g_bootSelectorTraceFile)
-            return;
-
-        char line[2048] = {};
-
-        va_list args;
-        va_start(args, format);
-
-        vsnprintf_s(
-            line,
-            sizeof(line),
-            _TRUNCATE,
-            format,
-            args);
-
-        va_end(args);
-
-        std::fputs(
-            line,
-            g_bootSelectorTraceFile);
-
-        std::fflush(
-            g_bootSelectorTraceFile);
-
-        OutputDebugStringA(line);
-    }
-
-    void TraceBootSelectorRequest(
-        const char* requestedPath,
-        uintptr_t* entryStack)
-    {
-        if (!g_bootSelectorTrace ||
-            !requestedPath ||
-            !entryStack)
-        {
-            return;
-        }
-
-        const char* base =
-            BaseNameOfPath(requestedPath);
-
-        bool* alreadyTraced = nullptr;
-        const char* stageName = nullptr;
-
-        if (_stricmp(base, kBootLegalPackage) == 0)
-        {
-            alreadyTraced = &g_tracedLegal;
-            stageName = "LEGAL";
-        }
-        else if (_stricmp(base, kBootNbaLogoPackage) == 0)
-        {
-            alreadyTraced = &g_tracedNbaLogo;
-            stageName = "NBA_LOGO";
-        }
-        else if (_stricmp(base, kBootTitlePackage) == 0)
-        {
-            alreadyTraced = &g_tracedTitle;
-            stageName = "TITLE";
-        }
-        else
-        {
-            return;
-        }
-
-        if (*alreadyTraced)
-            return;
-
-        *alreadyTraced = true;
-
-        WriteBootSelectorTraceLine(
-            "\n[BOOT_SELECTOR] stage=%s requested='%s'\n",
-            stageName,
-            requestedPath);
-
-        // Direct OpenResolved caller from its original entry stack.
-        WriteBootSelectorTraceLine(
-            "[BOOT_SELECTOR] direct_return=%08lX\n",
-            static_cast<unsigned long>(
-                entryStack[0]));
-
-        // RtlCaptureStackBackTrace gives the real active call chain. The
-        // first frames are our ASI hook/helper and are expected; later frames
-        // should converge on OpenResolved and then the APT/resource caller.
-        void* frames[48] = {};
-        const USHORT captured =
-            CaptureStackBackTrace(
-                0,
-                static_cast<DWORD>(
-                    sizeof(frames) / sizeof(frames[0])),
-                frames,
-                nullptr);
-
-        WriteBootSelectorTraceLine(
-            "[BOOT_SELECTOR] captured_frames=%u\n",
-            static_cast<unsigned>(captured));
-
-        for (USHORT i = 0; i < captured; ++i)
-        {
-            const uintptr_t address =
-                reinterpret_cast<uintptr_t>(
-                    frames[i]);
-
-            WriteBootSelectorTraceLine(
-                "[BOOT_SELECTOR] frame[%02u]=%08lX%s\n",
-                static_cast<unsigned>(i),
-                static_cast<unsigned long>(address),
-                IsMainExeCodeAddress(address)
-                    ? "  EXE"
-                    : "");
-        }
-
-        // Also scan the original caller stack for code-looking values. This
-        // is not treated as a formal call chain; it is a second independent
-        // fingerprint that survives imperfect x86 unwinding.
-        WriteBootSelectorTraceLine(
-            "[BOOT_SELECTOR] stack_code_candidates:\n");
-
-        unsigned emitted = 0;
-
-        __try
-        {
-            for (unsigned i = 0;
-                 i < 384 && emitted < 64;
-                 ++i)
-            {
-                const uintptr_t value =
-                    entryStack[i];
-
-                if (!IsMainExeCodeAddress(value))
-                    continue;
-
-                bool duplicate = false;
-
-                for (unsigned j = 0; j < i; ++j)
-                {
-                    if (entryStack[j] == value)
-                    {
-                        duplicate = true;
-                        break;
-                    }
-                }
-
-                if (duplicate)
-                    continue;
-
-                WriteBootSelectorTraceLine(
-                    "[BOOT_SELECTOR]   stack[%03u]=%08lX\n",
-                    i,
-                    static_cast<unsigned long>(value));
-
-                ++emitted;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            WriteBootSelectorTraceLine(
-                "[BOOT_SELECTOR]   stack scan stopped at unreadable page\n");
-        }
-
-        WriteBootSelectorTraceLine(
-            "[BOOT_SELECTOR] end stage=%s\n",
-            stageName);
-    }
-
 #if defined(_M_IX86)
-    void __cdecl TraceBootRequestConstructed(
-        uintptr_t requestObject,
-        uintptr_t constructorFrame)
-    {
-        if (!g_bootSelectorTrace ||
-            !requestObject)
-        {
-            return;
-        }
-
-        char path[512] = {};
-        const char* pathPointer = nullptr;
-
-        __try
-        {
-            pathPointer =
-                *reinterpret_cast<const char**>(
-                    requestObject + 0x30);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return;
-        }
-
-        if (!CopyReadableCString(
-                pathPointer,
-                path,
-                sizeof(path)))
-        {
-            return;
-        }
-
-        const char* base =
-            BaseNameOfPath(path);
-
-        bool* alreadyTraced = nullptr;
-        const char* stageName = nullptr;
-
-        if (_stricmp(base, kBootLegalPackage) == 0)
-        {
-            alreadyTraced = &g_tracedLegal;
-            stageName = "LEGAL";
-        }
-        else if (_stricmp(base, kBootNbaLogoPackage) == 0)
-        {
-            alreadyTraced = &g_tracedNbaLogo;
-            stageName = "NBA_LOGO";
-        }
-        else if (_stricmp(base, kBootTitlePackage) == 0)
-        {
-            alreadyTraced = &g_tracedTitle;
-            stageName = "TITLE";
-        }
-        else
-        {
-            return;
-        }
-
-        if (*alreadyTraced)
-            return;
-
-        *alreadyTraced = true;
-
-        DWORD field0C = 0;
-        DWORD field14 = 0;
-        DWORD field20 = 0;
-        DWORD field24 = 0;
-        DWORD field30 = 0;
-
-        __try
-        {
-            field0C =
-                *reinterpret_cast<DWORD*>(
-                    requestObject + 0x0C);
-
-            field14 =
-                *reinterpret_cast<DWORD*>(
-                    requestObject + 0x14);
-
-            field20 =
-                *reinterpret_cast<DWORD*>(
-                    requestObject + 0x20);
-
-            field24 =
-                *reinterpret_cast<DWORD*>(
-                    requestObject + 0x24);
-
-            field30 =
-                *reinterpret_cast<DWORD*>(
-                    requestObject + 0x30);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-        }
-
-        WriteBootSelectorTraceLine(
-            "\n[BOOT_ORIGIN] stage=%s request=%08lX path='%s'\n",
-            stageName,
-            static_cast<unsigned long>(
-                requestObject),
-            path);
-
-        WriteBootSelectorTraceLine(
-            "[BOOT_ORIGIN] fields "
-            "+0C=%08lX +14=%08lX +20=%08lX "
-            "+24=%08lX +30=%08lX\n",
-            static_cast<unsigned long>(field0C),
-            static_cast<unsigned long>(field14),
-            static_cast<unsigned long>(field20),
-            static_cast<unsigned long>(field24),
-            static_cast<unsigned long>(field30));
-
-        // At 006DD8A8, EBP still belongs to sub_6DD894.
-        // Walk the actual x86 EBP chain instead of scanning arbitrary stack
-        // contents. This should retain:
-        //
-        //   sub_6DD894
-        //   sub_6DC795 request factory
-        //   logical asset caller
-        //   mainFE/APT caller
-        //
-        // as long as the upstream functions use frame pointers.
-        WriteBootSelectorTraceLine(
-            "[BOOT_ORIGIN] ebp_chain start=%08lX\n",
-            static_cast<unsigned long>(
-                constructorFrame));
-
-        uintptr_t frame = constructorFrame;
-
-        for (unsigned depth = 0;
-             depth < 32 && frame;
-             ++depth)
-        {
-            uintptr_t nextFrame = 0;
-            uintptr_t returnAddress = 0;
-
-            __try
-            {
-                nextFrame =
-                    *reinterpret_cast<uintptr_t*>(
-                        frame);
-
-                returnAddress =
-                    *reinterpret_cast<uintptr_t*>(
-                        frame + sizeof(uintptr_t));
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                WriteBootSelectorTraceLine(
-                    "[BOOT_ORIGIN] ebp[%02u] unreadable frame=%08lX\n",
-                    depth,
-                    static_cast<unsigned long>(frame));
-                break;
-            }
-
-            WriteBootSelectorTraceLine(
-                "[BOOT_ORIGIN] ebp[%02u] frame=%08lX "
-                "ret=%08lX%s next=%08lX\n",
-                depth,
-                static_cast<unsigned long>(frame),
-                static_cast<unsigned long>(returnAddress),
-                IsLikelyCodeAddress06(returnAddress)
-                    ? " EXE"
-                    : "",
-                static_cast<unsigned long>(nextFrame));
-
-            if (nextFrame <= frame ||
-                nextFrame - frame > 0x20000)
-            {
-                break;
-            }
-
-            frame = nextFrame;
-        }
-
-        void* frames[64] = {};
-        const USHORT captured =
-            CaptureStackBackTrace(
-                0,
-                static_cast<DWORD>(
-                    sizeof(frames) /
-                    sizeof(frames[0])),
-                frames,
-                nullptr);
-
-        WriteBootSelectorTraceLine(
-            "[BOOT_ORIGIN] capture count=%u\n",
-            static_cast<unsigned>(captured));
-
-        for (USHORT i = 0;
-             i < captured;
-             ++i)
-        {
-            const uintptr_t address =
-                reinterpret_cast<uintptr_t>(
-                    frames[i]);
-
-            WriteBootSelectorTraceLine(
-                "[BOOT_ORIGIN] capture[%02u]=%08lX%s\n",
-                static_cast<unsigned>(i),
-                static_cast<unsigned long>(address),
-                IsLikelyCodeAddress06(address)
-                    ? " EXE"
-                    : "");
-        }
-
-        WriteBootSelectorTraceLine(
-            "[BOOT_ORIGIN] end stage=%s\n",
-            stageName);
-    }
-
-    __declspec(naked) void BootRequestCtorTraceHook06()
-    {
-        __asm
-        {
-            // Hooked at 006DD8A8, immediately after sub_6DC39E.
-            // Live registers:
-            //   ESI = newly constructed request object
-            //   EBP = sub_6DD894 frame
-
-            pushfd
-            pushad
-
-            mov     eax, [esp + 4]    // saved ESI
-            mov     edx, [esp + 8]    // saved EBP
-            push    edx
-            push    eax
-            call    TraceBootRequestConstructed
-            add     esp, 8
-
-            popad
-            popfd
-
-            // Original bytes overwritten at 006DD8A8:
-            //   8B 45 08    mov eax,[ebp+08]
-            //   8B CE       mov ecx,esi
-            mov     eax, [ebp + 8]
-            mov     ecx, esi
-
-            jmp     kRequestCtorTraceResume06
-        }
-    }
-
-    bool InstallBootRequestCtorTraceHook06()
-    {
-        if (g_requestCtorTraceHookInstalled)
-            return true;
-
-        unsigned char* target =
-            reinterpret_cast<unsigned char*>(
-                kRequestCtorTracePatch06);
-
-        const unsigned char expected[5] =
-        {
-            0x8B, 0x45, 0x08,
-            0x8B, 0xCE
-        };
-
-        __try
-        {
-            if (std::memcmp(
-                    target,
-                    expected,
-                    sizeof(expected)) != 0)
-            {
-                Log(
-                    "[AutoStart06] Boot-origin constructor trace "
-                    "validation failed at %08X.\n",
-                    kRequestCtorTracePatch06);
-
-                return false;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
-
-        DWORD oldProtect = 0;
-
-        if (!VirtualProtect(
-                target,
-                sizeof(expected),
-                PAGE_EXECUTE_READWRITE,
-                &oldProtect))
-        {
-            return false;
-        }
-
-        target[0] = 0xE9;
-
-        *reinterpret_cast<int32_t*>(
-            target + 1) =
-            static_cast<int32_t>(
-                reinterpret_cast<uintptr_t>(
-                    &BootRequestCtorTraceHook06) -
-                (kRequestCtorTracePatch06 + 5));
-
-        DWORD ignored = 0;
-
-        VirtualProtect(
-            target,
-            sizeof(expected),
-            oldProtect,
-            &ignored);
-
-        FlushInstructionCache(
-            GetCurrentProcess(),
-            target,
-            sizeof(expected));
-
-        g_requestCtorTraceHookInstalled = true;
-
-        Log(
-            "[AutoStart06] Boot-origin request-constructor trace "
-            "installed at %08X.\n",
-            kRequestCtorTracePatch06);
-
-        return true;
-    }
-
-    void __cdecl RedirectBootPackageAtOpen(uintptr_t* entryStack)
+void __cdecl RedirectBootPackageAtOpen(uintptr_t* entryStack)
     {
         if (!entryStack)
             return;
@@ -1026,7 +215,7 @@ namespace
         }
     }
 
-    __declspec(naked) void BootOpenResolvedHook06()
+__declspec(naked) void BootOpenResolvedHook06()
     {
         __asm
         {
@@ -1045,7 +234,7 @@ namespace
         }
     }
 
-    bool InstallBootOpenResolvedHook06()
+bool InstallBootOpenResolvedHook06()
     {
         if (g_bootOpenResolvedHookInstalled)
             return true;
@@ -1186,19 +375,17 @@ namespace
 
         return true;
     }
-#else
-    bool InstallBootRequestCtorTraceHook06()
-    {
-        return false;
-    }
 
-    bool InstallBootOpenResolvedHook06()
-    {
-        return false;
-    }
 #endif
+#if defined(_M_IX86)
+#else
+bool InstallBootOpenResolvedHook06()
+    {
+        return false;
+    }
 
-    bool IsReadableCommittedProtection(DWORD protect)
+#endif
+bool IsReadableCommittedProtection(DWORD protect)
     {
         if (protect & (PAGE_GUARD | PAGE_NOACCESS))
             return false;
@@ -1214,7 +401,7 @@ namespace
                baseProtect == PAGE_EXECUTE_WRITECOPY;
     }
 
-    bool ReadRuntimeByte(
+bool ReadRuntimeByte(
         const unsigned char* address,
         unsigned char& value)
     {
@@ -1232,7 +419,7 @@ namespace
                bytesRead == sizeof(value);
     }
 
-    bool WriteRuntimeByte(
+bool WriteRuntimeByte(
         unsigned char* address,
         unsigned char value)
     {
@@ -1291,7 +478,7 @@ namespace
                bytesWritten == sizeof(value);
     }
 
-    void RestoreTitleMainMenuBranch()
+void RestoreTitleMainMenuBranch()
     {
         if (!g_titleBranchPatchCount)
             return;
@@ -1330,7 +517,7 @@ namespace
         g_titleBranchPatchCount = 0;
     }
 
-    bool PatchLiveTitleMainMenuBranch()
+bool PatchLiveTitleMainMenuBranch()
     {
         if (g_titleBranchPatchCount)
             return true;
@@ -1589,18 +776,7 @@ namespace
         return true;
     }
 
-    // Original 0x005CBA30:
-    //
-    //   mov ecx,[esp+4]
-    //   push 0                    ; STARTUP_SCREEN_MAINMENU
-    //   call 005C8C60
-    //   ret
-    //
-    // This function is called by the title/startup APT flow to obtain the
-    // destination screen. We preserve the stock MAINMENU return value and
-    // merely latch a one-shot request. The actual game-state transition is
-    // deferred until the current FESystem::Update() finishes.
-    void __cdecl GetStartupScreen_AutoStart(void* aptCall)
+void __cdecl GetStartupScreen_AutoStart(void* aptCall)
     {
         void* feSystem =
             *reinterpret_cast<void**>(kFESystemGlobal);
@@ -1677,15 +853,7 @@ namespace
                 0);
     }
 
-    // Replacement only for the GameDirector GD_FE_RUN call site at 005F6AAF.
-    // ABI at the original site:
-    //
-    //   ECX = FESystem*
-    //   push delta
-    //   call FESystem::Update
-    //
-    // A __fastcall wrapper preserves ECX and pops the single stack argument.
-    int __fastcall FESystemUpdate_AutoStart(
+int __fastcall FESystemUpdate_AutoStart(
         void* feSystem,
         void* /*edx*/,
         int delta)
@@ -1835,7 +1003,7 @@ namespace
         return kGDGameInit;
     }
 
-    bool VerifyOriginalBytes()
+bool VerifyOriginalBytes()
     {
         // 005CBA30:
         //   8B 4C 24 04 6A 00 ...
@@ -1883,10 +1051,13 @@ namespace
 
         return true;
     }
+
 }
+
 
 void InitializeAutoStartGame()
 {
+    using namespace autostartdetail;
     if (!IsLive06())
         return;
 

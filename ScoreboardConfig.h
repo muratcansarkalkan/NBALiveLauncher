@@ -146,6 +146,27 @@ struct Config {
     bool freezeWhilePaused;
 };
 
+
+struct PlayoffTextConfig {
+    char roundPlayoffs[64];
+    char roundECR1[64];
+    char roundWCR1[64];
+    char roundECSF[64];
+    char roundWCSF[64];
+    char roundECF[64];
+    char roundWCF[64];
+    char roundFinals[64];
+
+    char tied00[64];
+    char tied11[64];
+    char tied22[64];
+    char tied33[64];
+
+    char leadTemplate[96];
+};
+
+const PlayoffTextConfig& GetPlayoffText();
+
 const Config& Get();
 const Config& GetViolation();
 const Config& GetPlayCall();

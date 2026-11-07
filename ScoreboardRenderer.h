@@ -28,6 +28,18 @@ struct Frame {
     IDirect3DTexture9* homeLogo;
     const char* awayTeamName;
     const char* homeTeamName;
+
+    // Dynamic postseason presentation.
+    bool playoffActive;
+    int playoffStage;
+    const char* playoffRoundText;
+    const char* playoffSeriesText;
+    char playoffSeriesTextStorage[96];
+    int playoffSeriesGame;
+    int playoffHomeWins;
+    int playoffAwayWins;
+    IDirect3DTexture9* playoffRoundImage;
+    IDirect3DTexture9* playoffSeriesLeaderLogo;
     const char* violationTitle;
     const char* violationPossession;
     const char* violationTeamName;

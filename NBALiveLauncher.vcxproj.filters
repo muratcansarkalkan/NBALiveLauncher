@@ -54,22 +54,13 @@
     <ClCompile Include="ScoreboardConfig.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="StartupTeams.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="DebugConsole.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="MemoryUpgrader.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="StadiumConfig.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="JumbotronRuntime.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="CustomPaths.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="AntiAliasing.cpp">
@@ -91,6 +82,18 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="AutoStartGame.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="GameSetup.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Live07CleanupFix.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LoadingOptimization.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="StageSetup.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -141,6 +144,33 @@
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="AutoStartGame.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AutoStartInternal.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ControllerSetupInternal.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="GameSetup.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="GameStageInternal.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Live07CleanupFix.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="LoadingOptimization.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PracticeSetupInternal.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="StageSetup.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D3D9HookChain.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

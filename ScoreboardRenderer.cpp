@@ -907,6 +907,51 @@ bool ResolveLayerText(const scoreboardconfig::Element& element,
         output[0] = '\0';
         return true;
     }
+    if (std::strcmp(b, "playoff.roundText") == 0) {
+        if (!frame.playoffActive || !frame.playoffRoundText ||
+            !*frame.playoffRoundText)
+            return false;
+        std::snprintf(output, capacity, "%s", frame.playoffRoundText);
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strcmp(b, "playoff.seriesText") == 0) {
+        if (!frame.playoffActive || !frame.playoffSeriesText ||
+            !*frame.playoffSeriesText)
+            return false;
+        std::snprintf(output, capacity, "%s", frame.playoffSeriesText);
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strcmp(b, "playoff.active") == 0) {
+        std::snprintf(output, capacity, "%d", frame.playoffActive ? 1 : 0);
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strcmp(b, "playoff.stage") == 0) {
+        if (!frame.playoffActive) return false;
+        std::snprintf(output, capacity, "%d", frame.playoffStage);
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strcmp(b, "playoff.seriesGame") == 0) {
+        if (!frame.playoffActive || frame.playoffSeriesGame <= 0) return false;
+        std::snprintf(output, capacity, "%d", frame.playoffSeriesGame);
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strcmp(b, "playoff.homeWins") == 0) {
+        if (!frame.playoffActive) return false;
+        std::snprintf(output, capacity, "%d", frame.playoffHomeWins);
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
+    if (std::strcmp(b, "playoff.awayWins") == 0) {
+        if (!frame.playoffActive) return false;
+        std::snprintf(output, capacity, "%d", frame.playoffAwayWins);
+        *defaultHeight = style.teamNameHeight;
+        return true;
+    }
     if (std::strcmp(b, "away.score") == 0) {
         std::snprintf(output, capacity, "%d", frame.awayScore);
         *defaultHeight = style.scoreHeight; return true;
@@ -1026,6 +1071,10 @@ bool RenderGenericElements(IDirect3DDevice9* device,
             IDirect3DTexture9* texture = nullptr;
             if (std::strcmp(e.binding, "away.logo") == 0) texture = frame.awayLogo;
             else if (std::strcmp(e.binding, "home.logo") == 0) texture = frame.homeLogo;
+            else if (std::strcmp(e.binding, "playoff.roundImage") == 0)
+                texture = frame.playoffActive ? frame.playoffRoundImage : nullptr;
+            else if (std::strcmp(e.binding, "playoff.seriesLeaderLogo") == 0)
+                texture = frame.playoffActive ? frame.playoffSeriesLeaderLogo : nullptr;
             else if (std::strcmp(e.binding, "violation.teamLogo") == 0)
                 texture = frame.violationTeamLogo;
             else if (std::strcmp(e.binding, "stat.teamLogo") == 0)

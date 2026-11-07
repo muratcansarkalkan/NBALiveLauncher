@@ -19,6 +19,7 @@ Config g_outroConfig = {};
 Config g_lineupsConfig = {};
 Config g_playerFoulConfig = {};
 Config g_statConfig = {};
+PlayoffTextConfig g_playoffText = {};
 bool g_loaded = false;
 bool g_violationLoaded = false;
 bool g_playCallLoaded = false;
@@ -66,6 +67,63 @@ struct StatResolutionCacheEntry {
 std::vector<StatLayoutCacheEntry> g_statLayoutCache;
 std::vector<StatResolutionCacheEntry> g_statResolutionCache;
 
+
+
+void String(const std::string& json, const char* key,
+            char* output, size_t capacity, const char* fallback);
+
+void SetPlayoffTextDefaults(PlayoffTextConfig* c)
+{
+    std::memset(c, 0, sizeof(*c));
+    std::strcpy(c->roundPlayoffs, "NBA Playoffs");
+    std::strcpy(c->roundECR1, "Eastern Conference First Round");
+    std::strcpy(c->roundWCR1, "Western Conference First Round");
+    std::strcpy(c->roundECSF, "Eastern Conference Semifinals");
+    std::strcpy(c->roundWCSF, "Western Conference Semifinals");
+    std::strcpy(c->roundECF, "Eastern Conference Finals");
+    std::strcpy(c->roundWCF, "Western Conference Finals");
+    std::strcpy(c->roundFinals, "NBA Finals");
+
+    std::strcpy(c->tied00, "Series tied 0-0");
+    std::strcpy(c->tied11, "Series tied 1-1");
+    std::strcpy(c->tied22, "Series tied 2-2");
+    std::strcpy(c->tied33, "Series tied 3-3");
+
+    std::strcpy(c->leadTemplate,
+        "{TEAM} leads {LEADER_WINS}-{LOSER_WINS}");
+}
+
+void ParsePlayoffText(const std::string& json, PlayoffTextConfig* c)
+{
+    String(json, "roundPlayoffs", c->roundPlayoffs,
+        sizeof(c->roundPlayoffs), c->roundPlayoffs);
+    String(json, "roundECR1", c->roundECR1,
+        sizeof(c->roundECR1), c->roundECR1);
+    String(json, "roundWCR1", c->roundWCR1,
+        sizeof(c->roundWCR1), c->roundWCR1);
+    String(json, "roundECSF", c->roundECSF,
+        sizeof(c->roundECSF), c->roundECSF);
+    String(json, "roundWCSF", c->roundWCSF,
+        sizeof(c->roundWCSF), c->roundWCSF);
+    String(json, "roundECF", c->roundECF,
+        sizeof(c->roundECF), c->roundECF);
+    String(json, "roundWCF", c->roundWCF,
+        sizeof(c->roundWCF), c->roundWCF);
+    String(json, "roundFinals", c->roundFinals,
+        sizeof(c->roundFinals), c->roundFinals);
+
+    String(json, "seriesTied0-0", c->tied00,
+        sizeof(c->tied00), c->tied00);
+    String(json, "seriesTied1-1", c->tied11,
+        sizeof(c->tied11), c->tied11);
+    String(json, "seriesTied2-2", c->tied22,
+        sizeof(c->tied22), c->tied22);
+    String(json, "seriesTied3-3", c->tied33,
+        sizeof(c->tied33), c->tied33);
+
+    String(json, "seriesLeadTemplate", c->leadTemplate,
+        sizeof(c->leadTemplate), c->leadTemplate);
+}
 
 void SetDefaults(Config* c)
 {
@@ -697,6 +755,7 @@ void ClearStatCachesForTheme(const char* themeName)
 
 } // namespace
 
+const PlayoffTextConfig& GetPlayoffText() { return g_playoffText; }
 const Config& Get() { return g_config; }
 const Config& GetViolation() { return g_violationConfig; }
 const Config& GetPlayCall() { return g_playCallConfig; }
@@ -718,13 +777,32 @@ bool Load(const char* themeName)
     if (!ReadFile(path.c_str(), &json)) {
         std::snprintf(g_lastError, sizeof(g_lastError),
             "Could not read %s", path.c_str());
+        PlayoffTextConfig playoffText;
+        SetPlayoffTextDefaults(&playoffText);
+        std::string playoffPath = GameDirectory() + "\\assets\\popups\\" +
+            themeName + "\\scoreboard\\playoffs.json";
+        std::string playoffJson;
+        if (ReadFile(playoffPath.c_str(), &playoffJson))
+            ParsePlayoffText(playoffJson, &playoffText);
+        g_playoffText = playoffText;
+
         g_config = next;
         g_loaded = true;
         std::strncpy(g_theme, themeName, sizeof(g_theme) - 1);
         return false;
     }
     Parse(json, &next);
+
+    PlayoffTextConfig playoffText;
+    SetPlayoffTextDefaults(&playoffText);
+    std::string playoffPath = GameDirectory() + "\\assets\\popups\\" +
+        themeName + "\\scoreboard\\playoffs.json";
+    std::string playoffJson;
+    if (ReadFile(playoffPath.c_str(), &playoffJson))
+        ParsePlayoffText(playoffJson, &playoffText);
+
     g_config = next;
+    g_playoffText = playoffText;
     g_loaded = true;
     std::strncpy(g_theme, themeName, sizeof(g_theme) - 1);
     g_lastError[0] = '\0';

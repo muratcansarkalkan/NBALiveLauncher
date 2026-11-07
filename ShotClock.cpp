@@ -10,6 +10,7 @@
 #include <intrin.h>
 #include <climits>
 #include <TlHelp32.h>
+#include <ShlObj.h>
 #include <d3d9.h>
 #include "ScoreboardRenderer.h"
 #include "PopupTheme.h"
@@ -17,8 +18,11 @@
 #include "ScoreboardConfig.h"
 #include "StatOverlayTypes.h"
 #include "AntiAliasing.h"
+#include "D3D9HookChain.h"
+#include "GameSetup.h"
 
 #pragma comment(lib, "d3d9.lib")
+#pragma comment(lib, "shell32.lib")
 
 using namespace plugin;
 
@@ -109,6 +113,7 @@ void BuildLogPath(char* outPath, size_t outSize, const char* fileName)
 struct GdAI { void** __vtable; };
 struct GdInfoCentral;
 struct IDTeam { int value; };
+struct IDPlayer { int value; };
 struct BBallString { char* sharedstring; };
 
 using SendEventFn = int (__cdecl *)(
@@ -131,6 +136,65 @@ using BoxScoreInitFn = void (__thiscall *)(void*);
 using GetBoxScoreGameFn = void* (__thiscall *)(void*, int, int);
 using PlayerGameStatsGetStatFn = int (__thiscall *)(void*, int);
 using SubstitutionBuilderFn = bool (__thiscall *)(void*, DWORD*, DWORD*);
+
+// NBA Live 06 native DbInGameStats_Events accessors recovered from nbalive06.exe.
+// 0x004A8640 is a layered PLAYER-stat getter:
+//   short thiscall(this, statId, IDPlayer*, layer)
+// It is separate from the compact runtime-player getter used by boxscore.csv.
+using InGameGetPlayerLayerStatFn =
+    short (__thiscall *)(void*, int, const IDPlayer*, int);
+using InGameGetTeamLayerFn =
+    int (__thiscall *)(void*, const IDTeam*, int);
+using InGameGetTeamLeaderFn =
+    int (__thiscall *)(void*, int, const IDTeam*, IDPlayer*);
+
+enum Live06InGameStatRow {
+    LIVE06_GSC_STRENGTH = 0,
+    LIVE06_GSC_INJURY_TYPE = 1,
+    LIVE06_GSC_FOUL_OUT = 2,
+    LIVE06_GSC_3P_ATTP = 3,
+    LIVE06_GSC_3P_MADE = 4,
+    LIVE06_GSC_FG_ATTP = 5,
+    LIVE06_GSC_FG_MADE = 6,
+    LIVE06_GSC_FT_ATTP = 7,
+    LIVE06_GSC_FT_MADE = 8,
+    LIVE06_GSC_ASSISTS = 9,
+    LIVE06_GSC_BLOCKS = 10,
+    LIVE06_GSC_DEF_REB = 11,
+    LIVE06_GSC_PER_FOULS = 12,
+    LIVE06_GSC_OFF_REB = 13,
+    LIVE06_GSC_SECONDS = 14,
+    LIVE06_GSC_STEALS = 15,
+    LIVE06_GSC_TURNOVERS = 16,
+    LIVE06_GSC_POINTS = 17
+};
+
+enum Live06StatLayer {
+    LIVE06_SDL_GAME = 0,
+    LIVE06_SDL_QUARTER1 = 1,
+    LIVE06_SDL_QUARTER2 = 2,
+    LIVE06_SDL_QUARTER3 = 3,
+    LIVE06_SDL_QUARTER4 = 4,
+    LIVE06_SDL_OVERTIME = 12,
+    LIVE06_SDL_CURR_QUARTER = 13,
+    LIVE06_SDL_FIRST_HALF = 14,
+    LIVE06_SDL_SECOND_HALF = 15,
+    LIVE06_SDL_CURR_HALF = 16
+};
+
+enum Live06TeamLeaderStat {
+    LIVE06_GSC_LEAD_REBOUNDS = 0,
+    LIVE06_GSC_LEAD_OFF_REB = 1,
+    LIVE06_GSC_LEAD_DEF_REB = 2,
+    LIVE06_GSC_LEAD_FG_MADE = 3,
+    LIVE06_GSC_LEAD_FG_ATTP = 4,
+    LIVE06_GSC_LEAD_PTS = 5,
+    LIVE06_GSC_LEAD_ASSISTS = 6,
+    LIVE06_GSC_LEAD_STEALS = 7,
+    LIVE06_GSC_LEAD_MINS = 8,
+    LIVE06_GSC_LEAD_BLOCKS = 9,
+    LIVE06_GSC_LEAD_FG_PCT = 10
+};
 
 const GameAddresses* g_game = nullptr;
 SendEventFn g_originalSendEvent = nullptr;
@@ -374,8 +438,7 @@ using PresentFn = HRESULT (WINAPI *)(IDirect3DDevice9*, const RECT*,
     const RECT*, HWND, const RGNDATA*);
 
 Direct3DCreate9Fn g_originalDirect3DCreate9 = nullptr;
-PresentFn g_originalPresent = nullptr;
-void** g_hookedDeviceVtable = nullptr;
+bool g_presentHookInstalled = false;
 bool g_presentReached = false;
 HMODULE g_systemD3D9Module = nullptr;
 volatile LONG g_d3d9ProbeScheduled = 0;
@@ -522,6 +585,34 @@ LiveGameData08 g_liveGame08 = {};
 LiveGameData08 g_liveGame07 = {};
 LiveGameData08 g_liveGame06 = {};
 LiveGameData08 g_liveGame05 = {};
+
+struct Live06PeriodTracker {
+    bool initialized;
+    int lastRawQuarter;
+    int completedCount; // regulation quarter-end cumulative snapshots, max 4
+    LiveGameData08 completedCumulative[4];
+    int completedFastBreak[4][2];     // indexed by teamIndex
+    int completedSecondChance[4][2];  // indexed by teamIndex
+};
+
+Live06PeriodTracker g_live06Periods = {};
+
+struct Live06AutoBoxScoreState {
+    bool identityValid;
+    int homeTeamDBID;
+    int awayTeamDBID;
+    bool finalPending;
+    bool saved;
+    DWORD finalDetectedAt;
+    int finalRawQuarter;
+    int finalHomeScore;
+    int finalAwayScore;
+    unsigned int attempts;
+    char savedDirectory[MAX_PATH];
+};
+
+Live06AutoBoxScoreState g_live06AutoBoxScore = {};
+
 SubstitutionBuilderFn g_originalSubstitutionBuilder08 = nullptr;
 SubstitutionBuilderFn g_originalSubstitutionBuilder07 = nullptr;
 SubstitutionBuilderFn g_originalSubstitutionBuilder06 = nullptr;
@@ -535,6 +626,11 @@ bool g_lineupInitialized07 = false;
 bool g_onCourt06[2][12] = {};
 int g_courtSlot06[2][12] = {};
 bool g_lineupInitialized06 = false;
+// A successful substitution-presentation event updates the lineup cache
+// synchronously. This sequence lets StageSetup consume that event without
+// waiting for two independent scoreboard / overlay refreshes.
+DWORD g_lineupEventRevision06[2] = {};
+DWORD g_lineupEventTick06[2] = {};
 bool g_onCourt05[2][12] = {};
 int g_courtSlot05[2][12] = {};
 bool g_lineupInitialized05 = false;
@@ -2643,11 +2739,15 @@ bool FillLiveRuntimePlayerData07(LivePlayerData08& o, DWORD nativePlayerId, void
 void ResetLiveGameData06()
 {
     std::memset(&g_liveGame06, 0, sizeof(g_liveGame06));
+    std::memset(&g_live06Periods, 0, sizeof(g_live06Periods));
+    g_live06Periods.lastRawQuarter = INT_MIN;
     std::memset(g_onCourt06, 0, sizeof(g_onCourt06));
     for (int side = 0; side < 2; ++side)
         for (int slot = 0; slot < 12; ++slot)
             g_courtSlot06[side][slot] = -1;
     g_lineupInitialized06 = false;
+    std::memset(g_lineupEventRevision06, 0, sizeof(g_lineupEventRevision06));
+    std::memset(g_lineupEventTick06, 0, sizeof(g_lineupEventTick06));
     g_liveGame06.homeTeamIndex = g_liveGame06.awayTeamIndex = -1;
 }
 
@@ -2703,6 +2803,10 @@ void ApplySubstitutionToLiveLineup06(DWORD incomingId, DWORD outgoingId)
             static_cast<unsigned int>(outgoingId), outSide);
         return;
     }
+    // A repeated presentation payload is not a second gameplay substitution.
+    // Reject duplicates or reversed/stale pairs without touching the lineup.
+    if (g_onCourt06[inSide][inSlot] || !g_onCourt06[outSide][outSlot])
+        return;
     const int inheritedCourtSlot = g_courtSlot06[outSide][outSlot];
     if (inheritedCourtSlot < 0 || inheritedCourtSlot > 4) {
         AppendDiagnostic(
@@ -2718,6 +2822,10 @@ void ApplySubstitutionToLiveLineup06(DWORD incomingId, DWORD outgoingId)
     g_liveGame06.teams[outSide].players[outSlot].courtSlot = -1;
     g_liveGame06.teams[inSide].players[inSlot].onCourt = true;
     g_liveGame06.teams[inSide].players[inSlot].courtSlot = inheritedCourtSlot;
+    ++g_lineupEventRevision06[inSide];
+    if (!g_lineupEventRevision06[inSide])
+        ++g_lineupEventRevision06[inSide]; // zero = no event
+    g_lineupEventTick06[inSide] = GetTickCount();
     AppendDiagnostic(
         "NBA Live 06 live lineup substitution: side=%s courtSlot=%d outgoing native=%u rosterSlot=%d incoming native=%u rosterSlot=%d.\n",
         inSide == 0 ? "home" : "away", inheritedCourtSlot,
@@ -3286,6 +3394,958 @@ bool ExportBoxScoreCsv05()
     return true;
 }
 
+
+void* GetInGameStats06()
+{
+    if (!g_game || g_game->version != GameVersion::Live2006)
+        return nullptr;
+
+    __try {
+        // DbPointerMgr live-game stat state in NBA Live 06.
+        if (*reinterpret_cast<volatile unsigned char*>(0x00CB1D40) == 0)
+            return nullptr;
+        return *reinterpret_cast<void**>(0x00CB1D34);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+int GetNativePlayerLayerStat06(
+    void* inGameStats, int stat, const IDPlayer& player, int layer)
+{
+    if (!inGameStats || player.value <= 0)
+        return -1;
+
+    __try {
+        const auto fn =
+            reinterpret_cast<InGameGetPlayerLayerStatFn>(0x004A8640);
+        return static_cast<int>(fn(inGameStats, stat, &player, layer));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+int GetNativeFastBreakPoints06(
+    void* inGameStats, const IDTeam& team, int layer)
+{
+    if (!inGameStats) return -1;
+    __try {
+        const auto fn = reinterpret_cast<InGameGetTeamLayerFn>(0x00490050);
+        return fn(inGameStats, &team, layer);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+int GetGameplayFastBreakPoints06(int side)
+{
+    // PC NBA Live 06 gameplay state:
+    //
+    //   *(0x00D20640) + 0x160 = home TEAMDATA
+    //   *(0x00D20640) + 0x350 = away TEAMDATA
+    //
+    // Initialization at 0x0080C7C0 cross-links the first dword:
+    //
+    //   home->otherteam = away
+    //   away->otherteam = home
+    //
+    // The basket scorer at 0x008A2876 updates:
+    //
+    //   scoringTeam->otherteam->TotalFastBreakPoints += points
+    //
+    // and the MM06 debug TEAMDATA layout identifies
+    // TotalFastBreakPoints at +0x11C. Therefore the points SCORED by home
+    // live in away+0x11C, and the points SCORED by away live in home+0x11C.
+    if (!g_game || g_game->version != GameVersion::Live2006 ||
+        side < 0 || side > 1)
+        return -1;
+
+    __try {
+        unsigned char* gameBase =
+            *reinterpret_cast<unsigned char**>(0x00D20640);
+        if (!gameBase)
+            return -1;
+
+        unsigned char* home = gameBase + 0x160;
+        unsigned char* away = gameBase + 0x350;
+
+        // Validate the structure before trusting the offsets.
+        void* homeOther = *reinterpret_cast<void**>(home + 0x00);
+        void* awayOther = *reinterpret_cast<void**>(away + 0x00);
+        if (homeOther != away || awayOther != home) {
+            AppendDiagnostic(
+                "NBA Live 06 gameplay fast-break layout validation failed: "
+                "base=%p home=%p homeOther=%p away=%p awayOther=%p.\n",
+                gameBase, home, homeOther, away, awayOther);
+            return -1;
+        }
+
+        // TEAMDATA score is +0x126. These are diagnostic sanity values only;
+        // the official scoreboard continues using GdInfoCentral.
+        const unsigned int homeGameplayScore =
+            static_cast<unsigned int>(
+                *reinterpret_cast<const unsigned short*>(home + 0x126));
+        const unsigned int awayGameplayScore =
+            static_cast<unsigned int>(
+                *reinterpret_cast<const unsigned short*>(away + 0x126));
+
+        unsigned char* storageTeam = side == 0 ? away : home;
+        const int value =
+            *reinterpret_cast<const int*>(storageTeam + 0x11C);
+
+        if (value < 0 || value > 1000) {
+            AppendDiagnostic(
+                "NBA Live 06 gameplay fast-break value rejected: "
+                "side=%s value=%d gameplayScore(home=%u away=%u).\n",
+                side == 0 ? "home" : "away",
+                value, homeGameplayScore, awayGameplayScore);
+            return -1;
+        }
+
+        return value;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+int GetNativeSecondChancePoints06(
+    void* inGameStats, const IDTeam& team, int layer)
+{
+    if (!inGameStats) return -1;
+    __try {
+        const auto fn = reinterpret_cast<InGameGetTeamLayerFn>(0x004901F0);
+        return fn(inGameStats, &team, layer);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+int GetNativeTeamLeader06(
+    void* inGameStats, int category, const IDTeam& team, IDPlayer* player)
+{
+    if (!inGameStats || !player) return -1;
+    player->value = -1;
+    __try {
+        const auto fn = reinterpret_cast<InGameGetTeamLeaderFn>(0x004904A0);
+        return fn(inGameStats, category, &team, player);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        player->value = -1;
+        return -1;
+    }
+}
+
+double StatPercent06(int made, int attempts)
+{
+    return attempts > 0
+        ? (100.0 * static_cast<double>(made) /
+           static_cast<double>(attempts))
+        : 0.0;
+}
+
+const char* GetLive06LeaderName(int category)
+{
+    switch (category) {
+    case LIVE06_GSC_LEAD_REBOUNDS: return "rebounds";
+    case LIVE06_GSC_LEAD_OFF_REB: return "offensive_rebounds";
+    case LIVE06_GSC_LEAD_DEF_REB: return "defensive_rebounds";
+    case LIVE06_GSC_LEAD_FG_MADE: return "fg_made";
+    case LIVE06_GSC_LEAD_FG_ATTP: return "fg_attempts";
+    case LIVE06_GSC_LEAD_PTS: return "points";
+    case LIVE06_GSC_LEAD_ASSISTS: return "assists";
+    case LIVE06_GSC_LEAD_STEALS: return "steals";
+    case LIVE06_GSC_LEAD_MINS: return "minutes";
+    case LIVE06_GSC_LEAD_BLOCKS: return "blocks";
+    case LIVE06_GSC_LEAD_FG_PCT: return "fg_pct";
+    default: return "unknown";
+    }
+}
+
+const LivePlayerData08* ResolveNativeLeaderPlayer06(
+    int side, int leaderId, int& rosterSlot)
+{
+    rosterSlot = -1;
+    if (side < 0 || side > 1 || leaderId < 0)
+        return nullptr;
+
+    const int teamIndex = side == 0
+        ? g_liveGame06.homeTeamIndex : g_liveGame06.awayTeamIndex;
+    if (teamIndex < 0 || teamIndex > 1)
+        return nullptr;
+
+    const auto& team = g_liveGame06.teams[teamIndex];
+    for (int i = 0; i < 12; ++i) {
+        const auto& p = team.players[i];
+        if (!p.valid) continue;
+        if (p.nativePlayerId == leaderId ||
+            p.databasePlayerId == leaderId) {
+            rosterSlot = i;
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
+
+struct Live06TeamBoxTotals {
+    int fgm;
+    int fga;
+    int threePm;
+    int threePa;
+    int ftm;
+    int fta;
+    int oreb;
+    int dreb;
+    int ast;
+    int stl;
+    int blk;
+    int turnovers;
+    int fouls;
+    int minutes;
+    int points;
+};
+
+Live06TeamBoxTotals SumCachedTeamTotals06(int teamIndex)
+{
+    Live06TeamBoxTotals totals = {};
+    if (teamIndex < 0 || teamIndex > 1)
+        return totals;
+
+    const auto& team = g_liveGame06.teams[teamIndex];
+    for (int slot = 0; slot < 12; ++slot) {
+        const auto& p = team.players[slot];
+        if (!p.valid)
+            continue;
+
+        totals.fgm += p.fgMade;
+        totals.fga += p.fgAttempts;
+        totals.threePm += p.threeMade;
+        totals.threePa += p.threeAttempts;
+        totals.ftm += p.ftMade;
+        totals.fta += p.ftAttempts;
+        totals.oreb += p.offensiveRebounds;
+        totals.dreb += p.defensiveRebounds;
+        totals.ast += p.assists;
+        totals.stl += p.steals;
+        totals.blk += p.blocks;
+        totals.turnovers += p.turnovers;
+        totals.fouls += p.fouls;
+        totals.minutes += p.minutes;
+        totals.points += p.points;
+    }
+    return totals;
+}
+
+
+Live06TeamBoxTotals SumTeamTotalsFromGame06(
+    const LiveGameData08& game, int teamIndex)
+{
+    Live06TeamBoxTotals totals = {};
+    if (teamIndex < 0 || teamIndex > 1)
+        return totals;
+
+    const auto& team = game.teams[teamIndex];
+    for (int slot = 0; slot < 12; ++slot) {
+        const auto& p = team.players[slot];
+        if (!p.valid)
+            continue;
+
+        totals.fgm += p.fgMade;
+        totals.fga += p.fgAttempts;
+        totals.threePm += p.threeMade;
+        totals.threePa += p.threeAttempts;
+        totals.ftm += p.ftMade;
+        totals.fta += p.ftAttempts;
+        totals.oreb += p.offensiveRebounds;
+        totals.dreb += p.defensiveRebounds;
+        totals.ast += p.assists;
+        totals.stl += p.steals;
+        totals.blk += p.blocks;
+        totals.turnovers += p.turnovers;
+        totals.fouls += p.fouls;
+        totals.minutes += p.minutes;
+        totals.points += p.points;
+    }
+    return totals;
+}
+
+Live06TeamBoxTotals PlayerTotalsFromGame06(
+    const LiveGameData08& game, int teamIndex, int rosterSlot)
+{
+    Live06TeamBoxTotals totals = {};
+    if (teamIndex < 0 || teamIndex > 1 ||
+        rosterSlot < 0 || rosterSlot >= 12)
+        return totals;
+
+    const auto& p = game.teams[teamIndex].players[rosterSlot];
+    if (!p.valid)
+        return totals;
+
+    totals.fgm = p.fgMade;
+    totals.fga = p.fgAttempts;
+    totals.threePm = p.threeMade;
+    totals.threePa = p.threeAttempts;
+    totals.ftm = p.ftMade;
+    totals.fta = p.ftAttempts;
+    totals.oreb = p.offensiveRebounds;
+    totals.dreb = p.defensiveRebounds;
+    totals.ast = p.assists;
+    totals.stl = p.steals;
+    totals.blk = p.blocks;
+    totals.turnovers = p.turnovers;
+    totals.fouls = p.fouls;
+    totals.minutes = p.minutes;
+    totals.points = p.points;
+    return totals;
+}
+
+Live06TeamBoxTotals SubtractBoxTotals06(
+    const Live06TeamBoxTotals& a,
+    const Live06TeamBoxTotals& b)
+{
+    Live06TeamBoxTotals r = {};
+    r.fgm = a.fgm - b.fgm;
+    r.fga = a.fga - b.fga;
+    r.threePm = a.threePm - b.threePm;
+    r.threePa = a.threePa - b.threePa;
+    r.ftm = a.ftm - b.ftm;
+    r.fta = a.fta - b.fta;
+    r.oreb = a.oreb - b.oreb;
+    r.dreb = a.dreb - b.dreb;
+    r.ast = a.ast - b.ast;
+    r.stl = a.stl - b.stl;
+    r.blk = a.blk - b.blk;
+    r.turnovers = a.turnovers - b.turnovers;
+    r.fouls = a.fouls - b.fouls;
+    r.minutes = a.minutes - b.minutes;
+    r.points = a.points - b.points;
+    return r;
+}
+
+Live06TeamBoxTotals GetCompletedCumulativeTeamTotals06(
+    int completedIndex, int teamIndex)
+{
+    if (completedIndex < 0 ||
+        completedIndex >= g_live06Periods.completedCount ||
+        completedIndex >= 4)
+        return Live06TeamBoxTotals{};
+
+    return SumTeamTotalsFromGame06(
+        g_live06Periods.completedCumulative[completedIndex],
+        teamIndex);
+}
+
+Live06TeamBoxTotals GetCompletedCumulativePlayerTotals06(
+    int completedIndex, int teamIndex, int rosterSlot)
+{
+    if (completedIndex < 0 ||
+        completedIndex >= g_live06Periods.completedCount ||
+        completedIndex >= 4)
+        return Live06TeamBoxTotals{};
+
+    return PlayerTotalsFromGame06(
+        g_live06Periods.completedCumulative[completedIndex],
+        teamIndex, rosterSlot);
+}
+
+enum Live06DerivedPeriod {
+    LIVE06_PERIOD_GAME = 0,
+    LIVE06_PERIOD_Q1,
+    LIVE06_PERIOD_Q2,
+    LIVE06_PERIOD_Q3,
+    LIVE06_PERIOD_Q4,
+    LIVE06_PERIOD_OT,
+    LIVE06_PERIOD_CURRENT,
+    LIVE06_PERIOD_FIRST_HALF,
+    LIVE06_PERIOD_SECOND_HALF
+};
+
+const char* GetLive06DerivedPeriodName(Live06DerivedPeriod period)
+{
+    switch (period) {
+    case LIVE06_PERIOD_GAME: return "game";
+    case LIVE06_PERIOD_Q1: return "q1";
+    case LIVE06_PERIOD_Q2: return "q2";
+    case LIVE06_PERIOD_Q3: return "q3";
+    case LIVE06_PERIOD_Q4: return "q4";
+    case LIVE06_PERIOD_OT: return "ot";
+    case LIVE06_PERIOD_CURRENT: return "current_quarter";
+    case LIVE06_PERIOD_FIRST_HALF: return "first_half";
+    case LIVE06_PERIOD_SECOND_HALF: return "second_half";
+    default: return "unknown";
+    }
+}
+
+Live06TeamBoxTotals GetDerivedPeriodTotals06(
+    Live06DerivedPeriod period,
+    const Live06TeamBoxTotals& current,
+    const Live06TeamBoxTotals completed[4],
+    int completedCount)
+{
+    const Live06TeamBoxTotals zero = {};
+
+    switch (period) {
+    case LIVE06_PERIOD_GAME:
+        return current;
+
+    case LIVE06_PERIOD_Q1:
+        if (completedCount >= 1) return completed[0];
+        return current;
+
+    case LIVE06_PERIOD_Q2:
+        if (completedCount >= 2)
+            return SubtractBoxTotals06(completed[1], completed[0]);
+        if (completedCount == 1)
+            return SubtractBoxTotals06(current, completed[0]);
+        return zero;
+
+    case LIVE06_PERIOD_Q3:
+        if (completedCount >= 3)
+            return SubtractBoxTotals06(completed[2], completed[1]);
+        if (completedCount == 2)
+            return SubtractBoxTotals06(current, completed[1]);
+        return zero;
+
+    case LIVE06_PERIOD_Q4:
+        if (completedCount >= 4)
+            return SubtractBoxTotals06(completed[3], completed[2]);
+        if (completedCount == 3)
+            return SubtractBoxTotals06(current, completed[2]);
+        return zero;
+
+    case LIVE06_PERIOD_OT:
+        if (completedCount >= 4)
+            return SubtractBoxTotals06(current, completed[3]);
+        return zero;
+
+    case LIVE06_PERIOD_CURRENT:
+        if (completedCount <= 0)
+            return current;
+        if (completedCount >= 4)
+            return SubtractBoxTotals06(current, completed[3]);
+        return SubtractBoxTotals06(
+            current, completed[completedCount - 1]);
+
+    case LIVE06_PERIOD_FIRST_HALF:
+        if (completedCount >= 2)
+            return completed[1];
+        return current;
+
+    case LIVE06_PERIOD_SECOND_HALF:
+        if (completedCount < 2)
+            return zero;
+        if (completedCount >= 4)
+            return SubtractBoxTotals06(completed[3], completed[1]);
+        return SubtractBoxTotals06(current, completed[1]);
+
+    default:
+        return zero;
+    }
+}
+
+int SafeSpecialDelta06(int current, int previous)
+{
+    if (current < 0 || previous < 0)
+        return -1;
+    return current - previous;
+}
+
+int GetDerivedSpecial06(
+    Live06DerivedPeriod period,
+    int current,
+    const int completed[4],
+    int completedCount)
+{
+    switch (period) {
+    case LIVE06_PERIOD_GAME:
+        return current;
+
+    case LIVE06_PERIOD_Q1:
+        return completedCount >= 1 ? completed[0] : current;
+
+    case LIVE06_PERIOD_Q2:
+        if (completedCount >= 2)
+            return SafeSpecialDelta06(completed[1], completed[0]);
+        if (completedCount == 1)
+            return SafeSpecialDelta06(current, completed[0]);
+        return 0;
+
+    case LIVE06_PERIOD_Q3:
+        if (completedCount >= 3)
+            return SafeSpecialDelta06(completed[2], completed[1]);
+        if (completedCount == 2)
+            return SafeSpecialDelta06(current, completed[1]);
+        return 0;
+
+    case LIVE06_PERIOD_Q4:
+        if (completedCount >= 4)
+            return SafeSpecialDelta06(completed[3], completed[2]);
+        if (completedCount == 3)
+            return SafeSpecialDelta06(current, completed[2]);
+        return 0;
+
+    case LIVE06_PERIOD_OT:
+        return completedCount >= 4
+            ? SafeSpecialDelta06(current, completed[3]) : 0;
+
+    case LIVE06_PERIOD_CURRENT:
+        if (completedCount <= 0)
+            return current;
+        if (completedCount >= 4)
+            return SafeSpecialDelta06(current, completed[3]);
+        return SafeSpecialDelta06(
+            current, completed[completedCount - 1]);
+
+    case LIVE06_PERIOD_FIRST_HALF:
+        return completedCount >= 2 ? completed[1] : current;
+
+    case LIVE06_PERIOD_SECOND_HALF:
+        if (completedCount < 2)
+            return 0;
+        if (completedCount >= 4)
+            return SafeSpecialDelta06(completed[3], completed[1]);
+        return SafeSpecialDelta06(current, completed[1]);
+
+    default:
+        return -1;
+    }
+}
+
+void UpdateLive06PeriodTracker(const ExtendedState& state)
+{
+    if (!g_game || g_game->version != GameVersion::Live2006 ||
+        !g_liveGame06.valid)
+        return;
+
+    if (!g_live06Periods.initialized) {
+        g_live06Periods.initialized = true;
+        g_live06Periods.lastRawQuarter = state.quarter;
+        g_live06Periods.completedCount = 0;
+        AppendDiagnostic(
+            "NBA Live 06 period tracker initialized: rawQuarter=%d.\n",
+            state.quarter);
+        return;
+    }
+
+    if (state.quarter == g_live06Periods.lastRawQuarter)
+        return;
+
+    // A decreasing quarter value is a new-game/restart signal.
+    if (state.quarter < g_live06Periods.lastRawQuarter) {
+        const int newQuarter = state.quarter;
+        std::memset(&g_live06Periods, 0, sizeof(g_live06Periods));
+        g_live06Periods.initialized = true;
+        g_live06Periods.lastRawQuarter = newQuarter;
+        AppendDiagnostic(
+            "NBA Live 06 period tracker reset by quarter rollback: "
+            "newRawQuarter=%d.\n",
+            newQuarter);
+        return;
+    }
+
+    // On the first frame of the new quarter the normal player cache is still
+    // cumulative for the game, which is exactly the end-of-previous-quarter
+    // snapshot we need. Store only regulation quarter boundaries; all
+    // overtime periods are aggregated as current minus end-Q4.
+    if (g_live06Periods.completedCount < 4) {
+        const int snapshotIndex = g_live06Periods.completedCount;
+        g_live06Periods.completedCumulative[snapshotIndex] = g_liveGame06;
+
+        void* inGameStats = GetInGameStats06();
+        for (int side = 0; side < 2; ++side) {
+            const bool home = side == 0;
+            const int teamIndex = home
+                ? g_liveGame06.homeTeamIndex : g_liveGame06.awayTeamIndex;
+            if (teamIndex < 0 || teamIndex > 1)
+                continue;
+
+            const IDTeam team = GetTeamIDFromSide(side);
+            g_live06Periods.completedFastBreak[snapshotIndex][teamIndex] =
+                GetGameplayFastBreakPoints06(side);
+            g_live06Periods.completedSecondChance[snapshotIndex][teamIndex] =
+                inGameStats
+                    ? GetNativeSecondChancePoints06(
+                        inGameStats, team, LIVE06_SDL_GAME)
+                    : -1;
+        }
+
+        ++g_live06Periods.completedCount;
+
+        AppendDiagnostic(
+            "NBA Live 06 period snapshot captured: completed=%d "
+            "rawQuarter=%d->%d homePTS=%d awayPTS=%d.\n",
+            g_live06Periods.completedCount,
+            g_live06Periods.lastRawQuarter,
+            state.quarter,
+            SumTeamTotalsFromGame06(
+                g_liveGame06, g_liveGame06.homeTeamIndex).points,
+            SumTeamTotalsFromGame06(
+                g_liveGame06, g_liveGame06.awayTeamIndex).points);
+    }
+
+    g_live06Periods.lastRawQuarter = state.quarter;
+}
+
+bool ExportNativeTeamStatsCsv06(void* inGameStats)
+{
+    if (!inGameStats) return false;
+
+    FILE* f = std::fopen("boxscore_team.csv", "w");
+    if (!f) return false;
+
+    std::fputs(
+        "side,team_index,database_team_id,native_team_id,score,"
+        "fgm,fga,fg_pct,3pm,3pa,3p_pct,ftm,fta,ft_pct,"
+        "oreb,dreb,reb,ast,stl,blk,to,total_personal_fouls,"
+        "total_player_seconds,total_player_minutes,"
+        "current_period_team_fouls,timeouts_left,"
+        "fast_break_points,second_chance_points\n", f);
+
+    GdInfoCentral* info = GetGdInfoCentral();
+
+    // Native side convention: 0=home, 1=away.
+    for (int side = 0; side < 2; ++side) {
+        const bool home = side == 0;
+        const IDTeam nativeTeam = GetTeamIDFromSide(side);
+        const int teamIndex = home
+            ? g_liveGame06.homeTeamIndex : g_liveGame06.awayTeamIndex;
+        if (teamIndex < 0 || teamIndex > 1)
+            continue;
+
+        const int databaseTeamId = g_liveGame06.teams[teamIndex].teamId;
+        const Live06TeamBoxTotals totals =
+            SumCachedTeamTotals06(teamIndex);
+
+        // The compact runtime cache exposes proven whole-minute totals.
+        // Avoid the unproven layered-ID path here.
+        const int seconds = totals.minutes * 60;
+
+        const int score = info ? GetTeamScore(info, side) : totals.points;
+        const int teamFouls = GetOptionalTeamValue(
+            g_game->getTeamFouls, nativeTeam);
+        const int timeouts = GetOptionalTeamValue(
+            g_game->getTeamTimeoutsLeft, nativeTeam);
+        const int fastBreak = GetGameplayFastBreakPoints06(side);
+        const int nativeEventFastBreak = GetNativeFastBreakPoints06(
+            inGameStats, nativeTeam, LIVE06_SDL_GAME);
+        const int secondChance = GetNativeSecondChancePoints06(
+            inGameStats, nativeTeam, LIVE06_SDL_GAME);
+
+        AppendDiagnostic(
+            "NBA Live 06 fast-break totals: side=%s teamIndex=%d "
+            "gameplay=%d dbInGameStats=%d secondChance=%d.\n",
+            home ? "home" : "away",
+            teamIndex, fastBreak, nativeEventFastBreak, secondChance);
+
+        std::fprintf(
+            f,
+            "%s,%d,%d,%d,%d,"
+            "%d,%d,%.3f,%d,%d,%.3f,%d,%d,%.3f,"
+            "%d,%d,%d,%d,%d,%d,%d,%d,"
+            "%d,%.3f,%d,%d,%d,%d\n",
+            home ? "home" : "away",
+            teamIndex,
+            databaseTeamId,
+            nativeTeam.value,
+            score,
+            totals.fgm, totals.fga,
+            StatPercent06(totals.fgm, totals.fga),
+            totals.threePm, totals.threePa,
+            StatPercent06(totals.threePm, totals.threePa),
+            totals.ftm, totals.fta,
+            StatPercent06(totals.ftm, totals.fta),
+            totals.oreb, totals.dreb, totals.oreb + totals.dreb,
+            totals.ast, totals.stl, totals.blk,
+            totals.turnovers, totals.fouls,
+            seconds,
+            seconds >= 0 ? static_cast<double>(seconds) / 60.0 : -1.0,
+            teamFouls,
+            timeouts,
+            fastBreak,
+            secondChance);
+    }
+
+    std::fclose(f);
+    AppendDiagnostic(
+        "NBA Live 06 team stats exported: boxscore_team.csv "
+        "(ordinary totals=player cache; fastBreak=gameplay TEAMDATA; "
+        "secondChance=native game stats).\n");
+    return true;
+}
+
+bool ExportNativePeriodStatsCsv06(void* inGameStats)
+{
+    if (!g_liveGame06.valid)
+        return false;
+
+    FILE* f = std::fopen("boxscore_periods.csv", "w");
+    if (!f)
+        return false;
+
+    std::fputs(
+        "side,team_index,database_team_id,native_team_id,"
+        "period,completed_quarter_snapshots,raw_quarter,"
+        "points,fgm,fga,fg_pct,3pm,3pa,3p_pct,ftm,fta,ft_pct,"
+        "oreb,dreb,reb,ast,stl,blk,to,pf,total_player_minutes,"
+        "fast_break_points,second_chance_points\n", f);
+
+    static const Live06DerivedPeriod periods[] = {
+        LIVE06_PERIOD_GAME,
+        LIVE06_PERIOD_Q1,
+        LIVE06_PERIOD_Q2,
+        LIVE06_PERIOD_Q3,
+        LIVE06_PERIOD_Q4,
+        LIVE06_PERIOD_OT,
+        LIVE06_PERIOD_CURRENT,
+        LIVE06_PERIOD_FIRST_HALF,
+        LIVE06_PERIOD_SECOND_HALF
+    };
+
+    for (int side = 0; side < 2; ++side) {
+        const bool home = side == 0;
+        const int teamIndex = home
+            ? g_liveGame06.homeTeamIndex : g_liveGame06.awayTeamIndex;
+        if (teamIndex < 0 || teamIndex > 1)
+            continue;
+
+        const IDTeam nativeTeam = GetTeamIDFromSide(side);
+        const int databaseTeamId = g_liveGame06.teams[teamIndex].teamId;
+        const Live06TeamBoxTotals current =
+            SumTeamTotalsFromGame06(g_liveGame06, teamIndex);
+
+        Live06TeamBoxTotals completed[4] = {};
+        int completedFastBreak[4] = {};
+        int completedSecondChance[4] = {};
+        for (int i = 0; i < g_live06Periods.completedCount && i < 4; ++i) {
+            completed[i] =
+                GetCompletedCumulativeTeamTotals06(i, teamIndex);
+            completedFastBreak[i] =
+                g_live06Periods.completedFastBreak[i][teamIndex];
+            completedSecondChance[i] =
+                g_live06Periods.completedSecondChance[i][teamIndex];
+        }
+
+        const int currentFastBreak =
+            GetGameplayFastBreakPoints06(side);
+        const int currentSecondChance =
+            inGameStats
+                ? GetNativeSecondChancePoints06(
+                    inGameStats, nativeTeam, LIVE06_SDL_GAME)
+                : -1;
+
+        for (const auto period : periods) {
+            const Live06TeamBoxTotals v =
+                GetDerivedPeriodTotals06(
+                    period, current, completed,
+                    g_live06Periods.completedCount);
+
+            const int fastBreak =
+                GetDerivedSpecial06(
+                    period, currentFastBreak, completedFastBreak,
+                    g_live06Periods.completedCount);
+            const int secondChance =
+                GetDerivedSpecial06(
+                    period, currentSecondChance, completedSecondChance,
+                    g_live06Periods.completedCount);
+
+            std::fprintf(
+                f,
+                "%s,%d,%d,%d,%s,%d,%d,"
+                "%d,%d,%d,%.3f,%d,%d,%.3f,%d,%d,%.3f,"
+                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                home ? "home" : "away",
+                teamIndex,
+                databaseTeamId,
+                nativeTeam.value,
+                GetLive06DerivedPeriodName(period),
+                g_live06Periods.completedCount,
+                g_live06Periods.lastRawQuarter,
+                v.points,
+                v.fgm, v.fga, StatPercent06(v.fgm, v.fga),
+                v.threePm, v.threePa,
+                StatPercent06(v.threePm, v.threePa),
+                v.ftm, v.fta, StatPercent06(v.ftm, v.fta),
+                v.oreb, v.dreb, v.oreb + v.dreb,
+                v.ast, v.stl, v.blk, v.turnovers, v.fouls,
+                v.minutes,
+                fastBreak,
+                secondChance);
+        }
+    }
+
+    std::fclose(f);
+    AppendDiagnostic(
+        "NBA Live 06 period stats exported: boxscore_periods.csv "
+        "(quarter-transition cumulative snapshots, completed=%d rawQuarter=%d).\n",
+        g_live06Periods.completedCount,
+        g_live06Periods.lastRawQuarter);
+    return true;
+}
+
+bool ExportPlayerPeriodStatsCsv06()
+{
+    if (!g_liveGame06.valid)
+        return false;
+
+    FILE* f = std::fopen("boxscore_player_periods.csv", "w");
+    if (!f)
+        return false;
+
+    std::fputs(
+        "side,team_index,team_id,roster_slot,runtime_player_id,"
+        "database_player_id,first_name,last_name,jersey,"
+        "period,completed_quarter_snapshots,raw_quarter,"
+        "fgm,fga,3pm,3pa,ftm,fta,oreb,dreb,reb,blk,stl,ast,to,pf,"
+        "minutes_rounded,points\n", f);
+
+    static const Live06DerivedPeriod periods[] = {
+        LIVE06_PERIOD_GAME,
+        LIVE06_PERIOD_Q1,
+        LIVE06_PERIOD_Q2,
+        LIVE06_PERIOD_Q3,
+        LIVE06_PERIOD_Q4,
+        LIVE06_PERIOD_OT,
+        LIVE06_PERIOD_CURRENT,
+        LIVE06_PERIOD_FIRST_HALF,
+        LIVE06_PERIOD_SECOND_HALF
+    };
+
+    for (int side = 0; side < 2; ++side) {
+        const bool home = side == 0;
+        const int teamIndex = home
+            ? g_liveGame06.homeTeamIndex : g_liveGame06.awayTeamIndex;
+        if (teamIndex < 0 || teamIndex > 1)
+            continue;
+
+        const auto& team = g_liveGame06.teams[teamIndex];
+
+        for (int slot = 0; slot < 12; ++slot) {
+            const auto& p = team.players[slot];
+            if (!p.valid)
+                continue;
+
+            const Live06TeamBoxTotals current =
+                PlayerTotalsFromGame06(g_liveGame06, teamIndex, slot);
+
+            Live06TeamBoxTotals completed[4] = {};
+            for (int i = 0; i < g_live06Periods.completedCount && i < 4; ++i) {
+                completed[i] =
+                    GetCompletedCumulativePlayerTotals06(
+                        i, teamIndex, slot);
+            }
+
+            for (const auto period : periods) {
+                const Live06TeamBoxTotals v =
+                    GetDerivedPeriodTotals06(
+                        period, current, completed,
+                        g_live06Periods.completedCount);
+
+                std::fprintf(
+                    f, "%s,%d,%d,%d,%d,%d,",
+                    home ? "home" : "away",
+                    teamIndex,
+                    team.teamId,
+                    slot,
+                    p.nativePlayerId,
+                    p.databasePlayerId);
+                WriteCsvQuoted08(f, p.firstName);
+                std::fputc(',', f);
+                WriteCsvQuoted08(f, p.lastName);
+                std::fprintf(
+                    f,
+                    ",%d,%s,%d,%d,"
+                    "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                    p.jerseyNumber,
+                    GetLive06DerivedPeriodName(period),
+                    g_live06Periods.completedCount,
+                    g_live06Periods.lastRawQuarter,
+                    v.fgm, v.fga,
+                    v.threePm, v.threePa,
+                    v.ftm, v.fta,
+                    v.oreb, v.dreb, v.oreb + v.dreb,
+                    v.blk, v.stl, v.ast, v.turnovers, v.fouls,
+                    v.minutes, v.points);
+            }
+        }
+    }
+
+    std::fclose(f);
+    AppendDiagnostic(
+        "NBA Live 06 player period stats exported: "
+        "boxscore_player_periods.csv.\n");
+    return true;
+}
+
+bool ExportNativeTeamLeadersCsv06(void* inGameStats)
+{
+    if (!inGameStats) return false;
+
+    FILE* f = std::fopen("boxscore_leaders.csv", "w");
+    if (!f) return false;
+
+    std::fputs(
+        "side,database_team_id,native_team_id,category,category_id,"
+        "leader_player_id,leader_value,roster_slot,runtime_player_id,"
+        "database_player_id,first_name,last_name,jersey\n", f);
+
+    for (int side = 0; side < 2; ++side) {
+        const bool home = side == 0;
+        const IDTeam nativeTeam = GetTeamIDFromSide(side);
+        const int teamIndex = home
+            ? g_liveGame06.homeTeamIndex : g_liveGame06.awayTeamIndex;
+        if (teamIndex < 0 || teamIndex > 1)
+            continue;
+        const int databaseTeamId = g_liveGame06.teams[teamIndex].teamId;
+
+        for (int category = LIVE06_GSC_LEAD_REBOUNDS;
+             category <= LIVE06_GSC_LEAD_FG_PCT;
+             ++category) {
+            IDPlayer leader = {};
+            leader.value = -1;
+            const int nativeValue = GetNativeTeamLeader06(
+                inGameStats, category, nativeTeam, &leader);
+
+            int rosterSlot = -1;
+            const LivePlayerData08* p = ResolveNativeLeaderPlayer06(
+                side, leader.value, rosterSlot);
+
+            // The native minutes leader identifies the correct player but its
+            // returned value is not the displayed whole-minute value. Export
+            // the proven runtime-player minute field for that category.
+            const int value =
+                category == LIVE06_GSC_LEAD_MINS && p
+                    ? p->minutes : nativeValue;
+
+            std::fprintf(
+                f, "%s,%d,%d,%s,%d,%d,%d,%d,%d,%d,",
+                home ? "home" : "away",
+                databaseTeamId,
+                nativeTeam.value,
+                GetLive06LeaderName(category),
+                category,
+                leader.value,
+                value,
+                rosterSlot,
+                p ? p->nativePlayerId : -1,
+                p ? p->databasePlayerId : -1);
+            WriteCsvQuoted08(f, p ? p->firstName : "");
+            std::fputc(',', f);
+            WriteCsvQuoted08(f, p ? p->lastName : "");
+            std::fprintf(f, ",%d\n", p ? p->jerseyNumber : -1);
+        }
+    }
+
+    std::fclose(f);
+    AppendDiagnostic(
+        "NBA Live 06 native team leaders exported: boxscore_leaders.csv.\n");
+    return true;
+}
+
 bool ExportBoxScoreCsv06()
 {
     if (!g_liveGame06.valid) return false;
@@ -3317,8 +4377,575 @@ bool ExportBoxScoreCsv06()
         }
     }
     std::fclose(f);
-    AppendDiagnostic("NBA Live 06 box score CSV exported: boxscore.csv.\n");
+
+    void* inGameStats = GetInGameStats06();
+    const bool teamStatsOk =
+        inGameStats && ExportNativeTeamStatsCsv06(inGameStats);
+    const bool periodStatsOk =
+        ExportNativePeriodStatsCsv06(inGameStats);
+    const bool playerPeriodStatsOk =
+        ExportPlayerPeriodStatsCsv06();
+    const bool leadersOk =
+        inGameStats && ExportNativeTeamLeadersCsv06(inGameStats);
+
+    AppendDiagnostic(
+        "NBA Live 06 box score export: players=boxscore.csv nativeTeam=%s "
+        "periods=%s playerPeriods=%s leaders=%s ingameStats=%p.\n",
+        teamStatsOk ? "OK" : "FAILED",
+        periodStatsOk ? "OK" : "FAILED",
+        playerPeriodStatsOk ? "OK" : "FAILED",
+        leadersOk ? "OK" : "FAILED",
+        inGameStats);
     return true;
+}
+
+
+void ResetLive06AutoBoxScoreForNewGame(
+    int homeTeamDBID, int awayTeamDBID)
+{
+    std::memset(&g_live06AutoBoxScore, 0,
+        sizeof(g_live06AutoBoxScore));
+    g_live06AutoBoxScore.identityValid = true;
+    g_live06AutoBoxScore.homeTeamDBID = homeTeamDBID;
+    g_live06AutoBoxScore.awayTeamDBID = awayTeamDBID;
+    g_live06AutoBoxScore.finalRawQuarter = -1;
+    g_live06AutoBoxScore.savedDirectory[0] = '\0';
+
+    AppendDiagnostic(
+        "NBA Live 06 automatic box score state reset: "
+        "homeDBID=%d awayDBID=%d.\n",
+        homeTeamDBID, awayTeamDBID);
+}
+
+bool EnsureDirectory06(const char* path)
+{
+    if (!path || !*path)
+        return false;
+
+    const DWORD attributes = GetFileAttributesA(path);
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+        return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+    if (CreateDirectoryA(path, nullptr))
+        return true;
+
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+void SanitizePathToken06(
+    const char* input, char* output, size_t outputSize,
+    const char* fallback)
+{
+    if (!output || !outputSize)
+        return;
+
+    output[0] = '\0';
+    size_t used = 0;
+
+    if (input) {
+        for (const unsigned char* p =
+                 reinterpret_cast<const unsigned char*>(input);
+             *p && used + 1 < outputSize; ++p) {
+            const unsigned char c = *p;
+            if ((c >= 'A' && c <= 'Z') ||
+                (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') ||
+                c == '_' || c == '-') {
+                output[used++] = static_cast<char>(c);
+            }
+        }
+    }
+
+    output[used] = '\0';
+
+    if (!output[0] && fallback) {
+        std::strncpy(output, fallback, outputSize - 1);
+        output[outputSize - 1] = '\0';
+    }
+}
+
+bool BuildLive06BoxScoreArchiveDirectory(
+    const ExtendedState& state,
+    char* output, size_t outputSize)
+{
+    if (!output || !outputSize)
+        return false;
+    output[0] = '\0';
+
+    char documents[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathA(
+            nullptr, CSIDL_PERSONAL, nullptr,
+            SHGFP_TYPE_CURRENT, documents))) {
+        AppendDiagnostic(
+            "NBA Live 06 automatic box score: "
+            "SHGetFolderPathA(CSIDL_PERSONAL) failed.\n");
+        return false;
+    }
+
+    char liveFolder[MAX_PATH] = {};
+    char boxScoreFolder[MAX_PATH] = {};
+    std::snprintf(
+        liveFolder, sizeof(liveFolder),
+        "%s\\NBA LIVE 06", documents);
+    std::snprintf(
+        boxScoreFolder, sizeof(boxScoreFolder),
+        "%s\\boxscores", liveFolder);
+
+    if (!EnsureDirectory06(liveFolder) ||
+        !EnsureDirectory06(boxScoreFolder)) {
+        AppendDiagnostic(
+            "NBA Live 06 automatic box score: "
+            "could not create '%s'.\n",
+            boxScoreFolder);
+        return false;
+    }
+
+    char awayFallback[32] = {};
+    char homeFallback[32] = {};
+    std::snprintf(
+        awayFallback, sizeof(awayFallback),
+        "AWAY%d", state.awayTeamDBID);
+    std::snprintf(
+        homeFallback, sizeof(homeFallback),
+        "HOME%d", state.homeTeamDBID);
+
+    char awayCode[32] = {};
+    char homeCode[32] = {};
+    SanitizePathToken06(
+        g_broadcast.awayLogoId, awayCode, sizeof(awayCode),
+        awayFallback);
+    SanitizePathToken06(
+        g_broadcast.homeLogoId, homeCode, sizeof(homeCode),
+        homeFallback);
+
+    SYSTEMTIME now = {};
+    GetLocalTime(&now);
+
+    char baseName[128] = {};
+    std::snprintf(
+        baseName, sizeof(baseName),
+        "%04u-%02u-%02u_%02u%02u%02u_%s_%s",
+        static_cast<unsigned int>(now.wYear),
+        static_cast<unsigned int>(now.wMonth),
+        static_cast<unsigned int>(now.wDay),
+        static_cast<unsigned int>(now.wHour),
+        static_cast<unsigned int>(now.wMinute),
+        static_cast<unsigned int>(now.wSecond),
+        awayCode, homeCode);
+
+    for (unsigned int suffix = 0; suffix < 1000; ++suffix) {
+        if (suffix == 0) {
+            std::snprintf(
+                output, outputSize,
+                "%s\\%s", boxScoreFolder, baseName);
+        }
+        else {
+            std::snprintf(
+                output, outputSize,
+                "%s\\%s_%u", boxScoreFolder, baseName, suffix + 1);
+        }
+
+        if (GetFileAttributesA(output) == INVALID_FILE_ATTRIBUTES) {
+            if (CreateDirectoryA(output, nullptr))
+                return true;
+
+            if (GetLastError() != ERROR_ALREADY_EXISTS)
+                break;
+        }
+    }
+
+    output[0] = '\0';
+    AppendDiagnostic(
+        "NBA Live 06 automatic box score: "
+        "could not allocate a unique archive directory.\n");
+    return false;
+}
+
+bool CopyAutoBoxScoreFile06(
+    const char* sourceName, const char* archiveDirectory)
+{
+    if (!sourceName || !archiveDirectory)
+        return false;
+
+    const DWORD attributes = GetFileAttributesA(sourceName);
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        return false;
+
+    char destination[MAX_PATH] = {};
+    std::snprintf(
+        destination, sizeof(destination),
+        "%s\\%s", archiveDirectory, sourceName);
+
+    if (CopyFileA(sourceName, destination, FALSE))
+        return true;
+
+    AppendDiagnostic(
+        "NBA Live 06 automatic box score: "
+        "CopyFile failed source='%s' destination='%s' error=%lu.\n",
+        sourceName, destination,
+        static_cast<unsigned long>(GetLastError()));
+    return false;
+}
+
+void WriteJsonString06(FILE* file, const char* value)
+{
+    if (!file)
+        return;
+    if (!value)
+        value = "";
+
+    std::fputc('"', file);
+    for (const unsigned char* p =
+             reinterpret_cast<const unsigned char*>(value); *p; ++p) {
+        switch (*p) {
+        case '"':  std::fputs("\\\"", file); break;
+        case '\\': std::fputs("\\\\", file); break;
+        case '\b': std::fputs("\\b", file); break;
+        case '\f': std::fputs("\\f", file); break;
+        case '\n': std::fputs("\\n", file); break;
+        case '\r': std::fputs("\\r", file); break;
+        case '\t': std::fputs("\\t", file); break;
+        default:
+            if (*p >= 0x20)
+                std::fputc(*p, file);
+            else
+                std::fprintf(file, "\\u%04X",
+                    static_cast<unsigned int>(*p));
+            break;
+        }
+    }
+    std::fputc('"', file);
+}
+
+bool WriteLive06GameJson(
+    const char* archiveDirectory,
+    const ExtendedState& state,
+    const bool copied[5])
+{
+    if (!archiveDirectory)
+        return false;
+
+    char path[MAX_PATH] = {};
+    std::snprintf(
+        path, sizeof(path),
+        "%s\\game.json", archiveDirectory);
+
+    FILE* file = std::fopen(path, "w");
+    if (!file)
+        return false;
+
+    char awayFallback[32] = {};
+    char homeFallback[32] = {};
+    std::snprintf(
+        awayFallback, sizeof(awayFallback),
+        "AWAY%d", state.awayTeamDBID);
+    std::snprintf(
+        homeFallback, sizeof(homeFallback),
+        "HOME%d", state.homeTeamDBID);
+
+    char awayCode[32] = {};
+    char homeCode[32] = {};
+    SanitizePathToken06(
+        g_broadcast.awayLogoId, awayCode, sizeof(awayCode),
+        awayFallback);
+    SanitizePathToken06(
+        g_broadcast.homeLogoId, homeCode, sizeof(homeCode),
+        homeFallback);
+
+    SYSTEMTIME now = {};
+    GetLocalTime(&now);
+
+    std::fputs("{\n", file);
+    std::fputs("  \"schema_version\": 1,\n", file);
+    std::fputs("  \"game\": \"NBA LIVE 06\",\n", file);
+    std::fputs("  \"save_trigger\": \"automatic_final_buzzer\",\n", file);
+
+    std::fputs("  \"saved_at_local\": ", file);
+    char savedAt[64] = {};
+    std::snprintf(
+        savedAt, sizeof(savedAt),
+        "%04u-%02u-%02uT%02u:%02u:%02u",
+        static_cast<unsigned int>(now.wYear),
+        static_cast<unsigned int>(now.wMonth),
+        static_cast<unsigned int>(now.wDay),
+        static_cast<unsigned int>(now.wHour),
+        static_cast<unsigned int>(now.wMinute),
+        static_cast<unsigned int>(now.wSecond));
+    WriteJsonString06(file, savedAt);
+    std::fputs(",\n", file);
+
+    std::fprintf(
+        file,
+        "  \"raw_quarter\": %d,\n"
+        "  \"periods_played\": %d,\n"
+        "  \"overtime\": %s,\n"
+        "  \"completed_regulation_quarter_snapshots\": %d,\n",
+        state.quarter,
+        state.quarter >= 0 ? state.quarter + 1 : 0,
+        state.quarter >= 4 ? "true" : "false",
+        g_live06Periods.completedCount);
+
+    std::fputs("  \"away\": {\n", file);
+    std::fputs("    \"code\": ", file);
+    WriteJsonString06(file, awayCode);
+    std::fprintf(
+        file,
+        ",\n    \"database_team_id\": %d,\n"
+        "    \"runtime_team_id\": %d,\n"
+        "    \"score\": %d\n"
+        "  },\n",
+        state.awayTeamDBID,
+        state.awayTeamID,
+        state.awayScore);
+
+    std::fputs("  \"home\": {\n", file);
+    std::fputs("    \"code\": ", file);
+    WriteJsonString06(file, homeCode);
+    std::fprintf(
+        file,
+        ",\n    \"database_team_id\": %d,\n"
+        "    \"runtime_team_id\": %d,\n"
+        "    \"score\": %d\n"
+        "  },\n",
+        state.homeTeamDBID,
+        state.homeTeamID,
+        state.homeScore);
+
+    static const char* fileNames[5] = {
+        "boxscore.csv",
+        "boxscore_team.csv",
+        "boxscore_periods.csv",
+        "boxscore_player_periods.csv",
+        "boxscore_leaders.csv"
+    };
+
+    std::fputs("  \"files\": {\n", file);
+    for (int i = 0; i < 5; ++i) {
+        std::fputs("    ", file);
+        WriteJsonString06(file, fileNames[i]);
+        std::fprintf(
+            file, ": %s%s\n",
+            copied[i] ? "true" : "false",
+            i == 4 ? "" : ",");
+    }
+    std::fputs("  }\n", file);
+    std::fputs("}\n", file);
+
+    std::fclose(file);
+    return true;
+}
+
+bool SaveAutomaticBoxScore06(const ExtendedState& state)
+{
+    if (!g_liveGame06.valid)
+        return false;
+
+    static const char* files[5] = {
+        "boxscore.csv",
+        "boxscore_team.csv",
+        "boxscore_periods.csv",
+        "boxscore_player_periods.csv",
+        "boxscore_leaders.csv"
+    };
+
+    // Remove previous debug copies so a missing native component at final
+    // cannot cause a stale F6 file to be archived for this game.
+    for (int i = 0; i < 5; ++i)
+        std::remove(files[i]);
+
+    const bool exportOk = ExportBoxScoreCsv06();
+
+    bool generated[5] = {};
+    for (int i = 0; i < 5; ++i) {
+        const DWORD attributes = GetFileAttributesA(files[i]);
+        generated[i] =
+            attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
+    // Do not create an archive directory for an incomplete retry. The four
+    // core result files must exist before we allocate the final game folder.
+    const bool generatedCore =
+        generated[0] && generated[1] &&
+        generated[2] && generated[3];
+
+    if (!generatedCore) {
+        AppendDiagnostic(
+            "NBA Live 06 automatic box score: "
+            "export=%s core files incomplete before archive creation "
+            "[players=%d teams=%d periods=%d playerPeriods=%d leaders=%d].\n",
+            exportOk ? "OK" : "FAILED",
+            generated[0] ? 1 : 0,
+            generated[1] ? 1 : 0,
+            generated[2] ? 1 : 0,
+            generated[3] ? 1 : 0,
+            generated[4] ? 1 : 0);
+        return false;
+    }
+
+    char archiveDirectory[MAX_PATH] = {};
+    if (!BuildLive06BoxScoreArchiveDirectory(
+            state, archiveDirectory,
+            sizeof(archiveDirectory)))
+        return false;
+
+    bool copied[5] = {};
+    int copiedCount = 0;
+    for (int i = 0; i < 5; ++i) {
+        copied[i] =
+            generated[i] &&
+            CopyAutoBoxScoreFile06(files[i], archiveDirectory);
+        if (copied[i])
+            ++copiedCount;
+    }
+
+    const bool jsonOk =
+        WriteLive06GameJson(
+            archiveDirectory, state, copied);
+
+    // Players, teams, team-periods and player-periods form the canonical
+    // result. The native leaders table is useful but not required to retain
+    // an otherwise complete final game if EA tears that object down first.
+    const bool coreOk =
+        copied[0] && copied[1] && copied[2] && copied[3];
+
+    AppendDiagnostic(
+        "NBA Live 06 automatic box score archive: "
+        "export=%s copied=%d/5 core=%s json=%s directory='%s'.\n",
+        exportOk ? "OK" : "FAILED",
+        copiedCount,
+        coreOk ? "OK" : "FAILED",
+        jsonOk ? "OK" : "FAILED",
+        archiveDirectory);
+
+    if (!coreOk || !jsonOk)
+        return false;
+
+    std::strncpy(
+        g_live06AutoBoxScore.savedDirectory,
+        archiveDirectory,
+        sizeof(g_live06AutoBoxScore.savedDirectory) - 1);
+    g_live06AutoBoxScore.savedDirectory[
+        sizeof(g_live06AutoBoxScore.savedDirectory) - 1] = '\0';
+
+    return true;
+}
+
+void UpdateLive06AutomaticBoxScore(const ExtendedState& state)
+{
+    if (!g_game ||
+        g_game->version != GameVersion::Live2006 ||
+        !g_liveGame06.valid)
+        return;
+
+    const bool haveIdentity =
+        state.homeTeamDBID >= 0 &&
+        state.awayTeamDBID >= 0;
+
+    if (!g_live06AutoBoxScore.identityValid && haveIdentity) {
+        ResetLive06AutoBoxScoreForNewGame(
+            state.homeTeamDBID, state.awayTeamDBID);
+    }
+    else if (haveIdentity &&
+             (state.homeTeamDBID !=
+                  g_live06AutoBoxScore.homeTeamDBID ||
+              state.awayTeamDBID !=
+                  g_live06AutoBoxScore.awayTeamDBID)) {
+        ResetLive06AutoBoxScoreForNewGame(
+            state.homeTeamDBID, state.awayTeamDBID);
+    }
+    else if (g_live06AutoBoxScore.saved &&
+             state.quarter <= 0 &&
+             state.gameRaw > 0) {
+        // New game with the same matchup.
+        ResetLive06AutoBoxScoreForNewGame(
+            state.homeTeamDBID, state.awayTeamDBID);
+    }
+
+    const bool finalCandidate =
+        state.quarter >= 3 &&
+        state.gameRaw == 0 &&
+        state.homeScore >= 0 &&
+        state.awayScore >= 0 &&
+        state.homeScore != state.awayScore;
+
+    if (!finalCandidate) {
+        // A tied Q4/OT horn is not final; the next overtime remains live.
+        if (g_live06AutoBoxScore.finalPending &&
+            state.homeScore == state.awayScore) {
+            AppendDiagnostic(
+                "NBA Live 06 automatic box score: "
+                "final candidate cancelled by tied score "
+                "quarter=%d away=%d home=%d.\n",
+                state.quarter,
+                state.awayScore,
+                state.homeScore);
+            g_live06AutoBoxScore.finalPending = false;
+            g_live06AutoBoxScore.finalDetectedAt = 0;
+        }
+        return;
+    }
+
+    if (g_live06AutoBoxScore.saved)
+        return;
+
+    const DWORD now = GetTickCount();
+
+    if (!g_live06AutoBoxScore.finalPending) {
+        g_live06AutoBoxScore.finalPending = true;
+        g_live06AutoBoxScore.finalDetectedAt = now;
+        g_live06AutoBoxScore.finalRawQuarter = state.quarter;
+        g_live06AutoBoxScore.finalHomeScore = state.homeScore;
+        g_live06AutoBoxScore.finalAwayScore = state.awayScore;
+        g_live06AutoBoxScore.attempts = 0;
+
+        AppendDiagnostic(
+            "NBA Live 06 automatic box score: final pending "
+            "quarter=%d away=%d home=%d clockRaw=%u.\n",
+            state.quarter,
+            state.awayScore,
+            state.homeScore,
+            state.gameRaw);
+        return;
+    }
+
+    // Require one later poll so the same-play stat bookkeeping can settle
+    // before we copy the final cumulative cache.
+    if (now - g_live06AutoBoxScore.finalDetectedAt < 50u)
+        return;
+
+    ++g_live06AutoBoxScore.attempts;
+
+    if (SaveAutomaticBoxScore06(state)) {
+        g_live06AutoBoxScore.saved = true;
+        g_live06AutoBoxScore.finalPending = false;
+
+        AppendDiagnostic(
+            "NBA Live 06 automatic box score SAVED: "
+            "attempt=%u directory='%s'.\n",
+            g_live06AutoBoxScore.attempts,
+            g_live06AutoBoxScore.savedDirectory);
+    }
+    else {
+        // Retry only while the final game objects are still available.
+        g_live06AutoBoxScore.finalDetectedAt = now;
+        AppendDiagnostic(
+            "NBA Live 06 automatic box score save attempt %u failed; "
+            "will retry while final state remains available.\n",
+            g_live06AutoBoxScore.attempts);
+    }
+}
+
+bool ShouldForceLive06FinalPoll()
+{
+    return
+        g_game &&
+        g_game->version == GameVersion::Live2006 &&
+        g_live06AutoBoxScore.finalPending &&
+        !g_live06AutoBoxScore.saved &&
+        GetTickCount() -
+            g_live06AutoBoxScore.finalDetectedAt >= 50u;
 }
 
 bool ExportBoxScoreCsv07()
@@ -3554,15 +5181,19 @@ void PollState()
 
     if (g_game->version == GameVersion::Live2005)
         RefreshLiveGameData05(state);
-    else if (g_game->version == GameVersion::Live2006)
+    else if (g_game->version == GameVersion::Live2006) {
         RefreshLiveGameData06(state);
+        UpdateLive06PeriodTracker(state);
+    }
     else if (g_game->version == GameVersion::Live2007)
         RefreshLiveGameData07(state);
     else if (g_game->version == GameVersion::Live2008)
         RefreshLiveGameData08(state);
 
-    if (g_game->version == GameVersion::Live2006)
+    if (g_game->version == GameVersion::Live2006) {
         TrackTurnoverChanges06(state);
+        UpdateLive06AutomaticBoxScore(state);
+    }
 
     // Team fouls reset between periods. The game's foul getters can retain
     // the previous period's values for a very short time after the quarter
@@ -3895,6 +5526,13 @@ bool RefreshRealtimeScoreboardState()
     __try {
         GdInfoCentral* info = GetGdInfoCentral();
         GdAI* gdAI = GetGdAI();
+
+        // A final-buzzer state event arms the save. Present() continues during
+        // the postgame transition, so request one fresh Live06 cache poll
+        // before game-valid teardown can hide the player/stat objects.
+        if (ShouldForceLive06FinalPoll())
+            PollState();
+
         if (!info || !gdAI || !IsGameClockValid(gdAI)) {
             const bool previousGameHadStarted = g_gameplayStarted;
             g_gameplayStarted = false;
@@ -4049,6 +5687,215 @@ const char* SelectTeamName(const popup::TeamVisual* team,
     }
 }
 
+
+const char* PlayoffRoundText(int stage)
+{
+    const scoreboardconfig::PlayoffTextConfig& text =
+        scoreboardconfig::GetPlayoffText();
+
+    switch (stage) {
+    case GAME_SETUP_STAGE_PLAYOFF:
+        return text.roundPlayoffs;
+    case GAME_SETUP_STAGE_ECR1:
+        return text.roundECR1;
+    case GAME_SETUP_STAGE_WCR1:
+        return text.roundWCR1;
+    case GAME_SETUP_STAGE_ECSF:
+        return text.roundECSF;
+    case GAME_SETUP_STAGE_WCSF:
+        return text.roundWCSF;
+    case GAME_SETUP_STAGE_ECF:
+        return text.roundECF;
+    case GAME_SETUP_STAGE_WCF:
+        return text.roundWCF;
+    case GAME_SETUP_STAGE_FINALS:
+        return text.roundFinals;
+    default:
+        return "";
+    }
+}
+
+const char* PlayoffRoundImagePath(int stage)
+{
+    switch (stage) {
+    case GAME_SETUP_STAGE_PLAYOFF:
+        return "images/playoffs.png";
+    case GAME_SETUP_STAGE_ECR1:
+        return "images/ecr1.png";
+    case GAME_SETUP_STAGE_WCR1:
+        return "images/wcr1.png";
+    case GAME_SETUP_STAGE_ECSF:
+        return "images/ecsf.png";
+    case GAME_SETUP_STAGE_WCSF:
+        return "images/wcsf.png";
+    case GAME_SETUP_STAGE_ECF:
+        return "images/ecf.png";
+    case GAME_SETUP_STAGE_WCF:
+        return "images/wcf.png";
+    case GAME_SETUP_STAGE_FINALS:
+        return "images/finals.png";
+    default:
+        return "";
+    }
+}
+
+
+void ReplacePlayoffToken(
+    std::string* value, const char* token, const char* replacement)
+{
+    if (!value || !token || !*token)
+        return;
+
+    const std::string wanted(token);
+    const std::string with = replacement ? replacement : "";
+    size_t position = 0;
+    while ((position = value->find(wanted, position)) != std::string::npos) {
+        value->replace(position, wanted.length(), with);
+        position += with.length();
+    }
+}
+
+void BuildPlayoffSeriesText(
+    const GameSetupPostseasonPresentation& presentation,
+    const popup::TeamVisual* awayTeam,
+    const popup::TeamVisual* homeTeam,
+    char* output,
+    size_t capacity,
+    bool* homeLeading)
+{
+    if (output && capacity)
+        output[0] = '\0';
+    if (homeLeading)
+        *homeLeading = false;
+
+    if (!output || capacity == 0 || !presentation.seriesValid)
+        return;
+
+    const int homeWins = presentation.homeWins;
+    const int awayWins = presentation.awayWins;
+
+    if (homeWins < 0 || awayWins < 0)
+        return;
+
+    const scoreboardconfig::PlayoffTextConfig& text =
+        scoreboardconfig::GetPlayoffText();
+
+    if (homeWins == awayWins) {
+        const char* tiedText = nullptr;
+        switch (homeWins) {
+        case 0: tiedText = text.tied00; break;
+        case 1: tiedText = text.tied11; break;
+        case 2: tiedText = text.tied22; break;
+        case 3: tiedText = text.tied33; break;
+        default: break;
+        }
+
+        if (tiedText && *tiedText) {
+            std::snprintf(output, capacity, "%s", tiedText);
+        } else {
+            std::snprintf(output, capacity, "Series tied %d-%d",
+                homeWins, awayWins);
+        }
+        return;
+    }
+
+    const bool home = homeWins > awayWins;
+    if (homeLeading)
+        *homeLeading = home;
+
+    const popup::TeamVisual* leader = home ? homeTeam : awayTeam;
+    const char* label = "";
+    if (leader) {
+        if (leader->abbreviation[0])
+            label = leader->abbreviation;
+        else if (leader->shortCode[0])
+            label = leader->shortCode;
+        else
+            label = leader->teamName;
+    }
+
+    if (!label || !*label)
+        label = home ? "Home" : "Away";
+
+    const int leaderWins = home ? homeWins : awayWins;
+    const int loserWins = home ? awayWins : homeWins;
+
+    std::string formatted = text.leadTemplate[0]
+        ? text.leadTemplate
+        : "{TEAM} leads {LEADER_WINS}-{LOSER_WINS}";
+
+    char leaderWinsText[16] = {};
+    char loserWinsText[16] = {};
+    char homeWinsText[16] = {};
+    char awayWinsText[16] = {};
+    char gameText[16] = {};
+    std::snprintf(leaderWinsText, sizeof(leaderWinsText), "%d", leaderWins);
+    std::snprintf(loserWinsText, sizeof(loserWinsText), "%d", loserWins);
+    std::snprintf(homeWinsText, sizeof(homeWinsText), "%d", homeWins);
+    std::snprintf(awayWinsText, sizeof(awayWinsText), "%d", awayWins);
+    std::snprintf(gameText, sizeof(gameText), "%d", presentation.seriesGame);
+
+    ReplacePlayoffToken(&formatted, "{TEAM}", label);
+    ReplacePlayoffToken(&formatted, "{LEADER_WINS}", leaderWinsText);
+    ReplacePlayoffToken(&formatted, "{LOSER_WINS}", loserWinsText);
+    ReplacePlayoffToken(&formatted, "{HOME_WINS}", homeWinsText);
+    ReplacePlayoffToken(&formatted, "{AWAY_WINS}", awayWinsText);
+    ReplacePlayoffToken(&formatted, "{GAME}", gameText);
+
+    std::snprintf(output, capacity, "%s", formatted.c_str());
+}
+
+void PopulatePlayoffPresentationFrame(IDirect3DDevice9* device,
+    scoreboard::Frame* frame)
+{
+    if (!device || !frame)
+        return;
+
+    GameSetupPostseasonPresentation postseason = {};
+    if (!GetGameSetupPostseasonPresentation(&postseason) || !postseason.active)
+        return;
+
+    frame->playoffActive = true;
+    frame->playoffStage = postseason.stage;
+    frame->playoffRoundText = PlayoffRoundText(postseason.stage);
+    frame->playoffSeriesGame = postseason.seriesGame;
+    frame->playoffHomeWins = postseason.homeWins;
+    frame->playoffAwayWins = postseason.awayWins;
+
+    const char* roundImagePath = PlayoffRoundImagePath(postseason.stage);
+    if (roundImagePath && *roundImagePath) {
+        // Playoff round art is shared presentation data. Keep it in the
+        // scoreboard asset folder so every popup package resolves the same art.
+        frame->playoffRoundImage = popup::GetOverlayTexture(
+            device, g_customOverlayName, "scoreboard", roundImagePath);
+    }
+
+    const popup::TeamVisual* awayTeam =
+        popup::FindTeam(g_lastState.awayTeamDBID);
+    const popup::TeamVisual* homeTeam =
+        popup::FindTeam(g_lastState.homeTeamDBID);
+
+    bool homeSeriesLeader = false;
+    BuildPlayoffSeriesText(
+        postseason,
+        awayTeam,
+        homeTeam,
+        frame->playoffSeriesTextStorage,
+        sizeof(frame->playoffSeriesTextStorage),
+        &homeSeriesLeader);
+    frame->playoffSeriesText = frame->playoffSeriesTextStorage;
+
+    if (postseason.seriesValid && postseason.homeWins != postseason.awayWins) {
+        IDirect3DTexture9* awayLogo = frame->awayLogo;
+        IDirect3DTexture9* homeLogo = frame->homeLogo;
+        if (!awayLogo && g_lastState.awayTeamDBID >= 0)
+            awayLogo = popup::GetLogoTexture(device, g_lastState.awayTeamDBID);
+        if (!homeLogo && g_lastState.homeTeamDBID >= 0)
+            homeLogo = popup::GetLogoTexture(device, g_lastState.homeTeamDBID);
+        frame->playoffSeriesLeaderLogo = homeSeriesLeader ? homeLogo : awayLogo;
+    }
+}
+
 void RenderNativeScoreboard(IDirect3DDevice9* device)
 {
     if (!g_customOverlayEnabled || !device || !RefreshRealtimeScoreboardState() ||
@@ -4118,6 +5965,9 @@ void RenderNativeScoreboard(IDirect3DDevice9* device)
     frame.homeTeamName = SelectTeamName(homeTeam,
         scoreboardSettings.teamNameFormat,
         homeFullName, sizeof(homeFullName), g_broadcast.homeName);
+
+    PopulatePlayoffPresentationFrame(device, &frame);
+
     scoreboard::Render(device, frame, g_customOverlayName);
 }
 
@@ -4217,6 +6067,7 @@ void RenderViolationOverlay(IDirect3DDevice9* device)
     const popup::TeamVisual* team = awaySide ? away : homeSide ? home : nullptr;
 
     scoreboard::Frame frame = {};
+    PopulatePlayoffPresentationFrame(device, &frame);
     frame.violationTitle = g_violation.title;
     frame.violationPossession = g_violation.possession;
     frame.violationTeamColor = g_violation.teamColor;
@@ -4283,6 +6134,7 @@ void RenderPlayerFoulOverlay(IDirect3DDevice9* device)
             home && (home->primaryColor & 0x00FFFFFFu) == rgb ? home : nullptr;
 
     scoreboard::Frame frame = {};
+    PopulatePlayoffPresentationFrame(device, &frame);
     frame.playerFirstName = g_playerFoul.firstName;
     frame.playerLastName = g_playerFoul.lastName;
     frame.playerJerseyNumber = g_playerFoul.jerseyNumber;
@@ -4376,6 +6228,7 @@ void RenderGenericStatOverlay(IDirect3DDevice9* device)
     const popup::TeamVisual* team = popup::FindTeamByShortCode(
         g_genericStat.teamCode);
     scoreboard::Frame frame = {};
+    PopulatePlayoffPresentationFrame(device, &frame);
     const char* genericStatFirstName = g_genericStat.count > 0 ?
         g_genericStat.values[0] : "";
     frame.playerFirstName = genericStatFirstName;
@@ -4514,6 +6367,7 @@ void RenderPlayCallOverlay(IDirect3DDevice9* device)
     }
 
     scoreboard::Frame frame = {};
+    PopulatePlayoffPresentationFrame(device, &frame);
     frame.playCallTeam = g_playCall.team;
     frame.playCallName = g_playCall.call;
     frame.playCallTeamColor = g_playCall.teamColor;
@@ -4563,6 +6417,7 @@ void RenderIntroOverlay(IDirect3DDevice9* device)
     }
 
     scoreboard::Frame frame = {};
+    PopulatePlayoffPresentationFrame(device, &frame);
     for (int i = 0; i < 15; ++i)
         frame.introValues[i] = g_intro.values[i];
     popup::Load(g_customOverlayName);
@@ -4609,6 +6464,7 @@ void RenderStarting5Overlay(IDirect3DDevice9* device)
         g_broadcast.homeLogoId) == 0;
 
     scoreboard::Frame frame = {};
+    PopulatePlayoffPresentationFrame(device, &frame);
     for (int i = 0; i < 11; ++i)
         frame.starting5Values[i] = g_starting5.values[i];
     for (int i = 0; i < 5; ++i) {
@@ -4664,6 +6520,7 @@ void RenderOutroOverlay(IDirect3DDevice9* device)
     const popup::TeamVisual* home = popup::FindTeamByShortCode(
         g_outro.values[13]);
     scoreboard::Frame frame = {};
+    PopulatePlayoffPresentationFrame(device, &frame);
     for (int i = 0; i < 15; ++i)
         frame.outroValues[i] = g_outro.values[i];
     frame.awayColor = away ? away->primaryColor : g_broadcast.awayColor;
@@ -4695,6 +6552,7 @@ void RenderLineupsOverlay(IDirect3DDevice9* device)
     const popup::TeamVisual* home = popup::FindTeamByShortCode(
         g_lineups.values[12]);
     scoreboard::Frame frame = {};
+    PopulatePlayoffPresentationFrame(device, &frame);
     for (int i = 0; i < 14; ++i)
         frame.lineupsValues[i] = g_lineups.values[i];
     frame.awayColor = away ? away->primaryColor : g_broadcast.awayColor;
@@ -4872,6 +6730,18 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* device, const RECT* sourceRect,
     const RECT* destinationRect, HWND destinationWindow,
     const RGNDATA* dirtyRegion)
 {
+    const auto nextPresent = d3d9chain::Next<PresentFn>(device, 17,
+        reinterpret_cast<void*>(&HookPresent));
+    if (!nextPresent) return D3DERR_INVALIDCALL;
+    static thread_local bool drawingOverlay = false;
+    if (drawingOverlay)
+        return nextPresent(device, sourceRect, destinationRect, destinationWindow, dirtyRegion);
+    struct OverlayScope {
+        bool& flag;
+        explicit OverlayScope(bool& value) : flag(value) { flag = true; }
+        ~OverlayScope() { flag = false; }
+    } overlayScope(drawingOverlay);
+
     if (!g_presentReached) {
         g_presentReached = true;
         D3DVIEWPORT9 viewport = {};
@@ -4903,48 +6773,20 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* device, const RECT* sourceRect,
     if (nativeOverlayPass)
         EndAntiAliasingNativeOverlayPass(device);
 
-    return g_originalPresent(device, sourceRect, destinationRect,
+    return nextPresent(device, sourceRect, destinationRect,
         destinationWindow, dirtyRegion);
-}
-
-bool ReplaceVtableEntry(void** table, unsigned int index,
-                        void* replacement, void** original)
-{
-    if (!table || !replacement || !original) return false;
-    DWORD oldProtection = 0;
-    if (!VirtualProtect(&table[index], sizeof(void*), PAGE_EXECUTE_READWRITE,
-                        &oldProtection))
-        return false;
-    *original = table[index];
-    table[index] = replacement;
-    DWORD ignored = 0;
-    VirtualProtect(&table[index], sizeof(void*), oldProtection, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), &table[index], sizeof(void*));
-    return true;
 }
 
 void HookDevice(IDirect3DDevice9* device)
 {
     if (!device) return;
     void** table = *reinterpret_cast<void***>(device);
-    if (table == g_hookedDeviceVtable) {
-        AppendDiagnostic("D3D9 device=%p reuses hooked vtable=%p.\n",
-            device, table);
+    if (!d3d9chain::Install(table, 17, reinterpret_cast<void*>(&HookPresent))) {
+        AppendDiagnostic("Failed to hook Present device=%p vtable=%p.\n", device, table);
         return;
     }
-
-    void* originalPresent = nullptr;
-    if (!ReplaceVtableEntry(table, 17, reinterpret_cast<void*>(&HookPresent),
-                            &originalPresent)) {
-        AppendDiagnostic("Failed to hook Present for device=%p vtable=%p.\n",
-            device, table);
-        return;
-    }
-    g_originalPresent = reinterpret_cast<PresentFn>(originalPresent);
-    g_hookedDeviceVtable = table;
-    AppendDiagnostic(
-        "Hooked D3D9 device=%p vtable=%p Present=%p.\n",
-        device, table, originalPresent);
+    g_presentHookInstalled = true;
+    AppendDiagnostic("Hooked D3D9 Present device=%p vtable=%p.\n", device, table);
 }
 
 class D3D9Proxy : public IDirect3D9 {
@@ -4952,9 +6794,28 @@ public:
     explicit D3D9Proxy(IDirect3D9* real) : real_(real) {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override
-        { return real_->QueryInterface(riid, object); }
-    ULONG STDMETHODCALLTYPE AddRef() override { return real_->AddRef(); }
-    ULONG STDMETHODCALLTYPE Release() override { return real_->Release(); }
+    {
+        if (!object) return E_POINTER;
+        if (IsEqualIID(riid, __uuidof(IUnknown)) ||
+            IsEqualIID(riid, __uuidof(IDirect3D9))) {
+            *object = static_cast<IDirect3D9*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return real_->QueryInterface(riid, object);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        real_->AddRef();
+        return static_cast<ULONG>(InterlockedIncrement(&references_));
+    }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        const LONG remaining = InterlockedDecrement(&references_);
+        real_->Release();
+        if (remaining == 0) delete this;
+        return static_cast<ULONG>(remaining);
+    }
     HRESULT STDMETHODCALLTYPE RegisterSoftwareDevice(void* initialize) override
         { return real_->RegisterSoftwareDevice(initialize); }
     UINT STDMETHODCALLTYPE GetAdapterCount() override
@@ -5010,13 +6871,14 @@ public:
             behaviorFlags, parameters, returnedDevice);
         AppendDiagnostic("D3D9 proxy CreateDevice result=%08X device=%p\n",
             static_cast<unsigned int>(result),
-            returnedDevice ? *returnedDevice : nullptr);
+            SUCCEEDED(result) && returnedDevice ? *returnedDevice : nullptr);
         if (SUCCEEDED(result) && returnedDevice && *returnedDevice)
             HookDevice(*returnedDevice);
         return result;
     }
 
 private:
+    volatile LONG references_ = 1;
     IDirect3D9* real_;
 };
 
@@ -5112,39 +6974,16 @@ bool HookImportedFunctionInModule(HMODULE module, const char* dllName,
 bool HookImportedFunction(const char* dllName, const char* functionName,
                           void* replacement, void** original)
 {
-    bool hooked = false;
-    HANDLE snapshot = CreateToolhelp32Snapshot(
-        TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (snapshot == INVALID_HANDLE_VALUE)
-        return false;
-
-    MODULEENTRY32 entry = {};
-    entry.dwSize = sizeof(entry);
-    if (Module32First(snapshot, &entry)) {
-        do {
-            __try {
-                if (HookImportedFunctionInModule(entry.hModule, dllName,
-                        functionName, replacement, original)) {
-                    hooked = true;
-                    AppendDiagnostic(
-                        "Hooked %s!%s import in %s base=%p.\n",
-                        dllName, functionName, entry.szModule,
-                        entry.modBaseAddr);
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                AppendDiagnostic(
-                    "Skipped invalid import table in %s base=%p.\n",
-                    entry.szModule, entry.modBaseAddr);
-            }
-        } while (Module32Next(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
-    return hooked && *original != nullptr;
+    // Intercept the game's call into the existing chain. Scanning every DLL
+    // can hijack ReShade's own calls and mix different original IAT targets.
+    return HookImportedFunctionInModule(GetModuleHandleA(nullptr), dllName,
+        functionName, replacement, original) && *original != nullptr;
 }
 
 bool HookSharedD3D9DeviceVtable()
 {
+    // The discovery device must never replace the real game's SSAA owner.
+    d3d9chain::ProbeScope probeScope;
     char systemDirectory[MAX_PATH] = {};
     if (!GetSystemDirectoryA(systemDirectory, MAX_PATH))
         return false;
@@ -5212,7 +7051,7 @@ bool HookSharedD3D9DeviceVtable()
     if (device) device->Release();
     direct3D->Release();
     DestroyWindow(window);
-    return SUCCEEDED(result) && g_originalPresent != nullptr;
+    return SUCCEEDED(result) && g_presentHookInstalled;
 }
 
 DWORD WINAPI DeferredD3D9VtableHook(void*)
@@ -6170,4 +8009,54 @@ void InitializeShotClock()
 void InitializeDebugLogging()
 {
     InitializeDebugLoggingInternal();
+}
+// Read-only cross-module bridge. Never call the game's runtime getters from
+// StageSetup's shared root-transform hook: it can run during scene construction.
+int ShotClockLookupLive06BenchPlayerByDbId(int databasePlayerId,
+    Live06BenchPlayerSnapshot* output)
+{
+    if (output) *output = {};
+    if (!output || databasePlayerId < 0 || !g_game ||
+        g_game->version != GameVersion::Live2006 || !g_liveGame06.valid)
+        return 0;
+
+    const DWORD now = GetTickCount();
+    const DWORD age = now - g_liveGame06.refreshedAt;
+    // The full player cache may pause during overlays. After a successful
+    // substitution event the 24 cached player identities remain valid and
+    // their on-court flags have just been updated. Allow that narrow window.
+    const bool freshLineupEvent[2] = {
+        g_lineupEventRevision06[0] &&
+            static_cast<DWORD>(now - g_lineupEventTick06[0]) <= 1500u,
+        g_lineupEventRevision06[1] &&
+            static_cast<DWORD>(now - g_lineupEventTick06[1]) <= 1500u
+    };
+    if (age > 3000u && !freshLineupEvent[0] && !freshLineupEvent[1])
+        return 0;
+
+    int matches = 0;
+    Live06BenchPlayerSnapshot found = {};
+    for (int side = 0; side < 2; ++side) {
+        if (age > 3000u && !freshLineupEvent[side]) continue;
+        const int teamIndex = side == 0 ? g_liveGame06.homeTeamIndex :
+                                          g_liveGame06.awayTeamIndex;
+        if (teamIndex < 0 || teamIndex > 1) continue;
+        for (int slot = 0; slot < 12; ++slot) {
+            const LivePlayerData08& p = g_liveGame06.teams[teamIndex].players[slot];
+            if (!p.valid || p.databasePlayerId != databasePlayerId) continue;
+            ++matches;
+            found.side = side;
+            found.originalRosterSlot = slot;
+            found.databasePlayerId = p.databasePlayerId;
+            found.nativePlayerId = static_cast<unsigned int>(p.nativePlayerId);
+            found.courtSlot = p.courtSlot;
+            found.trackedOnCourt = p.onCourt;
+            found.snapshotAgeMs = static_cast<unsigned int>(age);
+            found.refreshedAtTick = static_cast<unsigned int>(g_liveGame06.refreshedAt);
+            found.lineupEventRevision = g_lineupEventRevision06[side];
+            found.lineupEventTick = g_lineupEventTick06[side];
+        }
+    }
+    if (matches == 1) *output = found;
+    return matches;
 }

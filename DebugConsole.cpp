@@ -1,6 +1,7 @@
 #include "plugin-std.h"
+#include "Live07CleanupFix.h"
+#include "LoadingOptimization.h"
 #include "DebugConsole.h"
-
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
@@ -12,6 +13,18 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <Windows.h>
+#include <cstdlib>
+#include <cctype>
+#include <cmath>
+#include <fstream>
+#include <sstream>
+#include "GameStageInternal.h"
+#include "PracticeSetupInternal.h"
+#include <climits>
+#include <cstdarg>
+#include "AutoStartInternal.h"
+
 #pragma intrinsic(_ReturnAddress)
 
 // NBA Live 06 loading capture (optional, console must be disabled):
@@ -409,7 +422,6 @@ bool PatchIAT(const char* dllName, const char* procName, void* replacement, void
 }
 
 
-
 // Optional, bounded, quiet loading capture. This block lives in DebugConsole's
 // anonymous namespace and needs no additional project files or dependencies.
 namespace loadingprofile06 {
@@ -435,56 +447,6 @@ DWORD generation = 0, dropped = 0, handleDrops = 0;
 volatile LONG capturing = 0;
 bool ready = false, assetHook = false, openAHook = false;
 bool openWHook = false, readHook = false, closeHook = false;
-bool fileWaitHook = false, fastFileWait = false;
-HANDLE fileCompletionEvent = nullptr;
-bool completionSignalHook = false;
-typedef BOOL (WINAPI *SetEventFn)(HANDLE);
-SetEventFn nativeSetEvent = nullptr;
-struct FileWaitBuild {
-    const char* name;
-    uintptr_t waitPush, delayHelper, sleepExIat, signalCall, setEventIat;
-};
-const FileWaitBuild fileWaitBuilds[] = {
-    { "2005", 0x006C5B01, 0x004292B3, 0x00CCED6C, 0x006C574C, 0x00CCED84 },
-    { "06",   0x006DC59B, 0x00429642, 0x00D30D88, 0x006DC196, 0x00D30DAC },
-    { "07",   0x007FF170, 0x00428E82, 0x00D49D90, 0x007FED6B, 0x00D49DB4 },
-    { "08",   0x0082E18F, 0x0042B6B2, 0x00E07D9C, 0x0082DD8A, 0x00E07DC0 }
-};
-const FileWaitBuild* waitBuild = nullptr;
-uintptr_t nativeDelayHelper = 0x00429642;
-
-// Shared signature validation is separate from memory access and patching.
-// This also lets the offline check use the actual bytes from all four EXEs.
-bool ValidateWaitBytes(const FileWaitBuild& build, const BYTE* wait, const BYTE* helper) {
-    BYTE expectedWait[] = { 0x6A, 0x01, 0xE8, 0, 0, 0, 0, 0x59 };
-    const int32_t relative = static_cast<int32_t>(build.delayHelper - (build.waitPush + 7));
-    std::memcpy(expectedWait + 3, &relative, 4);
-    BYTE expectedHelper[] = { 0x55, 0x8B, 0xEC, 0x6A, 0x01, 0xFF, 0x75, 0x08,
-        0xFF, 0x15, 0, 0, 0, 0, 0x5D, 0xC3 };
-    const DWORD iat = static_cast<DWORD>(build.sleepExIat);
-    std::memcpy(expectedHelper + 10, &iat, 4);
-    return !std::memcmp(wait, expectedWait, sizeof(expectedWait)) &&
-        !std::memcmp(helper, expectedHelper, sizeof(expectedHelper));
-}
-bool ValidateSignalBytes(const FileWaitBuild& build, const BYTE* bytes) {
-    BYTE expected[] = { 0xFF, 0x76, 0x78, 0xFF, 0x15, 0, 0, 0, 0,
-        0x83, 0x7E, 0x08, 0x00 };
-    const DWORD iat = static_cast<DWORD>(build.setEventIat);
-    std::memcpy(expected + 5, &iat, 4);
-    return !std::memcmp(bytes, expected, sizeof(expected));
-}
-const FileWaitBuild* DetectFileWaitBuild() {
-#if defined(_M_IX86)
-    const uintptr_t ep = FM::GetEntryPoint();
-    if (ep == 0xCD8005) return &fileWaitBuilds[0];
-    if (ep == 0x40109F) {
-        if (plugin::patch::GetFloat(0xBD832C) == 1.3333334f) return &fileWaitBuilds[1];
-        if (plugin::patch::GetFloat(0xBBBC3C) == 1.3333334f) return &fileWaitBuilds[2];
-        if (plugin::patch::GetFloat(0xC3DF84) == 1.3333334f) return &fileWaitBuilds[3];
-    }
-#endif
-    return nullptr;
-}
 bool autoCapture = true, introHook = false;
 DWORD maxCaptureSeconds = 120;
 volatile LONG pendingSave = 0, pendingStatus = 0;
@@ -496,8 +458,8 @@ struct WaitSummary {
     LONGLONG ticks, maximum;
 };
 WaitSummary waitTotal = {}, waitSeconds[601] = {};
-struct WaitSample { DWORD generation; LONGLONG begin; bool active; };
-__declspec(thread) unsigned int shortWaitCount = 0;
+using WaitSample = LiveLoading::WaitSample;
+
 LARGE_INTEGER frequency = {}, captureBegin = {}, captureEnd = {};
 char logDirectory[MAX_PATH] = {};
 char captureStem[MAX_PATH] = {};
@@ -675,141 +637,6 @@ bool InstallIntroBoundary() {
 #endif
 }
 
-BOOL WINAPI SignalFileCompletion(HANDLE nativeEvent) {
-    // Invoke the original SetEvent first and preserve its result/LastError.
-    // The plugin event has independent state; never reset the engine's event.
-    const BOOL result = nativeSetEvent(nativeEvent);
-    const DWORD error = GetLastError();
-    if (fileCompletionEvent) SetEvent(fileCompletionEvent);
-    SetLastError(error);
-    return result;
-}
-
-bool InstallCompletionSignal() {
-#if defined(_M_IX86)
-    if (completionSignalHook) return true;
-    // Each verified worker moves the request to its completion list, invokes
-    // its callback, then signals context+78 at the selected signalCall.
-    // The existing HANDLE argument and stdcall cleanup are unchanged.
-    if (!waitBuild) return false;
-    BYTE* site = reinterpret_cast<BYTE*>(waitBuild->signalCall);
-    __try {
-        if (!ValidateSignalBytes(*waitBuild, site - 3)) return false;
-        nativeSetEvent = *reinterpret_cast<SetEventFn*>(waitBuild->setEventIat);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    if (!nativeSetEvent) return false;
-    HANDLE event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    if (!event) return false;
-    DWORD protect = 0;
-    if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &protect)) {
-        CloseHandle(event); return false;
-    }
-    fileCompletionEvent = event;
-    site[0] = 0xE8;
-    *reinterpret_cast<int32_t*>(site + 1) = static_cast<int32_t>(
-        reinterpret_cast<uintptr_t>(&SignalFileCompletion) - (waitBuild->signalCall + 5));
-    site[5] = 0x90;
-    DWORD ignored = 0;
-    VirtualProtect(site, 6, protect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), site, 6);
-    completionSignalHook = true;
-    return true;
-#else
-    return false;
-#endif
-}
-
-void __cdecl FileCompletionDelay(DWORD milliseconds) {
-    DWORD actual = milliseconds;
-    const bool eventWait = fastFileWait && completionSignalHook && milliseconds == 1;
-    if (fastFileWait && !eventWait && milliseconds == 1) {
-        // A bounded yield sequence: never replace long waits with a busy loop.
-        // TLS avoids cross-thread interference. The original native loop still
-        // checks the queue and pumps callbacks between every call here.
-        shortWaitCount = (shortWaitCount + 1) & 63;
-        actual = shortWaitCount ? 0 : 1;
-    }
-    const DWORD incomingError = GetLastError();
-    const WaitSample sample = BeginWait();
-    SetLastError(incomingError);
-    DWORD waitResult = 0;
-    if (eventWait) {
-        // Auto-reset retains a completion arriving just before this wait.
-        // A completion for a different request is only a wakeup: the native
-        // loop rechecks its own request before deciding that it has finished.
-        waitResult = WaitForSingleObjectEx(fileCompletionEvent, 1, TRUE);
-    }
-    if (!eventWait || waitResult == WAIT_FAILED) {
-        if (eventWait) SetLastError(incomingError);
-        // Original helper remains the OFF/installation-failure fallback.
-        reinterpret_cast<void (__cdecl *)(DWORD)>(nativeDelayHelper)(actual);
-    }
-    const DWORD error = GetLastError();
-    FinishWait(sample, actual, eventWait, waitResult);
-    SetLastError(error);
-}
-
-bool InstallFileCompletionDelay(bool fast) {
-#if defined(_M_IX86)
-    if (fileWaitHook) return true;
-    waitBuild = DetectFileWaitBuild();
-    if (!waitBuild) return false;
-    // Verify push 1 / call delayHelper / pop ecx plus the complete helper.
-    // No instruction relocation, return-address rewriting, or global API hook.
-    BYTE* site = reinterpret_cast<BYTE*>(waitBuild->waitPush);
-    __try {
-        if (!ValidateWaitBytes(*waitBuild, site, reinterpret_cast<const BYTE*>(waitBuild->delayHelper)))
-            return false;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    DWORD protect = 0;
-    if (!VirtualProtect(site + 2, 5, PAGE_EXECUTE_READWRITE, &protect)) return false;
-    fastFileWait = fast;
-    nativeDelayHelper = waitBuild->delayHelper;
-    if (fast) InstallCompletionSignal();
-    *reinterpret_cast<int32_t*>(site + 3) = static_cast<int32_t>(
-        reinterpret_cast<uintptr_t>(&FileCompletionDelay) - (waitBuild->waitPush + 7));
-    DWORD ignored = 0;
-    VirtualProtect(site + 2, 5, protect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), site + 2, 5);
-    fileWaitHook = true;
-    OutputDebugStringA(fast ? "[Loading] FAST_FILE_WAIT installed.\n" :
-        "[Loading] Native file-completion wait timing installed (delay unchanged).\n");
-    return true;
-#else
-    return false;
-#endif
-}
-
-void WriteFileWaitInstallStatus(bool installed) {
-    // One small startup report; does not enable console/file tracing or run
-    // during individual file operations. FAST_FILE_WAIT works without profiling.
-    char directory[MAX_PATH] = {};
-    const DWORD length = GetModuleFileNameA(nullptr, directory, MAX_PATH);
-    if (!length || length >= MAX_PATH) return;
-    char* slash = std::strrchr(directory, '\\');
-    if (!slash) return;
-    *slash = 0;
-    if (std::strlen(directory) > 190) return;
-    strcat_s(directory, "\\logs");
-    if (!CreateDirectoryA(directory, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return;
-    char path[MAX_PATH];
-    sprintf_s(path, "%s\\loading_wait_%s.log", directory, waitBuild ? waitBuild->name : "unsupported");
-    FILE* out = nullptr;
-    if (!fopen_s(&out, path, "w") && out) {
-        SYSTEMTIME t; GetLocalTime(&t);
-        std::fprintf(out, "File-wait initialization %04u-%02u-%02u %02u:%02u:%02u\n",
-            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-        std::fprintf(out, "game=%s requested_FAST_FILE_WAIT=1 installed=%d strategy=%s completion-signal-hook=%d\n",
-            waitBuild ? waitBuild->name : "unsupported", installed,
-            !installed ? "skipped" : completionSignalHook ? "completion-event" : "bounded-yields", completionSignalHook);
-        if (waitBuild) std::fprintf(out, "wait_call=%08lX helper=%08lX signal_call=%08lX\n",
-            static_cast<unsigned long>(waitBuild->waitPush + 2),
-            static_cast<unsigned long>(waitBuild->delayHelper), static_cast<unsigned long>(waitBuild->signalCall));
-        std::fprintf(out, "Startup status only; not a loading-duration capture. Native callbacks, completion checks and events remain in place.\n");
-        std::fclose(out);
-    }
-}
-
 void RecordAsset(const uintptr_t* stack) {
     if (!ready || internal || !stack) return;
     const DWORD previousError = GetLastError();
@@ -963,9 +790,9 @@ void Status(const char* message) {
     if (!fopen_s(&out, path, "w") && out) {
         std::fprintf(out, "%s\nasset-entry=%d CreateFileA=%d CreateFileW=%d ReadFile=%d CloseHandle=%d\n",
             message, assetHook, openAHook, openWHook, readHook, closeHook);
-        std::fprintf(out, "file-wait=%d FAST_FILE_WAIT=%d\n", fileWaitHook, fastFileWait);
+        std::fprintf(out, "file-wait=%d FAST_FILE_WAIT=%d\n", LiveLoading::IsInstalled(), LiveLoading::IsFastWaitEnabled());
         std::fprintf(out, "file-wait-strategy=%s completion-signal-hook=%d\n",
-            !fastFileWait ? "native" : completionSignalHook ? "completion-event" : "bounded-yields", completionSignalHook);
+            !LiveLoading::IsFastWaitEnabled() ? "native" : LiveLoading::HasCompletionSignal() ? "completion-event" : "bounded-yields", LiveLoading::HasCompletionSignal());
         std::fprintf(out, "AUTO_CAPTURE=%d intro-boundary-hook=%d MAX_SECONDS=%lu\n",
             autoCapture, introHook, static_cast<unsigned long>(maxCaptureSeconds));
         std::fclose(out);
@@ -1053,9 +880,9 @@ bool WriteCapture() {
     std::fprintf(out, "Coverage: asset-entry=%d CreateFileA=%d CreateFileW=%d ReadFile=%d CloseHandle=%d\n",
         assetHook, openAHook, openWHook, readHook, closeHook);
     std::fprintf(out, "File completion delay: hook=%d FAST_FILE_WAIT=%d\n",
-        fileWaitHook, fastFileWait);
+        LiveLoading::IsInstalled(), LiveLoading::IsFastWaitEnabled());
     std::fprintf(out, "File wait strategy: %s completion-signal-hook=%d\n",
-        !fastFileWait ? "native" : completionSignalHook ? "completion-event" : "bounded-yields", completionSignalHook);
+        !LiveLoading::IsFastWaitEnabled() ? "native" : LiveLoading::HasCompletionSignal() ? "completion-event" : "bounded-yields", LiveLoading::HasCompletionSignal());
     std::fprintf(out, "Completion-event waits wake on worker notification or alertable callback, with a 1-ms timeout.\n"
         "Bounded-yields fallback uses 63 zero-ms yields, then one 1-ms wait. Native events are unchanged.\n");
     std::fprintf(out, "Capture boundaries: start=%s stop=%s intro-hook=%d\n", startReason, stopReason, introHook);
@@ -1265,202 +1092,7 @@ __declspec(naked) void HookLive07CleanupEntry()
 }
 
 
-using Live07ReleaseResource_t = void (__cdecl *)(void* resultPtr, void* resourceObject);
-
 bool IsReadablePointerRange(uintptr_t address, size_t size);
-
-bool IsReadableObject07(uintptr_t p, size_t size)
-{
-    return IsReadablePointerRange(p, size);
-}
-
-enum Live07CleanupRejectReason : DWORD {
-    LIVE07_CLEANUP_OK = 0,
-    LIVE07_CLEANUP_BAD_OBJECT,
-    LIVE07_CLEANUP_BAD_OWNER,
-    LIVE07_CLEANUP_BAD_OWNER_COUNT,
-    LIVE07_CLEANUP_BAD_OWNER_LIST
-};
-
-const char* Live07CleanupRejectReasonName(
-    Live07CleanupRejectReason reason)
-{
-    switch (reason) {
-    case LIVE07_CLEANUP_BAD_OBJECT:      return "BAD_OBJECT";
-    case LIVE07_CLEANUP_BAD_OWNER:       return "BAD_OWNER";
-    case LIVE07_CLEANUP_BAD_OWNER_COUNT: return "BAD_OWNER_COUNT";
-    case LIVE07_CLEANUP_BAD_OWNER_LIST:  return "BAD_OWNER_LIST";
-    default:                             return "OK";
-    }
-}
-
-bool IsSafeCleanupResource07(
-    uintptr_t objectPtr,
-    uintptr_t& ownerPtr,
-    uintptr_t& ownerListPtr,
-    DWORD& ownerCount,
-    Live07CleanupRejectReason& rejectReason)
-{
-    ownerPtr = 0;
-    ownerListPtr = 0;
-    ownerCount = 0;
-    rejectReason = LIVE07_CLEANUP_OK;
-
-    // 0080B32B reads object+2C before calling 0080B103.
-    if (!objectPtr || !IsReadableObject07(objectPtr, 0x30)) {
-        rejectReason = LIVE07_CLEANUP_BAD_OBJECT;
-        return false;
-    }
-
-    __try {
-        ownerPtr =
-            *reinterpret_cast<const uintptr_t*>(objectPtr + 0x2C);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        ownerPtr = 0;
-        rejectReason = LIVE07_CLEANUP_BAD_OBJECT;
-        return false;
-    }
-
-    // 0080B103 uses owner+18 as the list pointer and owner+1C as count.
-    if (!ownerPtr || !IsReadableObject07(ownerPtr, 0x20)) {
-        rejectReason = LIVE07_CLEANUP_BAD_OWNER;
-        return false;
-    }
-
-    __try {
-        ownerListPtr =
-            *reinterpret_cast<const uintptr_t*>(ownerPtr + 0x18);
-        ownerCount =
-            *reinterpret_cast<const DWORD*>(ownerPtr + 0x1C);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        ownerListPtr = 0;
-        ownerCount = 0;
-        rejectReason = LIVE07_CLEANUP_BAD_OWNER;
-        return false;
-    }
-
-    // Observed bad stock-game state:
-    //   owner      = 00060000
-    //   owner+18   = 00021000
-    //   owner+1C   = D24841A3
-    //
-    // Use a deliberately generous ceiling. This catches clearly stale/reused
-    // owner memory without pretending to know the exact engine maximum.
-    constexpr DWORD kMaxReasonableOwnerEntries = 0x00010000;
-
-    if (ownerCount > kMaxReasonableOwnerEntries) {
-        rejectReason = LIVE07_CLEANUP_BAD_OWNER_COUNT;
-        return false;
-    }
-
-    // Zero entries means the list pointer is irrelevant.
-    if (ownerCount == 0)
-        return true;
-
-    if (!ownerListPtr) {
-        rejectReason = LIVE07_CLEANUP_BAD_OWNER_LIST;
-        return false;
-    }
-
-    const size_t listBytes =
-        static_cast<size_t>(ownerCount) * sizeof(uintptr_t);
-
-    if (!IsReadableObject07(ownerListPtr, listBytes)) {
-        rejectReason = LIVE07_CLEANUP_BAD_OWNER_LIST;
-        return false;
-    }
-
-    return true;
-}
-
-void __cdecl SafeReleaseResource07(void* resultPtr, void* resourceObject)
-{
-    const uintptr_t objectPtr =
-        reinterpret_cast<uintptr_t>(resourceObject);
-
-    uintptr_t ownerPtr = 0;
-    uintptr_t ownerListPtr = 0;
-    DWORD ownerCount = 0;
-    Live07CleanupRejectReason rejectReason = LIVE07_CLEANUP_OK;
-
-    if (!IsSafeCleanupResource07(
-            objectPtr,
-            ownerPtr,
-            ownerListPtr,
-            ownerCount,
-            rejectReason))
-    {
-        if (g_lockReady) {
-            EnterCriticalSection(&g_consoleLock);
-            PrintPrefix(
-                "FIX07",
-                FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-
-            std::printf(
-                "SKIP stale cleanup resource reason=%s "
-                "object=%08lX owner=%08lX list=%08lX count=%08lX\n",
-                Live07CleanupRejectReasonName(rejectReason),
-                static_cast<unsigned long>(objectPtr),
-                static_cast<unsigned long>(ownerPtr),
-                static_cast<unsigned long>(ownerListPtr),
-                static_cast<unsigned long>(ownerCount));
-
-            LeaveCriticalSection(&g_consoleLock);
-        }
-
-        // 00689B70 clears the cleanup slot immediately after this call
-        // returns, so the rejected stale entry is discarded by the game's
-        // normal cleanup control flow.
-        return;
-    }
-
-    reinterpret_cast<Live07ReleaseResource_t>(0x0080B32B)(
-        resultPtr,
-        resourceObject);
-}
-
-bool InstallLive07CleanupGuard()
-{
-    constexpr uintptr_t callAddress = 0x00689BA5;
-    constexpr size_t patchLength = 5;
-
-    // Original:
-    //   E8 81 17 18 00    call 0080B32B
-    const BYTE expected[patchLength] = {
-        0xE8, 0x81, 0x17, 0x18, 0x00
-    };
-
-    BYTE* target = reinterpret_cast<BYTE*>(callAddress);
-
-    __try {
-        if (std::memcmp(target, expected, patchLength) != 0)
-            return false;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(
-            target,
-            patchLength,
-            PAGE_EXECUTE_READWRITE,
-            &oldProtect))
-        return false;
-
-    target[0] = 0xE8;
-    *reinterpret_cast<int32_t*>(target + 1) =
-        static_cast<int32_t>(
-            reinterpret_cast<uintptr_t>(&SafeReleaseResource07) -
-            (callAddress + 5));
-
-    DWORD ignored = 0;
-    VirtualProtect(target, patchLength, oldProtect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
-    return true;
-}
 
 bool InstallLive07CleanupEntryHook()
 {
@@ -1937,6 +1569,8 @@ void PrintLive07ResourceOwnerCrash(EXCEPTION_POINTERS* ep)
 
 #else
 
+bool IsReadablePointerRange(uintptr_t, size_t) { return false; }
+
 bool InstallLive07ResourceOwnerHook()
 {
     return false;
@@ -1947,10 +1581,6 @@ bool InstallLive07CleanupEntryHook()
     return false;
 }
 
-bool InstallLive07CleanupGuard()
-{
-    return false;
-}
 
 void PrintLive07ResourceOwnerCrash(EXCEPTION_POINTERS*)
 {
@@ -2246,7 +1876,6 @@ bool InstallFileSystemOpenResolvedHookForCurrentGame()
 
     return false;
 }
-
 
 
 // -------------------------------------------------------------------------
@@ -4511,7 +4140,7 @@ bool loadingprofile06::Initialize() {
     ready = true;
     if (autoCapture) InstallIntroBoundary();
     const bool fastWait = GetPrivateProfileIntA("LOADING", "FAST_FILE_WAIT", 0, ".\\main.ini") != 0;
-    InstallFileCompletionDelay(fastWait);
+    LiveLoading::InstallFileCompletionDelay(fastWait);
     assetHook = InstallFileSystemOpenResolvedHookForCurrentGame();
     closeHook = PatchIAT("KERNEL32.dll", "CloseHandle", reinterpret_cast<void*>(&Close), reinterpret_cast<void**>(&originalClose));
     openAHook = PatchIAT("KERNEL32.dll", "CreateFileA", reinterpret_cast<void*>(&OpenA), reinterpret_cast<void**>(&originalOpenA));
@@ -4531,6 +4160,28 @@ bool loadingprofile06::Initialize() {
 #endif
 }
 
+void ReportLive07CleanupRejection(const char* reason, uintptr_t objectPtr,
+    uintptr_t ownerPtr, uintptr_t ownerListPtr, DWORD ownerCount)
+{
+        if (g_lockReady) {
+            EnterCriticalSection(&g_consoleLock);
+            PrintPrefix(
+                "FIX07",
+                FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+
+            std::printf(
+                "SKIP stale cleanup resource reason=%s "
+                "object=%08lX owner=%08lX list=%08lX count=%08lX\n",
+                reason,
+                static_cast<unsigned long>(objectPtr),
+                static_cast<unsigned long>(ownerPtr),
+                static_cast<unsigned long>(ownerListPtr),
+                static_cast<unsigned long>(ownerCount));
+
+            LeaveCriticalSection(&g_consoleLock);
+        }
+
+}
 } // namespace
 
 void InitializeDebugConsole() {
@@ -4546,9 +4197,11 @@ void InitializeDebugConsole() {
     if (InterlockedCompareExchange(&g_debugConsoleInitState, 1, 0) != 0)
         return;
 
+    LiveLoading::SetWaitObserver(&loadingprofile06::BeginWait, &loadingprofile06::FinishWait);
+
     if (fastFileWait) {
-        const bool installed = loadingprofile06::InstallFileCompletionDelay(true);
-        loadingprofile06::WriteFileWaitInstallStatus(installed);
+        const bool installed = LiveLoading::InstallFileCompletionDelay(true);
+        LiveLoading::WriteFileWaitInstallStatus(installed);
         if (!installed)
             OutputDebugStringA("[Loading] FAST_FILE_WAIT skipped: unsupported build or changed instruction bytes.\n");
     }
@@ -4659,7 +4312,7 @@ void InitializeDebugConsole() {
             cleanup07 ? "OK" : "MISS");
 
         if (g_live07CleanupFix) {
-            const bool cleanupGuard07 = InstallLive07CleanupGuard();
+            const bool cleanupGuard07 = Live07CleanupFix::Install(&IsReadablePointerRange, &ReportLive07CleanupRejection);
             PrintPrefix(
                 "DEBUG",
                 cleanupGuard07 ? (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
@@ -4747,4 +4400,2323 @@ void InitializeDebugConsole() {
     }
 
     std::printf("\n");
+}
+
+// Game context and commentary diagnostics.
+using namespace plugin;
+
+namespace custompaths {
+void* gLastPlayoffSnapshotOptions = nullptr;
+
+unsigned int gLastPlayoffSnapshotHash = 0;
+
+unsigned char gPreviousOptionsSnapshot[0x200] = {};
+
+bool gPreviousOptionsSnapshotValid = false;
+
+FILE* gPlayoffStateLogFile = nullptr;
+
+bool gLastTournamentSnapshotValid = false;
+
+unsigned int gLastTournamentSnapshotHash = 0;
+
+int gLastTournamentGameMode = -1;
+
+unsigned int gPlayoffSnapshotSequence = 0;
+
+unsigned int gLastTournamentPlayoffSequence = 0;
+
+unsigned int gTournamentSnapshotSequence = 0;
+
+TournamentChildSnapshot
+        gTournamentChildSnapshots[kTournamentChildCandidateCount] = {};
+
+unsigned char
+        gLive06PlayoffBracketTeams[kLive06PlayoffBracketSlotCount] = {};
+
+short gLive06PlayoffBracketWins[kLive06PlayoffBracketSlotCount] = {};
+
+bool gLive06PlayoffBracketCacheValid = false;
+
+void* gLive06CapturedPlayoffBracket = nullptr;
+
+PlayoffAccessorTrace
+        gPlayoffAccessorTraces[kPlayoffAccessorTraceCapacity] = {};
+
+unsigned int gPlayoffAccessorTraceCount = 0;
+
+unsigned int gPlayoffAccessorTraceCursor = 0;
+
+CommentaryParameterTrace
+        gCommentaryParameterTraces[kCommentaryParameterTraceCapacity] = {};
+
+unsigned int gCommentaryParameterTraceCount = 0;
+
+unsigned int gCommentaryParameterTraceCursor = 0;
+
+unsigned int gLive06IntroArguments[36] = {};
+
+bool gLive06IntroArgumentsValid = false;
+
+unsigned int gLive06IntroTraceCount = 0;
+
+void InitializePlayoffStateLog()
+    {
+        if (!gPlayoffStateDebug || gPlayoffStateLogFile)
+            return;
+
+        if (!CreateDirectoryA("logs", nullptr))
+        {
+            const DWORD error = GetLastError();
+            if (error != ERROR_ALREADY_EXISTS)
+            {
+                OutputDebugStringA(
+                    "[CustomPaths] Could not create the logs directory.\n");
+                return;
+            }
+        }
+
+        if (fopen_s(
+                &gPlayoffStateLogFile,
+                "logs\\playoff_state.log",
+                "a") != 0 ||
+            !gPlayoffStateLogFile)
+        {
+            gPlayoffStateLogFile = nullptr;
+            OutputDebugStringA(
+                "[CustomPaths] Could not open logs\\playoff_state.log.\n");
+            return;
+        }
+
+        SYSTEMTIME now = {};
+        GetLocalTime(&now);
+        fprintf_s(
+            gPlayoffStateLogFile,
+            "\n============================================================\n"
+            "Playoff-state session: %04u-%02u-%02u %02u:%02u:%02u "
+            "NBA Live %s\n"
+            "============================================================\n",
+            now.wYear,
+            now.wMonth,
+            now.wDay,
+            now.wHour,
+            now.wMinute,
+            now.wSecond,
+            GameVersionName());
+        fflush(gPlayoffStateLogFile);
+
+        OutputDebugStringA(
+            "[CustomPaths] Playoff state log: "
+            "logs\\playoff_state.log.\n");
+    }
+
+void WritePlayoffStateLog(const char* message)
+    {
+        if (!message)
+            return;
+
+        OutputDebugStringA(message);
+        if (!gPlayoffStateLogFile)
+            return;
+
+        fputs(message, gPlayoffStateLogFile);
+        fflush(gPlayoffStateLogFile);
+    }
+
+bool AddMemoryToHash(
+        const void* address,
+        size_t size,
+        unsigned int& hash)
+    {
+        if (!IsReadableMemoryRange(address, size))
+            return false;
+
+        __try
+        {
+            const unsigned char* bytes =
+                reinterpret_cast<const unsigned char*>(address);
+            for (size_t i = 0; i < size; ++i)
+            {
+                hash ^= bytes[i];
+                hash *= 16777619u;
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+void LogRawMemoryBlock(
+        const char* label,
+        const void* address,
+        size_t size)
+    {
+        if (!label || !IsReadableMemoryRange(address, size))
+            return;
+
+        __try
+        {
+            const unsigned char* bytes =
+                reinterpret_cast<const unsigned char*>(address);
+            char message[256] = {};
+            for (size_t offset = 0; offset < size; offset += 16)
+            {
+                const unsigned int* values =
+                    reinterpret_cast<const unsigned int*>(bytes + offset);
+                sprintf_s(
+                    message,
+                    sizeof(message),
+                    "[CustomPaths] %s +%04X: %08X %08X %08X %08X\n",
+                    label,
+                    static_cast<unsigned int>(offset),
+                    values[0],
+                    values[1],
+                    values[2],
+                    values[3]);
+                WritePlayoffStateLog(message);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] Tournament raw-memory read failed.\n");
+        }
+    }
+
+void LogLive06PlayoffSettings(const void* settings)
+    {
+        // NBA Live 06 SettingsObject is 0x428 bytes. The executable's
+        // SettingsObject accessors use the bool array at +0x7E and integer
+        // array at +0xBC. The IDs below come directly from the game's
+        // registered SETTINGS_* enum names. These are setup/configuration
+        // values; the live series results are owned by the bracket object.
+        const size_t settingsSize = 0x428;
+        if (!IsReadableMemoryRange(settings, settingsSize))
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_SETTINGS readable=no.\n");
+            return;
+        }
+
+        const unsigned int awayLostId = 0x0B;
+        const unsigned int awayWonId = 0x0C;
+        const unsigned int homeLostId = 0x23;
+        const unsigned int homeWonId = 0x24;
+        const unsigned int awayCouldWinId = 0x2A;
+        const unsigned int homeCouldWinId = 0x2B;
+        const unsigned int seriesLengthId = 0x3B;
+        const unsigned int roundId = 0x3C;
+        const unsigned int seriesTypeId = 0x3D;
+
+        __try
+        {
+            const unsigned char* bytes =
+                reinterpret_cast<const unsigned char*>(settings);
+            char message[512] = {};
+
+            const unsigned int boolBase = 0x7E;
+            const unsigned int intBase = 0xBC;
+            const int awayLost = *reinterpret_cast<const int*>(
+                bytes + intBase + awayLostId * sizeof(int));
+            const int awayWon = *reinterpret_cast<const int*>(
+                bytes + intBase + awayWonId * sizeof(int));
+            const int homeLost = *reinterpret_cast<const int*>(
+                bytes + intBase + homeLostId * sizeof(int));
+            const int homeWon = *reinterpret_cast<const int*>(
+                bytes + intBase + homeWonId * sizeof(int));
+            const int seriesLength = *reinterpret_cast<const int*>(
+                bytes + intBase + seriesLengthId * sizeof(int));
+            const int round = *reinterpret_cast<const int*>(
+                bytes + intBase + roundId * sizeof(int));
+            const int seriesType = *reinterpret_cast<const int*>(
+                bytes + intBase + seriesTypeId * sizeof(int));
+            const unsigned int awayCouldWin =
+                bytes[boolBase + awayCouldWinId] ? 1u : 0u;
+            const unsigned int homeCouldWin =
+                bytes[boolBase + homeCouldWinId] ? 1u : 0u;
+
+            sprintf_s(
+                message,
+                sizeof(message),
+                "[CustomPaths] PLAYOFF_CONFIG "
+                "awayW=%d awayL=%d homeW=%d homeL=%d "
+                "awayCouldWin=%u homeCouldWin=%u "
+                "length=%d round=%d seriesType=%d\n",
+                awayWon,
+                awayLost,
+                homeWon,
+                homeLost,
+                awayCouldWin,
+                homeCouldWin,
+                seriesLength,
+                round,
+                seriesType);
+            WritePlayoffStateLog(message);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_SETTINGS read failed.\n");
+        }
+    }
+
+void LogLive06PlayoffBracket(const void* bracket)
+    {
+        // The persistent playoff tree contains 30 nodes: 16 first-round
+        // teams, 8 conference-semifinal teams, 4 conference-final teams and
+        // 2 Finals teams. Native function 0x004F8820 reads the consecutive
+        // team bytes at +0x04 and 0x004F8730 writes the corresponding signed
+        // 16-bit win counts at +0x22. Unlike the temporary records at +0x3BC,
+        // these arrays remain valid after the game-launch transition.
+        const size_t bracketSize = 0x4BC;
+        const bool bracketReadable =
+            IsReadableMemoryRange(bracket, bracketSize);
+        if (!bracketReadable && !gLive06PlayoffBracketCacheValid)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_BRACKET readable=no.\n");
+            return;
+        }
+
+        __try
+        {
+            const unsigned char* teams = gLive06PlayoffBracketTeams;
+            const short* wins = gLive06PlayoffBracketWins;
+            if (bracketReadable)
+            {
+                const unsigned char* bytes =
+                    reinterpret_cast<const unsigned char*>(bracket);
+                teams = bytes + 0x04;
+                wins = reinterpret_cast<const short*>(bytes + 0x22);
+            }
+            else
+            {
+                WritePlayoffStateLog(
+                    "[CustomPaths] PLAYOFF_BRACKET source=cached-before-"
+                    "destruction\n");
+            }
+            char message[192] = {};
+
+            for (size_t i = 0;
+                 i < kLive06PlayoffBracketSlotCount;
+                 ++i)
+            {
+                sprintf_s(
+                    message,
+                    sizeof(message),
+                    "[CustomPaths] PLAYOFF_BRACKET_SLOT slot=%02u "
+                    "team=%u wins=%d\n",
+                    static_cast<unsigned int>(i),
+                    static_cast<unsigned int>(teams[i]),
+                    static_cast<int>(wins[i]));
+                WritePlayoffStateLog(message);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_BRACKET persistent read failed.\n");
+        }
+    }
+
+void CaptureLive06PlayoffBracket(const void* bracket)
+    {
+        if (!gPlayoffStateDebug ||
+            !IsReadableMemoryRange(bracket, 0x4BC))
+        {
+            return;
+        }
+
+        __try
+        {
+            const unsigned char* bytes =
+                reinterpret_cast<const unsigned char*>(bracket);
+            std::memcpy(
+                gLive06PlayoffBracketTeams,
+                bytes + 0x04,
+                sizeof(gLive06PlayoffBracketTeams));
+            std::memcpy(
+                gLive06PlayoffBracketWins,
+                bytes + 0x22,
+                sizeof(gLive06PlayoffBracketWins));
+            gLive06CapturedPlayoffBracket = const_cast<void*>(bracket);
+            gLive06PlayoffBracketCacheValid = true;
+
+            char message[160] = {};
+            sprintf_s(
+                message,
+                sizeof(message),
+                "[CustomPaths] PLAYOFF_BRACKET_CAPTURE bracket=%08X "
+                "slots=%u\n",
+                static_cast<unsigned int>(
+                    reinterpret_cast<uintptr_t>(bracket)),
+                static_cast<unsigned int>(
+                    kLive06PlayoffBracketSlotCount));
+            WritePlayoffStateLog(message);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_BRACKET capture failed.\n");
+        }
+    }
+
+void __fastcall Live06PlayoffBracketDestructorHook(
+        void* bracket,
+        void*)
+    {
+        CaptureLive06PlayoffBracket(bracket);
+        CallMethodDynGlobal(0x0051E700, bracket);
+    }
+
+const char* Live06PlayoffSettingName(unsigned int id)
+    {
+        switch (id)
+        {
+        case 0x0B: return "AWAY_LOST";
+        case 0x0C: return "AWAY_WON";
+        case 0x23: return "HOME_LOST";
+        case 0x24: return "HOME_WON";
+        case 0x2A: return "AWAY_COULD_WIN";
+        case 0x2B: return "HOME_COULD_WIN";
+        case 0x3B: return "LENGTH";
+        case 0x3C: return "ROUND";
+        case 0x3D: return "SERIES_TYPE";
+        default:   return "UNKNOWN";
+        }
+    }
+
+void LogLive06PlayoffAccessor(
+        void* settings,
+        uintptr_t caller,
+        unsigned int id,
+        unsigned int source,
+        int value,
+        bool isBoolean)
+    {
+        if (!gPlayoffStateDebug)
+            return;
+
+        for (unsigned int i = 0;
+             i < gPlayoffAccessorTraceCount;
+             ++i)
+        {
+            const PlayoffAccessorTrace& trace =
+                gPlayoffAccessorTraces[i];
+            if (trace.settings == settings &&
+                trace.caller == caller &&
+                trace.id == id &&
+                trace.source == source &&
+                trace.value == value &&
+                trace.isBoolean == isBoolean)
+            {
+                return;
+            }
+        }
+
+        PlayoffAccessorTrace& trace =
+            gPlayoffAccessorTraces[gPlayoffAccessorTraceCursor];
+        trace.settings = settings;
+        trace.caller = caller;
+        trace.id = id;
+        trace.source = source;
+        trace.value = value;
+        trace.isBoolean = isBoolean;
+
+        if (gPlayoffAccessorTraceCount < kPlayoffAccessorTraceCapacity)
+            ++gPlayoffAccessorTraceCount;
+        gPlayoffAccessorTraceCursor =
+            (gPlayoffAccessorTraceCursor + 1) %
+            kPlayoffAccessorTraceCapacity;
+
+        char message[256] = {};
+        sprintf_s(
+            message,
+            sizeof(message),
+            "[CustomPaths] PLAYOFF_ACCESS type=%s name=%s id=%02X "
+            "value=%d source=%u settings=%08X caller=%08X\n",
+            isBoolean ? "bool" : "int",
+            Live06PlayoffSettingName(id),
+            id,
+            value,
+            source,
+            static_cast<unsigned int>(
+                reinterpret_cast<uintptr_t>(settings)),
+            static_cast<unsigned int>(caller));
+        WritePlayoffStateLog(message);
+    }
+
+void LogLive06CommentaryParameter(
+        uintptr_t caller,
+        unsigned int index,
+        int value,
+        bool write)
+    {
+        if (!gPlayoffStateDebug)
+            return;
+
+        for (unsigned int i = 0;
+             i < gCommentaryParameterTraceCount;
+             ++i)
+        {
+            const CommentaryParameterTrace& trace =
+                gCommentaryParameterTraces[i];
+            if (trace.caller == caller &&
+                trace.index == index &&
+                trace.value == value &&
+                trace.write == write)
+            {
+                return;
+            }
+        }
+
+        CommentaryParameterTrace& trace =
+            gCommentaryParameterTraces[gCommentaryParameterTraceCursor];
+        trace.caller = caller;
+        trace.index = index;
+        trace.value = value;
+        trace.write = write;
+        if (gCommentaryParameterTraceCount <
+            kCommentaryParameterTraceCapacity)
+        {
+            ++gCommentaryParameterTraceCount;
+        }
+        gCommentaryParameterTraceCursor =
+            (gCommentaryParameterTraceCursor + 1) %
+            kCommentaryParameterTraceCapacity;
+
+        char message[224] = {};
+        sprintf_s(
+            message,
+            sizeof(message),
+            "[CustomPaths] PLAYOFF_COMMENTARY_PARAM op=%s index=%u "
+            "value=%d caller=%08X\n",
+            write ? "write" : "read",
+            index,
+            value,
+            static_cast<unsigned int>(caller));
+        WritePlayoffStateLog(message);
+    }
+
+#if defined(_M_IX86)
+uintptr_t gLive06IntroEventTarget = 0x00434610;
+
+uintptr_t gLive06SpeechDispatchContinuation = 0;
+
+void __stdcall LogLive06SpeechDispatch(const unsigned int* entryStack)
+    {
+        static unsigned int snapshots = 0;
+        static unsigned int previousHash = 0;
+        static bool previousValid = false;
+        if (!gPlayoffStateDebug || snapshots >= 512)
+            return;
+        __try
+        {
+            const unsigned int caller = entryStack[0];
+            // Native speech emitters. Exclude frontend and middleware traffic.
+            const bool live07 = gGameVersion == GAME_LIVE_07 || gGameVersion == GAME_LIVE_08;
+            if (caller < (live07 ? 0x00460000u : 0x00430000u) ||
+                caller >= (live07 ? 0x004A0000u : 0x00470000u))
+                return;
+            const unsigned int event = entryStack[1];
+            const unsigned int count = entryStack[2];
+            if (count > 64 ||
+                !IsReadableMemoryRange(entryStack, (count + 3) * sizeof(unsigned int)))
+                return;
+            unsigned int hash = 2166136261u;
+            for (unsigned int i = 0; i < count + 3; ++i)
+                hash = (hash ^ entryStack[i]) * 16777619u;
+            if (previousValid && hash == previousHash)
+                return;
+            previousHash = hash;
+            previousValid = true;
+            ++snapshots;
+            char message[320] = {};
+            sprintf_s(message, sizeof(message),
+                "[CustomPaths] PLAYOFF_SPEECH_EVENT snapshot=%u "
+                "event=%u route=%u group=%u packed=%08X count=%u caller=%08X\n",
+                snapshots, event & 0xFFFFu, event >> 24,
+                (event >> 16) & 0xFFu, event, count, caller);
+            WritePlayoffStateLog(message);
+            for (unsigned int i = 0; i < count; ++i)
+            {
+                sprintf_s(message, sizeof(message),
+                    "[CustomPaths] PLAYOFF_SPEECH_ARG snapshot=%u "
+                    "index=%02u hex=%08X signed=%d\n", snapshots, i,
+                    entryStack[i + 3], static_cast<int>(entryStack[i + 3]));
+                WritePlayoffStateLog(message);
+            }
+            // Capture the settings at the actual speech dispatch boundary.
+            // This also works when the event-8 emitter never runs.
+            LogLive06AudioSettings("speech-dispatch");
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_SPEECH_EVENT unreadable.\n");
+        }
+    }
+
+void __declspec(naked) Live06SpeechDispatchTraceHook()
+    {
+        __asm
+        {
+            pushfd
+            pushad
+            cld
+            mov ebx, esp
+            lea eax, [ebx + 36]
+            sub esp, 528
+            and esp, 0FFFFFFF0h
+            fxsave [esp]
+            push eax
+            call LogLive06SpeechDispatch
+            fxrstor [esp]
+            mov esp, ebx
+            popad
+            popfd
+            jmp dword ptr [gLive06SpeechDispatchContinuation]
+        }
+    }
+
+bool InstallLive06SpeechDispatchTrace()
+    {
+        // Whole instructions: PUSH EBX; PUSH ESI; PUSH EDI;
+        // MOV EDI,[ESP+14h]. No relative instructions in this prologue.
+        const bool live07 = gGameVersion == GAME_LIVE_07;
+        const bool live08 = gGameVersion == GAME_LIVE_08;
+        const size_t patchLength = live07 || live08 ? 6 : 7;
+        unsigned char* target = reinterpret_cast<unsigned char*>(gGameVersion == GAME_LIVE_2005 ? 0x0070DDB0 : (live08 ? 0x00851580 : (live07 ? 0x00822540 : 0x00722C0D)));
+        const unsigned char expected[7] = {
+            0x53, 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x14
+        };
+        const unsigned char expected07[6] = { 0x55, 0x8B, 0xEC, 0x53, 0x56, 0x57 };
+        if (std::memcmp(target, live07 || live08 ? expected07 : expected, patchLength) != 0)
+            return false;
+        unsigned char* trampoline = static_cast<unsigned char*>(VirtualAlloc(
+            nullptr, patchLength + 5, MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE));
+        if (!trampoline)
+            return false;
+        std::memcpy(trampoline, target, patchLength);
+        trampoline[patchLength] = 0xE9;
+        const int back = static_cast<int>(
+            reinterpret_cast<uintptr_t>(target + patchLength) -
+            reinterpret_cast<uintptr_t>(trampoline + patchLength + 5));
+        std::memcpy(trampoline + patchLength + 1, &back, sizeof(back));
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(target, patchLength, PAGE_EXECUTE_READWRITE,
+                            &oldProtect))
+        {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            return false;
+        }
+        gLive06SpeechDispatchContinuation =
+            reinterpret_cast<uintptr_t>(trampoline);
+        unsigned char replacement[7] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90 };
+        const int forward = static_cast<int>(
+            reinterpret_cast<uintptr_t>(Live06SpeechDispatchTraceHook) -
+            reinterpret_cast<uintptr_t>(target + 5));
+        std::memcpy(replacement + 1, &forward, sizeof(forward));
+        std::memcpy(target, replacement, patchLength);
+        DWORD ignored = 0;
+        VirtualProtect(target, patchLength, oldProtect, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), trampoline, patchLength + 5);
+        FlushInstructionCache(GetCurrentProcess(), target, patchLength);
+        return true;
+    }
+
+void LogLive06AudioSettings(const char* phase)
+    {
+        char message[320] = {};
+        __try
+        {
+            const unsigned char* root =
+                *reinterpret_cast<unsigned char**>(gGameVersion == GAME_LIVE_2005
+                    ? 0x00C44A30 : (gGameVersion == GAME_LIVE_08
+                    ? 0x00DA3D08 : (gGameVersion == GAME_LIVE_07 ? 0x00CE8378 : 0x00CAF5D8)));
+            if (!IsReadableMemoryRange(root, 0x3C))
+                return;
+            const unsigned char* rules =
+                *reinterpret_cast<const unsigned char* const*>(root + 0x28);
+            sprintf_s(message, sizeof(message),
+                "[CustomPaths] PLAYOFF_AUDIO_SETTINGS phase=%s root=%08X "
+                "rules=%08X lastOptions=%08X ready=%u active=%u\n", phase,
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(root)),
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(rules)),
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(gLastPlayoffSnapshotOptions)),
+                static_cast<unsigned int>(root[8]),
+                static_cast<unsigned int>(root[9]));
+            WritePlayoffStateLog(message);
+            if (!IsReadableMemoryRange(rules, 0x174))
+                return;
+            sprintf_s(message, sizeof(message),
+                "[CustomPaths] PLAYOFF_AUDIO_RULES phase=%s mode=%d "
+                "round=%d adjacent=%d length=%d\n", phase,
+                *reinterpret_cast<const int*>(rules + (gGameVersion == GAME_LIVE_08 ? 0x64 : 0x5C)),
+                *reinterpret_cast<const int*>(rules + (gGameVersion == GAME_LIVE_08 ? 0x168 : 0x158)),
+                *reinterpret_cast<const int*>(rules + (gGameVersion == GAME_LIVE_08 ? 0x16C : 0x15C)),
+                *reinterpret_cast<const int*>(rules + (gGameVersion == GAME_LIVE_08 ? 0x170 : 0x160)));
+            WritePlayoffStateLog(message);
+            LogRawMemoryBlock("AUDIO_RULES_100", rules + 0x100, 0x70);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_AUDIO_SETTINGS unreadable.\n");
+        }
+    }
+
+void __stdcall LogLive06SetupHandoff(
+        const unsigned char* setup, const unsigned int* entryStack,
+        const unsigned int* vtable, void* interfaceObject)
+    {
+        static unsigned int count = 0;
+        if (!gPlayoffStateDebug || count >= 32)
+            return;
+        ++count;
+        char message[320] = {};
+        __try
+        {
+            const unsigned char* rules =
+                reinterpret_cast<const unsigned char*>(entryStack[2]);
+            sprintf_s(message, sizeof(message),
+                "[CustomPaths] PLAYOFF_SETUP_HANDOFF snapshot=%u "
+                "setup=%08X interface=%08X target=%08X "
+                "settings=%08X rules=%08X\n", count,
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(setup)),
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(interfaceObject)),
+                vtable[0x15C / 4], entryStack[1], entryStack[2]);
+            WritePlayoffStateLog(message);
+            if (IsReadableMemoryRange(rules, 0x174))
+            {
+                sprintf_s(message, sizeof(message),
+                    "[CustomPaths] PLAYOFF_SETUP_RULES mode=%d "
+                    "field158=%d field15C=%d length160=%d\n",
+                    *reinterpret_cast<const int*>(rules + 0x5C),
+                    *reinterpret_cast<const int*>(rules + 0x158),
+                    *reinterpret_cast<const int*>(rules + 0x15C),
+                    *reinterpret_cast<const int*>(rules + 0x160));
+                WritePlayoffStateLog(message);
+                LogRawMemoryBlock("SETUP_RULES_100", rules + 0x100, 0x70);
+            }
+            LogLive06AudioSettings("setup-handoff-before");
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_SETUP_HANDOFF unreadable.\n");
+        }
+    }
+
+void __declspec(naked) Live06SetupHandoffTraceHook()
+    {
+        // Replace only CALL [eax+15Ch]. EAX is the native vtable and ECX
+        // the native interface. Restore all state before dispatching it.
+        __asm
+        {
+            pushfd
+            pushad
+            cld
+            mov ebx, esp
+            sub esp, 528
+            and esp, 0FFFFFFF0h
+            fxsave [esp]
+            push dword ptr [ebx + 24]
+            push dword ptr [ebx + 28]
+            lea edx, [ebx + 36]
+            push edx
+            push dword ptr [ebx + 4]
+            call LogLive06SetupHandoff
+            fxrstor [esp]
+            mov esp, ebx
+            popad
+            popfd
+            jmp dword ptr [eax + 15Ch]
+        }
+    }
+
+bool InstallLive06SetupHandoffTrace()
+    {
+        unsigned char* site = reinterpret_cast<unsigned char*>(0x0062F7DF);
+        const unsigned char expected[6] = { 0xFF, 0x90, 0x5C, 0x01, 0, 0 };
+        if (std::memcmp(site, expected, sizeof(expected)) != 0)
+            return false;
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(site, sizeof(expected), PAGE_EXECUTE_READWRITE,
+                            &oldProtect))
+            return false;
+        unsigned char replacement[6] = { 0xE8, 0, 0, 0, 0, 0x90 };
+        const int displacement = static_cast<int>(
+            reinterpret_cast<uintptr_t>(Live06SetupHandoffTraceHook) -
+            reinterpret_cast<uintptr_t>(site + 5));
+        std::memcpy(replacement + 1, &displacement, sizeof(displacement));
+        std::memcpy(site, replacement, sizeof(replacement));
+        DWORD ignored = 0;
+        VirtualProtect(site, sizeof(expected), oldProtect, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), site, sizeof(expected));
+        return true;
+    }
+
+void __stdcall LogLive06IntroArguments(const unsigned int* entryStack)
+    {
+        if (!gPlayoffStateDebug || gLive06IntroTraceCount >= 64)
+            return;
+
+        unsigned int arguments[36] = {};
+        __try
+        {
+            std::memcpy(arguments, entryStack + 1, sizeof(arguments));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] PLAYOFF_INTRO arguments unreadable.\n");
+            return;
+        }
+
+        if (gLive06IntroArgumentsValid &&
+            std::memcmp(arguments, gLive06IntroArguments,
+                        sizeof(arguments)) == 0)
+        {
+            return;
+        }
+        std::memcpy(gLive06IntroArguments, arguments, sizeof(arguments));
+        gLive06IntroArgumentsValid = true;
+        ++gLive06IntroTraceCount;
+
+        char message[320] = {};
+        sprintf_s(message, sizeof(message),
+            "[CustomPaths] PLAYOFF_INTRO snapshot=%u event=8 count=36 "
+            "caller=%08X forced=%u\n",
+            gLive06IntroTraceCount, entryStack[0],
+            gForcedSeriesEnabled && gForcedStageEnabled &&
+                gForceGlobalGameMode ? 1u : 0u);
+        WritePlayoffStateLog(message);
+
+        LogLive06AudioSettings("intro-event");
+        for (unsigned int i = 0; i < 36; i += 4)
+        {
+            sprintf_s(message, sizeof(message),
+                "[CustomPaths] PLAYOFF_INTRO_ARGS snapshot=%u "
+                "index=%02u..%02u hex=%08X,%08X,%08X,%08X "
+                "signed=%d,%d,%d,%d\n",
+                gLive06IntroTraceCount, i, i + 3,
+                arguments[i], arguments[i + 1],
+                arguments[i + 2], arguments[i + 3],
+                static_cast<int>(arguments[i]),
+                static_cast<int>(arguments[i + 1]),
+                static_cast<int>(arguments[i + 2]),
+                static_cast<int>(arguments[i + 3]));
+            WritePlayoffStateLog(message);
+        }
+    }
+
+void __declspec(naked) Live06IntroEventTraceHook()
+    {
+        // The native cdecl emitter receives 36 dwords. Preserve its exact
+        // stack, registers, flags, x87 and SSE state, then tail-call it.
+        __asm
+        {
+            pushfd
+            pushad
+            cld
+            mov ebx, esp
+            lea eax, [ebx + 36]
+            sub esp, 528
+            and esp, 0FFFFFFF0h
+            fxsave [esp]
+            push eax
+            call LogLive06IntroArguments
+            fxrstor [esp]
+            mov esp, ebx
+            popad
+            popfd
+            jmp dword ptr [gLive06IntroEventTarget]
+        }
+    }
+
+#endif
+void LogLive06TournamentState()
+    {
+        if (!gPlayoffStateDebug || gGameVersion != GAME_LIVE_06)
+            return;
+
+        // Log exactly once for each PLAYOFF_STATE notification, even when
+        // the decoded SettingsObject and bracket bytes happen to be equal.
+        if (gPlayoffSnapshotSequence == 0 ||
+            gLastTournamentPlayoffSequence == gPlayoffSnapshotSequence)
+        {
+            return;
+        }
+
+        const size_t uberSize = 0x90;
+        // Executable research identified +0x58 as SettingsObject and +0x74
+        // as the tournament/bracket object. Do not scan unrelated FE objects.
+        const unsigned int childOffsets[kTournamentChildCandidateCount] = {
+            0x58, 0x74
+        };
+        const size_t childSizes[kTournamentChildCandidateCount] = {
+            0x428, 0x854
+        };
+        void* uber = nullptr;
+
+        __try
+        {
+            uber = *reinterpret_cast<void**>(0x00CB2A2C);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+
+        if (!IsReadableMemoryRange(uber, uberSize))
+            return;
+
+        void* children[kTournamentChildCandidateCount] = {};
+        void* tournamentRoot = nullptr;
+        void* bracket = nullptr;
+        int gameMode = -1;
+        __try
+        {
+            const unsigned char* bytes =
+                reinterpret_cast<const unsigned char*>(uber);
+            gameMode = *reinterpret_cast<const int*>(bytes + 0x08);
+            for (size_t i = 0; i < kTournamentChildCandidateCount; ++i)
+            {
+                children[i] = *reinterpret_cast<void* const*>(
+                    bytes + childOffsets[i]);
+            }
+
+            // The global game-mode owner stores the active playoff bracket at
+            // +0x8E4. Native playoff code at 0x004F82D2 follows this exact
+            // chain, and the bracket destructor at 0x0051E710 clears it.
+            tournamentRoot = *reinterpret_cast<void**>(0x00CB2B08);
+            const unsigned char* tournamentRootBytes =
+                reinterpret_cast<const unsigned char*>(tournamentRoot);
+            if (IsReadableMemoryRange(tournamentRootBytes, 0x8E8))
+            {
+                bracket = *reinterpret_cast<void* const*>(
+                    tournamentRootBytes + 0x8E4);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+
+        unsigned int hash = 2166136261u;
+        if (!AddMemoryToHash(uber, uberSize, hash))
+            return;
+
+        for (size_t i = 0; i < kTournamentChildCandidateCount; ++i)
+        {
+            const size_t childSize = childSizes[i];
+            const uintptr_t pointerValue =
+                reinterpret_cast<uintptr_t>(children[i]);
+            hash ^= static_cast<unsigned int>(pointerValue);
+            hash *= 16777619u;
+            AddMemoryToHash(children[i], childSize, hash);
+        }
+
+        const uintptr_t bracketPointerValue =
+            reinterpret_cast<uintptr_t>(bracket);
+        hash ^= static_cast<unsigned int>(bracketPointerValue);
+        hash *= 16777619u;
+        AddMemoryToHash(bracket, 0x4BC, hash);
+
+        const bool gameModeChanged = gameMode != gLastTournamentGameMode;
+
+        gLastTournamentPlayoffSequence = gPlayoffSnapshotSequence;
+        gLastTournamentSnapshotValid = true;
+        gLastTournamentSnapshotHash = hash;
+        ++gTournamentSnapshotSequence;
+
+        if (gameModeChanged)
+        {
+            gLastTournamentGameMode = gameMode;
+            std::memset(
+                gTournamentChildSnapshots,
+                0,
+                sizeof(gTournamentChildSnapshots));
+        }
+
+        char message[256] = {};
+        sprintf_s(
+            message,
+            sizeof(message),
+            "[CustomPaths] TOURNAMENT_STATE snapshot=%u uber=%08X "
+            "gameMode=%d hash=%08X\n",
+            gTournamentSnapshotSequence,
+            static_cast<unsigned int>(reinterpret_cast<uintptr_t>(uber)),
+            gameMode,
+            hash);
+        WritePlayoffStateLog(message);
+
+        LogLive06PlayoffSettings(children[0]);
+        sprintf_s(
+            message,
+            sizeof(message),
+            "[CustomPaths] PLAYOFF_BRACKET root=%08X bracket=%08X\n",
+            static_cast<unsigned int>(
+                reinterpret_cast<uintptr_t>(tournamentRoot)),
+            static_cast<unsigned int>(
+                reinterpret_cast<uintptr_t>(bracket)));
+        WritePlayoffStateLog(message);
+        LogLive06PlayoffBracket(bracket);
+
+        if (gameModeChanged)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] TOURNAMENT_CONTEXT changed; child "
+                "baselines reset.\n");
+        }
+
+        LogRawMemoryBlock("FE_UBER", uber, uberSize);
+
+        for (size_t i = 0; i < kTournamentChildCandidateCount; ++i)
+        {
+            const size_t childSize = childSizes[i];
+            const bool readable =
+                IsReadableMemoryRange(children[i], childSize);
+            TournamentChildSnapshot& previous =
+                gTournamentChildSnapshots[i];
+
+            if (!readable)
+            {
+                if (previous.valid || previous.pointer != children[i])
+                {
+                    sprintf_s(
+                        message,
+                        sizeof(message),
+                        "[CustomPaths] FE_CHILD_%02X pointer=%08X "
+                        "readable=no\n",
+                        childOffsets[i],
+                        static_cast<unsigned int>(
+                            reinterpret_cast<uintptr_t>(children[i])));
+                    WritePlayoffStateLog(message);
+                }
+                previous.pointer = children[i];
+                previous.valid = false;
+                continue;
+            }
+
+            __try
+            {
+                const unsigned char* current =
+                    reinterpret_cast<const unsigned char*>(children[i]);
+
+                if (!previous.valid || previous.pointer != children[i])
+                {
+                    previous.pointer = children[i];
+                    std::memcpy(previous.bytes, current, childSize);
+                    previous.valid = true;
+                    sprintf_s(
+                        message,
+                        sizeof(message),
+                        "[CustomPaths] FE_CHILD_%02X baseline pointer=%08X "
+                        "size=%04X\n",
+                        childOffsets[i],
+                        static_cast<unsigned int>(
+                            reinterpret_cast<uintptr_t>(children[i])),
+                        static_cast<unsigned int>(childSize));
+                    WritePlayoffStateLog(message);
+                    continue;
+                }
+
+                unsigned int changed = 0;
+                const unsigned int maximumLoggedChanges = 256;
+                for (size_t offset = 0;
+                     offset + sizeof(unsigned int) <= childSize;
+                     offset += sizeof(unsigned int))
+                {
+                    const unsigned int oldValue =
+                        *reinterpret_cast<const unsigned int*>(
+                            previous.bytes + offset);
+                    const unsigned int newValue =
+                        *reinterpret_cast<const unsigned int*>(
+                            current + offset);
+                    if (oldValue == newValue)
+                        continue;
+
+                    if (changed < maximumLoggedChanges)
+                    {
+                        sprintf_s(
+                            message,
+                            sizeof(message),
+                            "[CustomPaths] FE_CHILD_%02X_CHANGE +%04X: "
+                            "%08X -> %08X\n",
+                            childOffsets[i],
+                            static_cast<unsigned int>(offset),
+                            oldValue,
+                            newValue);
+                        WritePlayoffStateLog(message);
+                    }
+                    ++changed;
+                }
+
+                if (changed > maximumLoggedChanges)
+                {
+                    sprintf_s(
+                        message,
+                        sizeof(message),
+                        "[CustomPaths] FE_CHILD_%02X_CHANGE truncated: "
+                        "%u total changed dwords.\n",
+                        childOffsets[i],
+                        changed);
+                    WritePlayoffStateLog(message);
+                }
+
+                if (changed != 0)
+                {
+                    std::memcpy(previous.bytes, current, childSize);
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                sprintf_s(
+                    message,
+                    sizeof(message),
+                    "[CustomPaths] FE_CHILD_%02X comparison failed.\n",
+                    childOffsets[i]);
+                WritePlayoffStateLog(message);
+                previous.valid = false;
+            }
+        }
+    }
+
+void LogPlayoffStateSnapshot(void* options)
+    {
+        if (!gPlayoffStateDebug || !options)
+            return;
+
+        const unsigned int firstOffset = 0x40;
+        const unsigned int endOffset =
+            gGameVersion == GAME_LIVE_08 ? 0x190 : 0x180;
+        const unsigned int modeOffset =
+            gGameVersion == GAME_LIVE_08 ? 0x64 : 0x5C;
+        const unsigned int roundOffset =
+            gGameVersion == GAME_LIVE_08 ? 0x168 : 0x158;
+
+        __try
+        {
+            const unsigned char* bytes =
+                reinterpret_cast<const unsigned char*>(options);
+            unsigned int hash = 2166136261u;
+            for (unsigned int i = firstOffset; i < endOffset; ++i)
+            {
+                hash ^= bytes[i];
+                hash *= 16777619u;
+            }
+
+            // Repeated GameCourt notifications normally carry the same state.
+            // If the Live 06 schedule database was not ready on the first
+            // notification, keep retrying until the exact series score has
+            // been resolved.
+            if (options == gLastPlayoffSnapshotOptions &&
+                hash == gLastPlayoffSnapshotHash &&
+                !gRetryLive06PlayoffSeries)
+            {
+                return;
+            }
+            gLastPlayoffSnapshotOptions = options;
+            gLastPlayoffSnapshotHash = hash;
+            gRetryLive06PlayoffSeries = false;
+            ++gPlayoffSnapshotSequence;
+
+            const int mode = *reinterpret_cast<const int*>(bytes + modeOffset);
+            const int round = *reinterpret_cast<const int*>(bytes + roundOffset);
+            char iniPath[MAX_PATH] = {};
+            const DWORD exeLength = GetModuleFileNameA(
+                nullptr, iniPath, static_cast<DWORD>(sizeof(iniPath)));
+            if (exeLength == 0 || exeLength >= sizeof(iniPath))
+            {
+                strcpy_s(iniPath, ".\\main.ini");
+            }
+            else
+            {
+                char* slash = strrchr(iniPath, '\\');
+                if (slash)
+                    strcpy_s(slash + 1,
+                        sizeof(iniPath) -
+                            static_cast<size_t>(slash + 1 - iniPath),
+                        "main.ini");
+                else
+                    strcpy_s(iniPath, "main.ini");
+            }
+
+            char rawStage[32] = {};
+            GetPrivateProfileStringA(
+                "PLAYOFF", "FORCE_STAGE", "OFF",
+                rawStage, sizeof(rawStage), iniPath);
+
+            char message[512] = {};
+            sprintf_s(
+                message,
+                sizeof(message),
+                "[CustomPaths] PLAYOFF_FORCE stage=%s enabled=%u global=%u "
+                "series=%u game=%d homeWins=%d awayWins=%d "
+                "iniStage=%s ini=%s\n",
+                StageName(gForcedStage),
+                gForcedStageEnabled ? 1u : 0u,
+                gForceGlobalGameMode ? 1u : 0u,
+                gForcedSeriesEnabled ? 1u : 0u,
+                gForcedSeriesGame,
+                gForcedHomeWins,
+                gForcedAwayWins,
+                rawStage,
+                iniPath);
+            WritePlayoffStateLog(message);
+
+            sprintf_s(
+                message,
+                sizeof(message),
+                "[CustomPaths] PLAYOFF_STATE game=%s options=%08X "
+                "mode[+%04X]=%d round[+%04X]=%d hash=%08X\n",
+                GameVersionName(),
+                static_cast<unsigned int>(reinterpret_cast<uintptr_t>(options)),
+                modeOffset,
+                mode,
+                roundOffset,
+                round,
+                hash);
+            WritePlayoffStateLog(message);
+
+            if (gGameVersion == GAME_LIVE_06)
+            {
+                // RulesSettings carries the two native playoff-clinching
+                // flags directly. Gameplay copies +0x10D/+0x10E into
+                // 0x00D212D5/0x00D212D4 in sub_8CF820, and GdCentral copies
+                // the same bytes into its presentation state at +0x24/+0x25.
+                const bool awayCanWin = bytes[0x10D] != 0;
+                const bool homeCanWin = bytes[0x10E] != 0;
+                const char* clinchState = "none";
+                if (awayCanWin && homeCanWin)
+                    clinchState = "decisive";
+                else if (awayCanWin)
+                    clinchState = "away-can-clinch";
+                else if (homeCanWin)
+                    clinchState = "home-can-clinch";
+
+                sprintf_s(
+                    message,
+                    sizeof(message),
+                    "[CustomPaths] PLAYOFF_RULES awayCanWin=%u "
+                    "homeCanWin=%u clinchState=%s\n",
+                    awayCanWin ? 1u : 0u,
+                    homeCanWin ? 1u : 0u,
+                    clinchState);
+                WritePlayoffStateLog(message);
+
+                // ScheduleInfo.GetGame/GetLastGame read these two native
+                // identifiers from the Live 06 schedule service. Keep this
+                // probe narrow: it avoids reopening scheduleplayoff.dbf or
+                // tracing the generic database layer during every file load.
+                const unsigned char* scheduleInfo =
+                    *reinterpret_cast<unsigned char* const*>(0x00CB2AE0);
+                if (scheduleInfo)
+                {
+                    const unsigned int currentGame =
+                        *reinterpret_cast<const unsigned short*>(
+                            scheduleInfo + 0x64);
+                    const unsigned int lastGame =
+                        *reinterpret_cast<const unsigned short*>(
+                            scheduleInfo + 0x66);
+
+                    // scheduleplayoff.dbf interleaves the 15 bracket series:
+                    // one potential game for every series per block. Thus a
+                    // series advances by 15 GAMENUM values each game.
+                    const bool validPlayoffGame =
+                        currentGame > 0u && currentGame <= 15u * 7u;
+                    const unsigned int seriesGame =
+                        validPlayoffGame
+                            ? ((currentGame - 1u) / 15u) + 1u
+                            : 0u;
+                    const unsigned int bracketSlot =
+                        validPlayoffGame
+                            ? ((currentGame - 1u) % 15u) + 1u
+                            : 0u;
+
+                    char seriesState[64] = "unknown";
+                    if (seriesGame == 1u)
+                    {
+                        strcpy_s(seriesState, "tied-0-0");
+                    }
+                    else if (awayCanWin && homeCanWin)
+                    {
+                        strcpy_s(seriesState, "tied-3-3");
+                    }
+                    else if (awayCanWin && seriesGame >= 4u)
+                    {
+                        sprintf_s(
+                            seriesState,
+                            sizeof(seriesState),
+                            "away-leads-3-%u",
+                            seriesGame - 4u);
+                    }
+                    else if (homeCanWin && seriesGame >= 4u)
+                    {
+                        sprintf_s(
+                            seriesState,
+                            sizeof(seriesState),
+                            "home-leads-3-%u",
+                            seriesGame - 4u);
+                    }
+                    else if (seriesGame == 5u)
+                    {
+                        // Four completed games and neither team has three
+                        // wins can only be a 2-2 series.
+                        strcpy_s(seriesState, "tied-2-2");
+                    }
+
+                    sprintf_s(
+                        message,
+                        sizeof(message),
+                        "[CustomPaths] PLAYOFF_SCHEDULE currentGame=%u "
+                        "lastGame=%u seriesGame=%u bracketSlot=%u "
+                        "seriesState=%s service=%08X\n",
+                        currentGame,
+                        lastGame,
+                        seriesGame,
+                        bracketSlot,
+                        seriesState,
+                        static_cast<unsigned int>(
+                            reinterpret_cast<uintptr_t>(scheduleInfo)));
+                    WritePlayoffStateLog(message);
+
+                    if (gForcedSeriesEnabled &&
+                        gForcedStageEnabled &&
+                        gForceGlobalGameMode)
+                    {
+                        gRetryLive06PlayoffSeries = false;
+                        sprintf_s(
+                            message,
+                            sizeof(message),
+                            "[CustomPaths] PLAYOFF_SERIES forced=yes "
+                            "game=%d homeWins=%d awayWins=%d exact=yes\n",
+                            gForcedSeriesGame,
+                            gForcedHomeWins,
+                            gForcedAwayWins);
+                        WritePlayoffStateLog(message);
+                    }
+                    else
+                    {
+                        // Read the live schedule records owned by the game and
+                        // count the completed games in this exact bracket slot.
+                        // The DBF layout advances a series by 15 IDs per game.
+                        Live06ScheduleGame currentScheduleGame = {};
+                        if (validPlayoffGame &&
+                            ReadLive06ScheduleGame(
+                                currentGame,
+                                currentScheduleGame))
+                        {
+                            // Native normalized layout: +20 home team, +22
+                            // home score, +26 away team, +28 away score.
+                            const short homeTeam = ReadScheduleShort(
+                                currentScheduleGame,
+                                20);
+                            const short awayTeam = ReadScheduleShort(
+                                currentScheduleGame,
+                                26);
+                            unsigned int homeWins = 0;
+                            unsigned int awayWins = 0;
+                            unsigned int historyGames = 0;
+                            bool exactSeriesScore =
+                                homeTeam >= 0 && awayTeam >= 0 &&
+                                homeTeam != awayTeam;
+
+                            unsigned int previousGame = currentGame;
+                            while (exactSeriesScore && previousGame > 15u)
+                            {
+                                previousGame -= 15u;
+                                Live06ScheduleGame prior = {};
+                                if (!ReadLive06ScheduleGame(previousGame, prior))
+                                {
+                                    exactSeriesScore = false;
+                                    break;
+                                }
+
+                                const short priorHome =
+                                    ReadScheduleShort(prior, 20);
+                                const short priorAway =
+                                    ReadScheduleShort(prior, 26);
+                                const short priorHomeScore =
+                                    ReadScheduleShort(prior, 22);
+                                const short priorAwayScore =
+                                    ReadScheduleShort(prior, 28);
+                                const bool sameTeams =
+                                    (priorHome == homeTeam &&
+                                     priorAway == awayTeam) ||
+                                    (priorHome == awayTeam &&
+                                     priorAway == homeTeam);
+
+                                // +18 is PLAYED in the normalized native record.
+                                if (prior.bytes[18] == 0 ||
+                                    !sameTeams ||
+                                    priorHomeScore == priorAwayScore)
+                                {
+                                    exactSeriesScore = false;
+                                    break;
+                                }
+
+                                const short winner =
+                                    priorHomeScore > priorAwayScore
+                                        ? priorHome
+                                        : priorAway;
+                                if (winner == homeTeam)
+                                    ++homeWins;
+                                else if (winner == awayTeam)
+                                    ++awayWins;
+                                else
+                                {
+                                    exactSeriesScore = false;
+                                    break;
+                                }
+                                ++historyGames;
+                            }
+
+                            // All preceding games must have been accounted for.
+                            if (historyGames + 1u != seriesGame)
+                                exactSeriesScore = false;
+
+                            gRetryLive06PlayoffSeries = !exactSeriesScore;
+
+                            sprintf_s(
+                                message,
+                                sizeof(message),
+                                "[CustomPaths] PLAYOFF_SERIES game=%u "
+                                "homeTeam=%d awayTeam=%d homeWins=%u "
+                                "awayWins=%u historyGames=%u exact=%s\n",
+                                seriesGame,
+                                homeTeam,
+                                awayTeam,
+                                homeWins,
+                                awayWins,
+                                historyGames,
+                                exactSeriesScore ? "yes" : "no");
+                            WritePlayoffStateLog(message);
+                        }
+                        else
+                        {
+                            gRetryLive06PlayoffSeries = true;
+                            WritePlayoffStateLog(
+                                "[CustomPaths] PLAYOFF_SERIES available=no.\n");
+                        }
+                    }
+                }
+                else
+                {
+                    gRetryLive06PlayoffSeries = true;
+                    WritePlayoffStateLog(
+                        "[CustomPaths] PLAYOFF_SCHEDULE available=no.\n");
+                }
+            }
+
+            if (!gPreviousOptionsSnapshotValid)
+            {
+                std::memcpy(
+                    gPreviousOptionsSnapshot,
+                    bytes,
+                    endOffset);
+                gPreviousOptionsSnapshotValid = true;
+                WritePlayoffStateLog(
+                    "[CustomPaths] OPTIONS_BASELINE captured; subsequent "
+                    "snapshots will list changed dwords.\n");
+            }
+            else
+            {
+                unsigned int changed = 0;
+                for (unsigned int offset = firstOffset;
+                     offset + sizeof(unsigned int) <= endOffset;
+                     offset += sizeof(unsigned int))
+                {
+                    const unsigned int previous =
+                        *reinterpret_cast<const unsigned int*>(
+                            gPreviousOptionsSnapshot + offset);
+                    const unsigned int current =
+                        *reinterpret_cast<const unsigned int*>(bytes + offset);
+                    if (previous == current)
+                        continue;
+
+                    sprintf_s(
+                        message,
+                        sizeof(message),
+                        "[CustomPaths] OPTIONS_CHANGE +%04X: "
+                        "%08X -> %08X\n",
+                        offset,
+                        previous,
+                        current);
+                    WritePlayoffStateLog(message);
+                    ++changed;
+                }
+
+                if (changed == 0)
+                {
+                    WritePlayoffStateLog(
+                        "[CustomPaths] OPTIONS_CHANGE: no aligned dword "
+                        "changes found.\n");
+                }
+
+                std::memcpy(
+                    gPreviousOptionsSnapshot,
+                    bytes,
+                    endOffset);
+            }
+
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WritePlayoffStateLog(
+                "[CustomPaths] Could not read playoff-state snapshot.\n");
+        }
+    }
+
+void InstallLive06PlayoffBracketCaptureHook()
+    {
+        const unsigned int destructorCallSite = 0x005491B3;
+        if (!ValidateCallSites(
+                &destructorCallSite,
+                1,
+                0x0051E700))
+        {
+            OutputDebugStringA(
+                "[CustomPaths] NBA Live 06 playoff-bracket capture hook "
+                "validation failed.\n");
+            return;
+        }
+
+        patch::RedirectCall(
+            destructorCallSite,
+            Live06PlayoffBracketDestructorHook);
+        OutputDebugStringA(
+            "[CustomPaths] NBA Live 06 playoff-bracket capture hook "
+            "installed.\n");
+    }
+
+}
+
+namespace practicesetup {
+constexpr const char* kIniFile = ".\\main.ini";
+void PracticeLog06(const char* message) {
+        OutputDebugStringA(message);
+        HANDLE file = CreateFileA(".\\PracticeSetup.log", FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(file, message, static_cast<DWORD>(strlen(message)), &written, nullptr);
+            CloseHandle(file);
+        }
+    }
+
+void PracticeDescribeParticipant06(const char* stage, const void* participant) {
+        char message[320] = {};
+        if (!IsReadableAddress(participant, 0x14)) {
+            sprintf_s(message, sizeof(message),
+                "[PracticeSetup] %s participant=%p NOT READABLE\n", stage, participant);
+            PracticeLog06(message);
+            return;
+        }
+        const auto* bytes = static_cast<const unsigned char*>(participant);
+        int player = -1, jersey = -1, kind = -1;
+        memcpy(&player, bytes + 0x08, sizeof(player));
+        memcpy(&jersey, bytes + 0x0C, sizeof(jersey));
+        memcpy(&kind, bytes + 0x10, sizeof(kind));
+        sprintf_s(message, sizeof(message),
+            "[PracticeSetup] %s participant=%p playerId=%d jersey=%d kind=%d requestedDbId=%d requestedJersey=%d playerMatch=%s jerseyMatch=%s\n",
+            stage, participant, player, jersey, kind, g_practice06.dbId,
+            g_practice06.jerseyId,
+            player == g_practice06.dbId ? "yes" : "NO",
+            g_practice06.jerseyId < 0 ? "native-default" :
+                (jersey == g_practice06.jerseyId ? "yes" : "NO"));
+        PracticeLog06(message);
+    }
+
+void PracticeDumpWords06(const char* label, const void* ptr, size_t byteCount) {
+        char line[320] = {};
+        sprintf_s(line, sizeof(line),
+            "[PracticeSetup] BE snapshot %s base=%p bytes=%u (raw DWORDs; offsets are not verified fields)\n",
+            label, ptr, static_cast<unsigned>(byteCount));
+        PracticeLog06(line);
+        if (!ptr || byteCount > 0x100 || (byteCount % sizeof(uint32_t)) != 0 ||
+            !IsReadableAddress(ptr, byteCount)) {
+            PracticeLog06("[PracticeSetup] BE snapshot skipped: address not readable as one contiguous region.\n");
+            return;
+        }
+        const auto* data = static_cast<const unsigned char*>(ptr);
+        for (size_t offset = 0; offset < byteCount; offset += 16) {
+            uint32_t w[4] = {};
+            memcpy(w, data + offset, sizeof(w));
+            sprintf_s(line, sizeof(line),
+                "[PracticeSetup]   +%03X: %08X %08X %08X %08X%s\n",
+                static_cast<unsigned>(offset),
+                static_cast<unsigned>(w[0]), static_cast<unsigned>(w[1]),
+                static_cast<unsigned>(w[2]), static_cast<unsigned>(w[3]),
+                (w[0] == static_cast<uint32_t>(g_practice06.dbId) ||
+                 w[1] == static_cast<uint32_t>(g_practice06.dbId) ||
+                 w[2] == static_cast<uint32_t>(g_practice06.dbId) ||
+                 w[3] == static_cast<uint32_t>(g_practice06.dbId))
+                    ? "  [requested ID value present; not proof of player binding]" : "");
+            PracticeLog06(line);
+        }
+    }
+
+void PracticeTraceStack06() {
+        void* frames[16] = {};
+        const USHORT count = CaptureStackBackTrace(0, 16, frames, nullptr);
+        char line[200] = {};
+        sprintf_s(line, sizeof(line),
+            "[PracticeSetup] BE entry stack trace: %u captured addresses (ret addr chain).\n",
+            static_cast<unsigned>(count));
+        PracticeLog06(line);
+        for (USHORT i = 0; i < count; ++i) {
+            sprintf_s(line, sizeof(line), "[PracticeSetup]   stack[%u]=%p\n",
+                static_cast<unsigned>(i), frames[i]);
+            PracticeLog06(line);
+        }
+    }
+
+void __fastcall PracticeSceneCallHook06(void* sceneObject, void*, int setupArg) {
+        // Virtual function at vtable 0x00BC6C38 + 0x0C. Native ends in RET 4.
+        // DO NOT treat the FE participant as transferred into gameplay until
+        // actor/player-creation handling has been identified and checked.
+        ++g_practice06.backendCalls;
+        char message[384] = {};
+        sprintf_s(message, sizeof(message),
+            "[PracticeSetup] BE Practice scene entry #%lu object=%p arg=%d; FE updates=%lu; lastFePlayer=%d lastFeJersey=%d lastFeKind=%d; requestedDbId=%d\n",
+            g_practice06.backendCalls, sceneObject, setupArg,
+            g_practice06.frontendCalls, g_practice06.lastFePlayer,
+            g_practice06.lastFeJersey, g_practice06.lastFeKind,
+            g_practice06.dbId);
+        PracticeLog06(message);
+        if (g_practice06.frontendCalls == 0) {
+            PracticeLog06("[PracticeSetup] IMPORTANT: no intercepted FE player setter has executed. "
+                "Player override is NOT applied; FE calls may have run earlier or used an alternate path.\n");
+        }
+        PracticeTraceStack06();
+        // The original vtable +4 stores the selection/config pointer at +14;
+        // the Practice scene routine reads [sceneObject+14] at 0061DF12.
+        if (IsReadableAddress(sceneObject, 0x18)) {
+            const auto* p = static_cast<const unsigned char*>(sceneObject);
+            const void* participant = nullptr;
+            memcpy(&participant, p + 0x14, sizeof(participant));
+            PracticeDescribeParticipant06("BE SCENE selection +14", participant);
+        }
+        PracticeDumpWords06("sceneObject BEFORE", sceneObject, 0x80);
+        // setupArg is still passed as its original integer. Treat its bit
+        // pattern as an address ONLY for a guarded read-only diagnostic.
+        const void* argCandidate = reinterpret_cast<const void*>(
+            static_cast<uintptr_t>(static_cast<uint32_t>(setupArg)));
+        PracticeDumpWords06("setupArg BEFORE (pointer candidate)", argCandidate, 0x40);
+        reinterpret_cast<PracticeSceneFn06>(kPracticeSceneStart06)(
+            sceneObject, setupArg);
+        PracticeDumpWords06("sceneObject AFTER", sceneObject, 0x80);
+        PracticeLog06("[PracticeSetup] BE Practice scene initialization returned. "
+            "Gameplay player identity NOT YET VERIFIED.\n");
+    }
+
+}
+
+// Boot package origin diagnostics.
+using namespace plugin;
+namespace autostartdetail {
+FILE* g_bootSelectorTraceFile = nullptr;
+
+bool g_tracedLegal = false;
+
+bool g_tracedNbaLogo = false;
+
+bool g_tracedTitle = false;
+
+#if defined(_M_IX86)
+bool g_requestCtorTraceHookInstalled = false;
+
+#endif
+void Log(const char* format, ...)
+    {
+        char buffer[768] = {};
+
+        va_list args;
+        va_start(args, format);
+        vsnprintf_s(
+            buffer,
+            sizeof(buffer),
+            _TRUNCATE,
+            format,
+            args);
+        va_end(args);
+
+        OutputDebugStringA(buffer);
+
+        // The launcher already has a debug console in development builds.
+        std::printf("%s", buffer);
+        std::fflush(stdout);
+    }
+
+void DumpUberState(const char* reason)
+    {
+        void* uber =
+            reinterpret_cast<void*(__cdecl*)()>(
+                kGetFEUberGameMode)();
+
+        if (!uber)
+        {
+            Log(
+                "[AutoStart06] %s: FEUberGameMode=null\n",
+                reason);
+            return;
+        }
+
+        const auto* bytes =
+            static_cast<const std::uint8_t*>(uber);
+
+        const int currentMode =
+            *reinterpret_cast<const int*>(bytes + 0x08);
+
+        const int nextMode =
+            *reinterpret_cast<const int*>(bytes + 0x0C);
+
+        const int inGameplay =
+            bytes[0x84] ? 1 : 0;
+
+        Log(
+            "[AutoStart06] %s: uber=%p currentMode=%d "
+            "nextMode=%d inGameplay=%d\n",
+            reason,
+            uber,
+            currentMode,
+            nextMode,
+            inGameplay);
+    }
+
+bool IsLikelyCodeAddress06(uintptr_t value)
+    {
+        return value >= 0x00401000 &&
+               value <  0x00B91E51;
+    }
+
+bool CopyReadableCString(
+        const char* source,
+        char* destination,
+        size_t destinationSize)
+    {
+        if (!source ||
+            !destination ||
+            destinationSize == 0)
+        {
+            return false;
+        }
+
+        destination[0] = '\0';
+
+        __try
+        {
+            size_t i = 0;
+
+            for (;
+                 i + 1 < destinationSize;
+                 ++i)
+            {
+                const char c = source[i];
+                destination[i] = c;
+
+                if (c == '\0')
+                    return i != 0;
+
+                const unsigned char uc =
+                    static_cast<unsigned char>(c);
+
+                if (uc < 0x20 &&
+                    c != '\t')
+                {
+                    destination[0] = '\0';
+                    return false;
+                }
+            }
+
+            destination[destinationSize - 1] = '\0';
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            destination[0] = '\0';
+            return false;
+        }
+    }
+
+void OpenBootSelectorTraceFile()
+    {
+        if (!g_bootSelectorTrace || g_bootSelectorTraceFile)
+            return;
+
+        char exePath[MAX_PATH] = {};
+        const DWORD len =
+            GetModuleFileNameA(
+                nullptr,
+                exePath,
+                static_cast<DWORD>(sizeof(exePath)));
+
+        if (!len || len >= sizeof(exePath))
+            return;
+
+        char* slash = std::strrchr(exePath, '\\');
+        if (!slash)
+            return;
+
+        *(slash + 1) = '\0';
+
+        char logsDir[MAX_PATH] = {};
+        sprintf_s(
+            logsDir,
+            sizeof(logsDir),
+            "%slogs",
+            exePath);
+
+        CreateDirectoryA(logsDir, nullptr);
+
+        char logPath[MAX_PATH] = {};
+        sprintf_s(
+            logPath,
+            sizeof(logPath),
+            "%slogs\\boot_selector_trace06.log",
+            exePath);
+
+        fopen_s(
+            &g_bootSelectorTraceFile,
+            logPath,
+            "a");
+
+        if (!g_bootSelectorTraceFile)
+            return;
+
+        SYSTEMTIME st = {};
+        GetLocalTime(&st);
+
+        std::fprintf(
+            g_bootSelectorTraceFile,
+            "\n============================================================\n"
+            "NBA Live 06 boot selector trace %04u-%02u-%02u "
+            "%02u:%02u:%02u\n"
+            "============================================================\n",
+            st.wYear,
+            st.wMonth,
+            st.wDay,
+            st.wHour,
+            st.wMinute,
+            st.wSecond);
+
+        std::fflush(g_bootSelectorTraceFile);
+    }
+
+bool IsMainExeCodeAddress(uintptr_t value)
+    {
+        return IsLikelyCodeAddress06(value);
+    }
+
+void WriteBootSelectorTraceLine(
+        const char* format,
+        ...)
+    {
+        if (!g_bootSelectorTrace)
+            return;
+
+        OpenBootSelectorTraceFile();
+
+        if (!g_bootSelectorTraceFile)
+            return;
+
+        char line[2048] = {};
+
+        va_list args;
+        va_start(args, format);
+
+        vsnprintf_s(
+            line,
+            sizeof(line),
+            _TRUNCATE,
+            format,
+            args);
+
+        va_end(args);
+
+        std::fputs(
+            line,
+            g_bootSelectorTraceFile);
+
+        std::fflush(
+            g_bootSelectorTraceFile);
+
+        OutputDebugStringA(line);
+    }
+
+void TraceBootSelectorRequest(
+        const char* requestedPath,
+        uintptr_t* entryStack)
+    {
+        if (!g_bootSelectorTrace ||
+            !requestedPath ||
+            !entryStack)
+        {
+            return;
+        }
+
+        const char* base =
+            BaseNameOfPath(requestedPath);
+
+        bool* alreadyTraced = nullptr;
+        const char* stageName = nullptr;
+
+        if (_stricmp(base, kBootLegalPackage) == 0)
+        {
+            alreadyTraced = &g_tracedLegal;
+            stageName = "LEGAL";
+        }
+        else if (_stricmp(base, kBootNbaLogoPackage) == 0)
+        {
+            alreadyTraced = &g_tracedNbaLogo;
+            stageName = "NBA_LOGO";
+        }
+        else if (_stricmp(base, kBootTitlePackage) == 0)
+        {
+            alreadyTraced = &g_tracedTitle;
+            stageName = "TITLE";
+        }
+        else
+        {
+            return;
+        }
+
+        if (*alreadyTraced)
+            return;
+
+        *alreadyTraced = true;
+
+        WriteBootSelectorTraceLine(
+            "\n[BOOT_SELECTOR] stage=%s requested='%s'\n",
+            stageName,
+            requestedPath);
+
+        // Direct OpenResolved caller from its original entry stack.
+        WriteBootSelectorTraceLine(
+            "[BOOT_SELECTOR] direct_return=%08lX\n",
+            static_cast<unsigned long>(
+                entryStack[0]));
+
+        // RtlCaptureStackBackTrace gives the real active call chain. The
+        // first frames are our ASI hook/helper and are expected; later frames
+        // should converge on OpenResolved and then the APT/resource caller.
+        void* frames[48] = {};
+        const USHORT captured =
+            CaptureStackBackTrace(
+                0,
+                static_cast<DWORD>(
+                    sizeof(frames) / sizeof(frames[0])),
+                frames,
+                nullptr);
+
+        WriteBootSelectorTraceLine(
+            "[BOOT_SELECTOR] captured_frames=%u\n",
+            static_cast<unsigned>(captured));
+
+        for (USHORT i = 0; i < captured; ++i)
+        {
+            const uintptr_t address =
+                reinterpret_cast<uintptr_t>(
+                    frames[i]);
+
+            WriteBootSelectorTraceLine(
+                "[BOOT_SELECTOR] frame[%02u]=%08lX%s\n",
+                static_cast<unsigned>(i),
+                static_cast<unsigned long>(address),
+                IsMainExeCodeAddress(address)
+                    ? "  EXE"
+                    : "");
+        }
+
+        // Also scan the original caller stack for code-looking values. This
+        // is not treated as a formal call chain; it is a second independent
+        // fingerprint that survives imperfect x86 unwinding.
+        WriteBootSelectorTraceLine(
+            "[BOOT_SELECTOR] stack_code_candidates:\n");
+
+        unsigned emitted = 0;
+
+        __try
+        {
+            for (unsigned i = 0;
+                 i < 384 && emitted < 64;
+                 ++i)
+            {
+                const uintptr_t value =
+                    entryStack[i];
+
+                if (!IsMainExeCodeAddress(value))
+                    continue;
+
+                bool duplicate = false;
+
+                for (unsigned j = 0; j < i; ++j)
+                {
+                    if (entryStack[j] == value)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+
+                if (duplicate)
+                    continue;
+
+                WriteBootSelectorTraceLine(
+                    "[BOOT_SELECTOR]   stack[%03u]=%08lX\n",
+                    i,
+                    static_cast<unsigned long>(value));
+
+                ++emitted;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            WriteBootSelectorTraceLine(
+                "[BOOT_SELECTOR]   stack scan stopped at unreadable page\n");
+        }
+
+        WriteBootSelectorTraceLine(
+            "[BOOT_SELECTOR] end stage=%s\n",
+            stageName);
+    }
+
+#if defined(_M_IX86)
+void __cdecl TraceBootRequestConstructed(
+        uintptr_t requestObject,
+        uintptr_t constructorFrame)
+    {
+        if (!g_bootSelectorTrace ||
+            !requestObject)
+        {
+            return;
+        }
+
+        char path[512] = {};
+        const char* pathPointer = nullptr;
+
+        __try
+        {
+            pathPointer =
+                *reinterpret_cast<const char**>(
+                    requestObject + 0x30);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+
+        if (!CopyReadableCString(
+                pathPointer,
+                path,
+                sizeof(path)))
+        {
+            return;
+        }
+
+        const char* base =
+            BaseNameOfPath(path);
+
+        bool* alreadyTraced = nullptr;
+        const char* stageName = nullptr;
+
+        if (_stricmp(base, kBootLegalPackage) == 0)
+        {
+            alreadyTraced = &g_tracedLegal;
+            stageName = "LEGAL";
+        }
+        else if (_stricmp(base, kBootNbaLogoPackage) == 0)
+        {
+            alreadyTraced = &g_tracedNbaLogo;
+            stageName = "NBA_LOGO";
+        }
+        else if (_stricmp(base, kBootTitlePackage) == 0)
+        {
+            alreadyTraced = &g_tracedTitle;
+            stageName = "TITLE";
+        }
+        else
+        {
+            return;
+        }
+
+        if (*alreadyTraced)
+            return;
+
+        *alreadyTraced = true;
+
+        DWORD field0C = 0;
+        DWORD field14 = 0;
+        DWORD field20 = 0;
+        DWORD field24 = 0;
+        DWORD field30 = 0;
+
+        __try
+        {
+            field0C =
+                *reinterpret_cast<DWORD*>(
+                    requestObject + 0x0C);
+
+            field14 =
+                *reinterpret_cast<DWORD*>(
+                    requestObject + 0x14);
+
+            field20 =
+                *reinterpret_cast<DWORD*>(
+                    requestObject + 0x20);
+
+            field24 =
+                *reinterpret_cast<DWORD*>(
+                    requestObject + 0x24);
+
+            field30 =
+                *reinterpret_cast<DWORD*>(
+                    requestObject + 0x30);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+
+        WriteBootSelectorTraceLine(
+            "\n[BOOT_ORIGIN] stage=%s request=%08lX path='%s'\n",
+            stageName,
+            static_cast<unsigned long>(
+                requestObject),
+            path);
+
+        WriteBootSelectorTraceLine(
+            "[BOOT_ORIGIN] fields "
+            "+0C=%08lX +14=%08lX +20=%08lX "
+            "+24=%08lX +30=%08lX\n",
+            static_cast<unsigned long>(field0C),
+            static_cast<unsigned long>(field14),
+            static_cast<unsigned long>(field20),
+            static_cast<unsigned long>(field24),
+            static_cast<unsigned long>(field30));
+
+        // At 006DD8A8, EBP still belongs to sub_6DD894.
+        // Walk the actual x86 EBP chain instead of scanning arbitrary stack
+        // contents. This should retain:
+        //
+        //   sub_6DD894
+        //   sub_6DC795 request factory
+        //   logical asset caller
+        //   mainFE/APT caller
+        //
+        // as long as the upstream functions use frame pointers.
+        WriteBootSelectorTraceLine(
+            "[BOOT_ORIGIN] ebp_chain start=%08lX\n",
+            static_cast<unsigned long>(
+                constructorFrame));
+
+        uintptr_t frame = constructorFrame;
+
+        for (unsigned depth = 0;
+             depth < 32 && frame;
+             ++depth)
+        {
+            uintptr_t nextFrame = 0;
+            uintptr_t returnAddress = 0;
+
+            __try
+            {
+                nextFrame =
+                    *reinterpret_cast<uintptr_t*>(
+                        frame);
+
+                returnAddress =
+                    *reinterpret_cast<uintptr_t*>(
+                        frame + sizeof(uintptr_t));
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                WriteBootSelectorTraceLine(
+                    "[BOOT_ORIGIN] ebp[%02u] unreadable frame=%08lX\n",
+                    depth,
+                    static_cast<unsigned long>(frame));
+                break;
+            }
+
+            WriteBootSelectorTraceLine(
+                "[BOOT_ORIGIN] ebp[%02u] frame=%08lX "
+                "ret=%08lX%s next=%08lX\n",
+                depth,
+                static_cast<unsigned long>(frame),
+                static_cast<unsigned long>(returnAddress),
+                IsLikelyCodeAddress06(returnAddress)
+                    ? " EXE"
+                    : "",
+                static_cast<unsigned long>(nextFrame));
+
+            if (nextFrame <= frame ||
+                nextFrame - frame > 0x20000)
+            {
+                break;
+            }
+
+            frame = nextFrame;
+        }
+
+        void* frames[64] = {};
+        const USHORT captured =
+            CaptureStackBackTrace(
+                0,
+                static_cast<DWORD>(
+                    sizeof(frames) /
+                    sizeof(frames[0])),
+                frames,
+                nullptr);
+
+        WriteBootSelectorTraceLine(
+            "[BOOT_ORIGIN] capture count=%u\n",
+            static_cast<unsigned>(captured));
+
+        for (USHORT i = 0;
+             i < captured;
+             ++i)
+        {
+            const uintptr_t address =
+                reinterpret_cast<uintptr_t>(
+                    frames[i]);
+
+            WriteBootSelectorTraceLine(
+                "[BOOT_ORIGIN] capture[%02u]=%08lX%s\n",
+                static_cast<unsigned>(i),
+                static_cast<unsigned long>(address),
+                IsLikelyCodeAddress06(address)
+                    ? " EXE"
+                    : "");
+        }
+
+        WriteBootSelectorTraceLine(
+            "[BOOT_ORIGIN] end stage=%s\n",
+            stageName);
+    }
+
+__declspec(naked) void BootRequestCtorTraceHook06()
+    {
+        __asm
+        {
+            // Hooked at 006DD8A8, immediately after sub_6DC39E.
+            // Live registers:
+            //   ESI = newly constructed request object
+            //   EBP = sub_6DD894 frame
+
+            pushfd
+            pushad
+
+            mov     eax, [esp + 4]    // saved ESI
+            mov     edx, [esp + 8]    // saved EBP
+            push    edx
+            push    eax
+            call    TraceBootRequestConstructed
+            add     esp, 8
+
+            popad
+            popfd
+
+            // Original bytes overwritten at 006DD8A8:
+            //   8B 45 08    mov eax,[ebp+08]
+            //   8B CE       mov ecx,esi
+            mov     eax, [ebp + 8]
+            mov     ecx, esi
+
+            jmp     kRequestCtorTraceResume06
+        }
+    }
+
+bool InstallBootRequestCtorTraceHook06()
+    {
+        if (g_requestCtorTraceHookInstalled)
+            return true;
+
+        unsigned char* target =
+            reinterpret_cast<unsigned char*>(
+                kRequestCtorTracePatch06);
+
+        const unsigned char expected[5] =
+        {
+            0x8B, 0x45, 0x08,
+            0x8B, 0xCE
+        };
+
+        __try
+        {
+            if (std::memcmp(
+                    target,
+                    expected,
+                    sizeof(expected)) != 0)
+            {
+                Log(
+                    "[AutoStart06] Boot-origin constructor trace "
+                    "validation failed at %08X.\n",
+                    kRequestCtorTracePatch06);
+
+                return false;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+
+        DWORD oldProtect = 0;
+
+        if (!VirtualProtect(
+                target,
+                sizeof(expected),
+                PAGE_EXECUTE_READWRITE,
+                &oldProtect))
+        {
+            return false;
+        }
+
+        target[0] = 0xE9;
+
+        *reinterpret_cast<int32_t*>(
+            target + 1) =
+            static_cast<int32_t>(
+                reinterpret_cast<uintptr_t>(
+                    &BootRequestCtorTraceHook06) -
+                (kRequestCtorTracePatch06 + 5));
+
+        DWORD ignored = 0;
+
+        VirtualProtect(
+            target,
+            sizeof(expected),
+            oldProtect,
+            &ignored);
+
+        FlushInstructionCache(
+            GetCurrentProcess(),
+            target,
+            sizeof(expected));
+
+        g_requestCtorTraceHookInstalled = true;
+
+        Log(
+            "[AutoStart06] Boot-origin request-constructor trace "
+            "installed at %08X.\n",
+            kRequestCtorTracePatch06);
+
+        return true;
+    }
+
+#endif
+#if defined(_M_IX86)
+#else
+bool InstallBootRequestCtorTraceHook06()
+    {
+        return false;
+    }
+
+#endif
 }
